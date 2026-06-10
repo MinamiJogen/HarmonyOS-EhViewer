@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "E-Harmony app module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "E-Harmony entry ability"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "E-Harmony"
+    }
+  ]
+}
