@@ -5818,6 +5818,12 @@ struct Index {
     this.searchSuggestionsVisible = false;
   }
 
+  private hideSearchSuggestionOverlayKeepingInputActive(): void {
+    this.cancelSearchInputBlurTimer();
+    this.searchInputFocused = true;
+    this.searchSuggestionsVisible = false;
+  }
+
   private handleSearchInputFocus(allowOpen: boolean = false): void {
     if (!allowOpen && !this.searchInputFocused) {
       return;
@@ -6033,12 +6039,12 @@ struct Index {
 
   private applyTagSuggestion(item: TagTranslationSuggestion): void {
     this.setNativeQuery(this.replaceTagSuggestionTail(this.buildSearchTokenFromSuggestion(item)));
-    this.hideSearchSuggestionOverlay();
+    this.hideSearchSuggestionOverlayKeepingInputActive();
   }
 
   private applyHistorySuggestion(query: string): void {
     this.setNativeQuery(query);
-    this.hideSearchSuggestionOverlay();
+    this.hideSearchSuggestionOverlayKeepingInputActive();
   }
 
   private filterUsesTagSuggestions(): boolean {
