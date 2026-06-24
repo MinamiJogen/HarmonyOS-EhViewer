@@ -1,11 +1,20 @@
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { CustomColors, CustomTheme, ThemeControl, window } from '@kit.ArkUI';
+import preferences from '@ohos.data.preferences';
 import webview from '@ohos.web.webview';
 import connection from '@ohos.net.connection';
 import { NativeEhClient } from '../ehviewer/EhNative';
+import {
+  initializePrivacyAppStorageDefaults,
+  isAppLockAuthActive as isAppLockAuthActiveStorage,
+  isBackgroundPreviewProtectionEnabled as readBackgroundPreviewProtectionEnabled,
+  setAppLockForegroundRequired as setAppLockForegroundRequiredStorage,
+  syncPrivacySettingsToAppStorage as syncPrivacySettingsStoreToAppStorage
+} from '../privacy/PrivacySettings';
 
 const DOMAIN = 0x0000;
+const SETTINGS_STORE_NAME: string = 'ehviewer_harmony';
 
 const EH_CLOUDFLARE_HOSTS: string[] = [
   'e-hentai.org',
@@ -95,7 +104,13 @@ const EH_BUILT_IN_HOSTS: Record<string, string[]> = {
 };
 
 export default class EntryAbility extends UIAbility {
+  private mainWindow?: window.Window = undefined;
+  private settingsStore?: preferences.Preferences = undefined;
+  private windowPrivacyModeApplied: boolean = false;
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    initializePrivacyAppStorageDefaults();
+    this.syncPrivacySettingsToAppStorage();
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
@@ -179,6 +194,7 @@ export default class EntryAbility extends UIAbility {
 
   private async configureImmersiveMainWindow(windowStage: window.WindowStage): Promise<void> {
     const mainWindow = await windowStage.getMainWindow();
+    this.mainWindow = mainWindow;
     await mainWindow.setWindowLayoutFullScreen(true);
     await mainWindow.setWindowSystemBarEnable(['status', 'navigation']);
     await mainWindow.setWindowSystemBarProperties({
@@ -206,9 +222,84 @@ export default class EntryAbility extends UIAbility {
     });
   }
 
+  private setAppLockForegroundRequired(required: boolean): void {
+    setAppLockForegroundRequiredStorage(required);
+  }
+
+  private isAppLockAuthActive(): boolean {
+    return isAppLockAuthActiveStorage();
+  }
+
+  private ensureSettingsStore(): preferences.Preferences | undefined {
+    if (this.settingsStore) {
+      return this.settingsStore;
+    }
+    try {
+      this.settingsStore = preferences.getPreferencesSync(this.context, { name: SETTINGS_STORE_NAME });
+      return this.settingsStore;
+    } catch (error) {
+      hilog.warn(DOMAIN, 'testTag', 'Failed to load preferences. Cause: %{public}s', `${error}`);
+      return undefined;
+    }
+  }
+
+  private syncPrivacySettingsToAppStorage(): void {
+    const store = this.ensureSettingsStore();
+    if (!store) {
+      return;
+    }
+    syncPrivacySettingsStoreToAppStorage(store);
+  }
+
+  private isBackgroundPreviewProtectionEnabled(): boolean {
+    return readBackgroundPreviewProtectionEnabled(this.ensureSettingsStore());
+  }
+
+  private applyWindowPrivacyMode(isPrivacyMode: boolean): void {
+    if (!this.mainWindow || this.windowPrivacyModeApplied === isPrivacyMode) {
+      return;
+    }
+    void this.mainWindow.setWindowPrivacyMode(isPrivacyMode)
+      .then(() => {
+        this.windowPrivacyModeApplied = isPrivacyMode;
+      })
+      .catch((error: Error) => {
+        hilog.warn(DOMAIN, 'testTag', 'Failed to set window privacy mode. Cause: %{public}s', `${error}`);
+      });
+  }
+
+  private handleWindowStageEvent(event: window.WindowStageEventType): void {
+    if (event === window.WindowStageEventType.INACTIVE) {
+      this.applyWindowPrivacyMode(this.isBackgroundPreviewProtectionEnabled());
+      if (!this.isAppLockAuthActive()) {
+        this.setAppLockForegroundRequired(true);
+      }
+      return;
+    }
+    if (event === window.WindowStageEventType.HIDDEN) {
+      this.applyWindowPrivacyMode(this.isBackgroundPreviewProtectionEnabled());
+      this.setAppLockForegroundRequired(true);
+      return;
+    }
+    if (event === window.WindowStageEventType.ACTIVE || event === window.WindowStageEventType.SHOWN) {
+      this.applyWindowPrivacyMode(false);
+    }
+  }
+
+  private registerWindowStageEvents(windowStage: window.WindowStage): void {
+    try {
+      windowStage.on('windowStageEvent', (event: window.WindowStageEventType): void => {
+        this.handleWindowStageEvent(event);
+      });
+    } catch (error) {
+      hilog.warn(DOMAIN, 'testTag', 'Failed to register window stage event. Cause: %{public}s', `${error}`);
+    }
+  }
+
   onWindowStageCreate(windowStage: window.WindowStage): void {
     // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+    this.registerWindowStageEvents(windowStage);
 
     void this.configureImmersiveMainWindow(windowStage)
       .then(() => {
@@ -227,11 +318,14 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     // Ability has brought to foreground
+    this.applyWindowPrivacyMode(false);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
   }
 
   onBackground(): void {
     // Ability has back to background
+    this.applyWindowPrivacyMode(this.isBackgroundPreviewProtectionEnabled());
+    this.setAppLockForegroundRequired(true);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
   }
 }

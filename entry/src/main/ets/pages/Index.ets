@@ -60,6 +60,7 @@ import { HomeGalleryPage } from './gallery/HomeGalleryPage';
 import { FavoriteGalleryPage } from './gallery/FavoriteGalleryPage';
 import { GalleryDetailPage } from './gallery/GalleryDetailPage';
 import { SearchResultsPage } from './gallery/SearchResultsPage';
+import { PrivacySettingsCard } from './settings/PrivacySettingsCard';
 import { SystemLoadingBlock } from '../components/SystemLoadingBlock';
 import { LocalGalleryRecord, HistoryItem } from '../models/LocalModels';
 import {
@@ -120,6 +121,8 @@ import {
 import {
   APP_ABILITY_NAME,
   APP_BUNDLE_NAME,
+  APP_LOCK_ENABLED_KEY,
+  BACKGROUND_PREVIEW_PROTECTION_KEY,
   BOTTOM_NAV_SAFE_FALLBACK,
   CACHE_CATEGORY_GALLERY,
   CACHE_CATEGORY_IMAGE_SEARCH,
@@ -216,6 +219,7 @@ import {
   READER_KEY_KEEP_SCREEN_ON,
   READER_KEY_PAGE_SCALING,
   READER_KEY_PRELOAD_IMAGE,
+  READER_PROGRESS_KEY,
   READER_KEY_READING_DIRECTION,
   READER_KEY_REVERSE_VOLUME_PAGE,
   READER_KEY_SCREEN_LIGHTNESS,
@@ -284,6 +288,31 @@ import {
   SearchModeOption
 } from '../models/AppModels';
 import { EhLocalDataDao } from '../data/EhLocalDataDao';
+import { authenticateAppLock, AppLockAuthenticationResult } from '../privacy/AppLockAuthentication';
+import {
+  readPrivacySettings,
+  setAppLockAuthActive as setAppLockAuthActiveStorage,
+  setAppLockForegroundRequired as setAppLockForegroundRequiredStorage
+} from '../privacy/PrivacySettings';
+import { formatByteSize, formatBytesPerSecond, formatRating, formatRemainingSeconds, compactTags, categoryColor, metaLine } from '../utils/FormatUtils';
+import { clampNumber } from '../utils/NumberUtils';
+import { readObjectBoolean, readObjectNumber, readObjectString } from '../utils/RecordUtils';
+import { rawBytesToString, safeFileName } from '../utils/TextUtils';
+import { parseReaderProgress, readerProgressSnapshot } from '../reader/ReaderProgressStore';
+import {
+  emptyFavoriteCategoryCounts,
+  ensureDownloadDefaultLabel,
+  isSupportedExcludedLanguageTag,
+  parseBookmarks,
+  parseDownloadLabels,
+  parseDownloadPageErrorsFromObject,
+  parseExcludedLanguageTags,
+  parseFavoriteCategoryCounts,
+  parseFavoriteCategoryNames,
+  parseLocalGalleryRecord,
+  parseQuickSearches,
+  parseSearchHistoryQueries
+} from '../storage/PreferenceParsers';
 
 let sharedDownloadWorkerRunning: boolean = false;
 let sharedDownloadActiveKey: string = '';
@@ -366,6 +395,7 @@ struct Index {
   private readonly readerPageRetrySkipKeys: Map<string, string> = new Map();
   private readonly readerImageCache: Map<string, ReaderImageCacheEntry> = new Map();
   private readonly readerImageInFlight: Map<string, Promise<string>> = new Map();
+  private readonly readerProgressByGallery: Map<string, number> = new Map();
   private readonly galleryImageCache: Map<string, GalleryImageCacheEntry> = new Map();
   private readonly galleryImageInFlight: Map<string, Promise<string>> = new Map();
   private localDao?: EhLocalDataDao = undefined;
@@ -429,6 +459,13 @@ struct Index {
   @State private siteMode: string = GallerySite.E;
   @State private warningAcknowledged: boolean = false;
   @State private privateBrowsing: boolean = false;
+  @StorageLink('app_lock_enabled') private appLockEnabled: boolean = false;
+  @State private appLockVerified: boolean = false;
+  @State private appLockAuthInProgress: boolean = false;
+  @State private appLockStatus: string = '验证身份后进入应用';
+  @StorageLink('background_preview_protection_enabled') private backgroundPreviewProtectionEnabled: boolean = true;
+  @State private privacySettingsRevision: number = 0;
+  @StorageLink('app_lock_foreground_required') private appLockForegroundRequired: boolean = false;
   @State private webSrc: string = EhUrl.home(GallerySite.E);
   @State private addressInput: string = EhUrl.home(GallerySite.E);
   @State private pageTitle: string = 'E-Harmony';
@@ -654,6 +691,7 @@ struct Index {
   @State private readerUseOriginImage: boolean = false;
   @State private readerDisplayImageUrl: string = '';
   @State private readerCurrentError: string = '';
+  @State private readerProgressRevision: number = 0;
   @State private readerCacheStatus: string = '缓存空闲';
   @State private cacheMaxSizeMb: number = CACHE_DEFAULT_MAX_SIZE_MB;
   @State private cacheRetentionDays: number = CACHE_DEFAULT_RETENTION_DAYS;
@@ -731,10 +769,16 @@ struct Index {
   }
 
   onPageShow(): void {
+    this.refreshPrivacySettingsFromStore();
+    this.loadReaderProgressSettings();
     this.refreshPersistedCookieState();
     void this.applyReaderWindowState();
     void this.syncDownloadStateFromDatabase(false);
     this.updateDownloadStatePolling();
+    void this.requireAppUnlockIfNeeded();
+  }
+
+  onPageHide(): void {
   }
 
   aboutToDisappear(): void {
@@ -751,6 +795,7 @@ struct Index {
 
   onBackPress(): boolean {
     if (this.hasActiveReaderPage()) {
+      this.persistCurrentReaderProgress();
       if (this.isRouteBackAvailableForCurrentSubPage()) {
         return false;
       }
@@ -818,21 +863,23 @@ struct Index {
     this.siteMode = hasPrimedRoute ? primedRouteSiteMode : this.readString('site_mode', GallerySite.E);
     this.warningAcknowledged = this.readBoolean('warning_acknowledged', false);
     this.privateBrowsing = this.readBoolean('private_browsing', false);
+    this.appLockEnabled = this.readBoolean(APP_LOCK_ENABLED_KEY, false);
+    this.backgroundPreviewProtectionEnabled = this.readBoolean(BACKGROUND_PREVIEW_PROTECTION_KEY, true);
     this.cookieDraft = this.readString('cookie_draft', '');
     this.restoreCookieDraftToWeb();
-    this.excludedLanguageTags = this.parseExcludedLanguageTags(this.readString(EXCLUDED_LANGUAGE_KEY, '[]'));
+    this.excludedLanguageTags = parseExcludedLanguageTags(this.readString(EXCLUDED_LANGUAGE_KEY, '[]'));
     this.defaultFavoriteSlot = this.normalizeFavoriteSlot(
       this.readNumber(FAVORITE_DEFAULT_SLOT_KEY, FAVORITE_INVALID_DEFAULT_SLOT),
       true
     );
-    this.favoriteCategoryNames = this.parseFavoriteCategoryNames(this.readString(FAVORITE_CATEGORY_NAMES_KEY, '[]'));
-    this.favoriteCategoryCounts = this.parseFavoriteCategoryCounts(this.readString(FAVORITE_CATEGORY_COUNTS_KEY, '[]'));
+    this.favoriteCategoryNames = parseFavoriteCategoryNames(this.readString(FAVORITE_CATEGORY_NAMES_KEY, '[]'));
+    this.favoriteCategoryCounts = parseFavoriteCategoryCounts(this.readString(FAVORITE_CATEGORY_COUNTS_KEY, '[]'));
     this.favoriteListFilter = FAVORITE_FILTER_ALL;
     await this.migratePreferencesToLocalDatabase();
     await this.loadLocalSideData();
     await this.loadLocalFilterData();
     this.downloadDirectoryPath = this.readString('download_directory_path', '');
-    this.downloadConcurrency = this.clampNumber(
+    this.downloadConcurrency = clampNumber(
       this.readNumber('download_concurrency', DOWNLOAD_DEFAULT_CONCURRENCY),
       1,
       DOWNLOAD_MAX_CONCURRENCY
@@ -841,6 +888,7 @@ struct Index {
     await this.loadDownloadState();
     this.nativeQuery = hasPrimedRoute ? primedRouteNativeQuery : this.readString('native_query', '');
     this.loadReaderSettings();
+    this.loadReaderProgressSettings();
     this.loadCachePolicySettings();
     this.updateDownloadStatePolling();
     const lastUrl = this.readString('last_url', EhUrl.home(this.siteMode));
@@ -859,6 +907,10 @@ struct Index {
     }
     this.refreshTagTranslationState();
     this.isReady = true;
+    if (this.appLockEnabled && !hasPrimedRoute) {
+      this.setAppLockForegroundRequired(true);
+    }
+    void this.requireAppUnlockIfNeeded();
     void this.updateTagTranslations(false);
     this.scheduleCacheMaintenance();
     if (this.routeNativeSummary) {
@@ -1021,6 +1073,7 @@ struct Index {
     }
     try {
       this.settingsStore = await preferences.getPreferences(hostContext as common.UIAbilityContext, 'ehviewer_harmony');
+      this.refreshPrivacySettingsFromStore();
     } catch (error) {
       this.toast('本地设置打开失败');
     }
@@ -1046,12 +1099,18 @@ struct Index {
     if (!this.localDao || this.readBoolean(LOCAL_DATA_MIGRATION_KEY, false)) {
       return;
     }
-    const backupBookmarks = this.parseBookmarks(this.readString('bookmarks', '[]'));
-    const backupQuickSearches = this.parseQuickSearches(this.readString('quick_searches', '[]'));
-    const backupSearchHistory = this.parseSearchHistoryQueries(this.readString('search_history_queries', '[]'));
+    const backupBookmarks = parseBookmarks(this.readString('bookmarks', '[]'));
+    const backupQuickSearches = parseQuickSearches(
+      this.readString('quick_searches', '[]'),
+      this.currentSearchAdvancedFlagsDefault()
+    );
+    const backupSearchHistory = parseSearchHistoryQueries(this.readString('search_history_queries', '[]'));
     const backupHistory = this.parseHistoryItems(this.readString('history_items', '[]'));
     const backupDownloads = this.parseDownloadItems(this.readString('download_items', '[]'));
-    const backupLabels = this.ensureDownloadDefaultLabel(this.parseDownloadLabels(this.readString('download_labels', '[]')));
+    const backupLabels = ensureDownloadDefaultLabel(
+      parseDownloadLabels(this.readString('download_labels', '[]'), this.nowLabel()),
+      this.nowLabel()
+    );
     try {
       await this.localDao.migrateFromPreferences(
         backupBookmarks,
@@ -1070,9 +1129,12 @@ struct Index {
   }
 
   private async loadLocalSideData(): Promise<void> {
-    const backupBookmarks = this.parseBookmarks(this.readString('bookmarks', '[]'));
-    const backupQuickSearches = this.parseQuickSearches(this.readString('quick_searches', '[]'));
-    const backupSearchHistory = this.parseSearchHistoryQueries(this.readString('search_history_queries', '[]'));
+    const backupBookmarks = parseBookmarks(this.readString('bookmarks', '[]'));
+    const backupQuickSearches = parseQuickSearches(
+      this.readString('quick_searches', '[]'),
+      this.currentSearchAdvancedFlagsDefault()
+    );
+    const backupSearchHistory = parseSearchHistoryQueries(this.readString('search_history_queries', '[]'));
     const backupHistory = this.parseHistoryItems(this.readString('history_items', '[]'));
 
     if (!this.localDao) {
@@ -1272,20 +1334,20 @@ struct Index {
 
   private async loadDownloadState(): Promise<void> {
     const backupItems = this.parseDownloadItems(this.readString('download_items', '[]'));
-    const backupLabels = this.parseDownloadLabels(this.readString('download_labels', '[]'));
+    const backupLabels = parseDownloadLabels(this.readString('download_labels', '[]'), this.nowLabel());
     const dbItems = await this.loadDownloadItemsFromDatabase();
     const dbLabels = await this.loadDownloadLabelsFromDatabase();
 
     if (dbItems.length > 0) {
       this.downloadItems = this.recoverInterruptedDownloads(dbItems);
-      this.downloadLabels = this.ensureDownloadDefaultLabel(dbLabels);
+      this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
       this.saveDownloadItems();
       this.saveDownloadLabels();
       return;
     }
 
     this.downloadItems = this.recoverInterruptedDownloads(backupItems);
-    this.downloadLabels = this.ensureDownloadDefaultLabel(backupLabels);
+    this.downloadLabels = ensureDownloadDefaultLabel(backupLabels, this.nowLabel());
     this.saveDownloadLabels();
     if (backupItems.length > 0) {
       this.saveDownloadItems();
@@ -1345,20 +1407,6 @@ struct Index {
     }
   }
 
-  private rawBytesToString(bytes: Uint8Array): string {
-    let result = '';
-    const chunkSize = 8192;
-    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-      let chunk = '';
-      const end = Math.min(offset + chunkSize, bytes.length);
-      for (let index = offset; index < end; index++) {
-        chunk += String.fromCharCode(bytes[index]);
-      }
-      result += chunk;
-    }
-    return result;
-  }
-
   private async configureTagTranslationCache(): Promise<void> {
     const hostContext = this.getUIContext().getHostContext();
     if (!hostContext) {
@@ -1368,7 +1416,7 @@ struct Index {
       const abilityContext = hostContext as common.UIAbilityContext;
       EhTagTranslator.configureCacheDir(abilityContext.filesDir);
       const bundledRaw = await abilityContext.resourceManager.getRawFileContent('tag-translations-zh-rCN');
-      EhTagTranslator.configureBundledRaw(this.rawBytesToString(bundledRaw));
+      EhTagTranslator.configureBundledRaw(rawBytesToString(bundledRaw));
     } catch (error) {
     }
   }
@@ -1414,226 +1462,163 @@ struct Index {
     }
   }
 
-  private writeValue(key: string, value: preferences.ValueType): void {
+  private writeValue(key: string, value: preferences.ValueType): boolean {
     if (!this.settingsStore) {
-      return;
+      return false;
     }
     try {
       this.settingsStore.putSync(key, value);
       this.settingsStore.flushSync();
+      return true;
     } catch (error) {
       this.toast('本地设置保存失败');
+      return false;
     }
   }
 
-  private readObjectString(item: Record<string, Object>, key: string, fallback: string = ''): string {
-    const value = item[key];
-    if (typeof value === 'string') {
-      return value;
-    }
-    if (typeof value === 'number') {
-      return `${value}`;
-    }
-    return fallback;
+  private setAppLockForegroundRequired(required: boolean): void {
+    this.appLockForegroundRequired = required;
+    setAppLockForegroundRequiredStorage(required);
   }
 
-  private readObjectNumber(item: Record<string, Object>, key: string, fallback: number = 0): number {
-    const value = item[key];
-    if (typeof value === 'number') {
-      return value;
-    }
-    if (typeof value === 'string') {
-      const numericValue = Number(value);
-      return Number.isFinite(numericValue) ? numericValue : fallback;
-    }
-    return fallback;
+  private setAppLockAuthActive(active: boolean): void {
+    setAppLockAuthActiveStorage(active);
   }
 
-  private readObjectBoolean(item: Record<string, Object>, key: string, fallback: boolean = false): boolean {
-    const value = item[key];
-    if (typeof value === 'boolean') {
-      return value;
-    }
-    if (typeof value === 'number') {
-      return value !== 0;
-    }
-    if (typeof value === 'string') {
-      return value === 'true' || value === '1';
-    }
-    return fallback;
-  }
-
-  private parseBookmarks(raw: string): BookmarkItem[] {
+  private runInUiScope(action: () => void): void {
     try {
-      const parsed = JSON.parse(raw) as Array<Record<string, Object>>;
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed
-        .map((item: Record<string, Object>) => {
-          const url = this.readObjectString(item, 'url', '');
-          const title = this.readObjectString(item, 'title', url);
-          const bookmark: BookmarkItem = { title, url };
-          return bookmark;
-        })
-        .filter((item: BookmarkItem) => item.url.length > 0)
-        .slice(0, 24);
+      this.getUIContext().runScopedTask(action);
     } catch (error) {
-      return [];
+      action();
     }
   }
 
-  private parseQuickSearches(raw: string): QuickSearchItem[] {
+  private refreshPrivacySettingsFromStore(): void {
+    if (!this.settingsStore) {
+      return;
+    }
+    this.applyPrivacySettingsFromStore(this.settingsStore);
+  }
+
+  private applyPrivacySettingsFromStore(store: preferences.Preferences): void {
+    const snapshot = readPrivacySettings(
+      store,
+      this.appLockEnabled,
+      this.backgroundPreviewProtectionEnabled
+    );
+    if (
+      snapshot.appLockEnabled === this.appLockEnabled &&
+      snapshot.backgroundPreviewProtectionEnabled === this.backgroundPreviewProtectionEnabled
+    ) {
+      return;
+    }
+    this.appLockEnabled = snapshot.appLockEnabled;
+    this.backgroundPreviewProtectionEnabled = snapshot.backgroundPreviewProtectionEnabled;
     try {
-      const parsed = JSON.parse(raw) as Array<Record<string, Object>>;
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed
-        .map((item: Record<string, Object>) => {
-          const quickSearch: QuickSearchItem = {
-            id: this.readObjectString(item, 'id', ''),
-            label: this.readObjectString(item, 'label', ''),
-            query: this.readObjectString(item, 'query', ''),
-            site: this.readObjectString(item, 'site', GallerySite.E),
-            mode: this.readObjectString(item, 'mode', SEARCH_MODE_NORMAL),
-            category: this.readObjectNumber(item, 'category', CATEGORY_ALL),
-            advancedEnabled: this.readObjectBoolean(item, 'advancedEnabled', true),
-            advancedFlags: this.readObjectNumber(item, 'advancedFlags', this.currentSearchAdvancedFlagsDefault()),
-            minRating: this.readObjectString(item, 'minRating', ''),
-            pageFrom: this.readObjectString(item, 'pageFrom', ''),
-            pageTo: this.readObjectString(item, 'pageTo', ''),
-            savedAt: this.readObjectString(item, 'savedAt', '')
-          };
-          return quickSearch;
-        })
-        .filter((item: QuickSearchItem) => item.id.length > 0 && item.query.length > 0)
-        .slice(0, 20);
+      AppStorage.setOrCreate<boolean>(APP_LOCK_ENABLED_KEY, this.appLockEnabled);
+      AppStorage.setOrCreate<boolean>(BACKGROUND_PREVIEW_PROTECTION_KEY, this.backgroundPreviewProtectionEnabled);
     } catch (error) {
-      return [];
     }
+    this.privacySettingsRevision++;
   }
 
-  private parseSearchHistoryQueries(raw: string): string[] {
-    try {
-      const parsed = JSON.parse(raw) as Array<string>;
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      const values: string[] = [];
-      for (const item of parsed) {
-        if (typeof item !== 'string') {
-          continue;
-        }
-        if (item.length === 0 || values.indexOf(item) >= 0) {
-          continue;
-        }
-        values.push(item);
-        if (values.length >= SEARCH_HISTORY_MAX_COUNT) {
-          break;
-        }
-      }
-      return values;
-    } catch (error) {
-      return [];
-    }
+  private currentAppLockEnabled(): boolean {
+    this.privacySettingsRevision;
+    return this.appLockEnabled;
   }
 
-  private isSupportedExcludedLanguageTag(tag: string): boolean {
-    for (const option of EXCLUDED_LANGUAGE_OPTIONS) {
-      if (option.tag === tag) {
-        return true;
-      }
-    }
-    return false;
+  private currentBackgroundPreviewProtectionEnabled(): boolean {
+    this.privacySettingsRevision;
+    return this.backgroundPreviewProtectionEnabled;
   }
 
-  private parseExcludedLanguageTags(raw: string): string[] {
-    try {
-      const parsed = JSON.parse(raw) as Array<string>;
-      if (!Array.isArray(parsed)) {
-        return [];
+  private async runAppLockAuthentication(title: string): Promise<boolean> {
+    const result: AppLockAuthenticationResult = await authenticateAppLock(
+      title,
+      (active: boolean): void => {
+        this.setAppLockAuthActive(active);
       }
-      const values: string[] = [];
-      for (const item of parsed) {
-        if (typeof item !== 'string') {
-          continue;
-        }
-        const tag = item.trim().toLowerCase();
-        if (tag.length === 0 || values.indexOf(tag) >= 0 || !this.isSupportedExcludedLanguageTag(tag)) {
-          continue;
-        }
-        values.push(tag);
-      }
-      return values;
-    } catch (error) {
-      return [];
+    );
+    if (result.unavailableMessage.length > 0) {
+      this.appLockStatus = result.unavailableMessage;
     }
+    return result.authenticated;
   }
 
-  private emptyFavoriteCategoryCounts(): number[] {
-    return EMPTY_FAVORITE_CATEGORY_COUNTS.slice();
+  private async requireAppUnlockIfNeeded(): Promise<void> {
+    if (!this.isReady || !this.appLockEnabled || !this.appLockForegroundRequired || this.appLockAuthInProgress) {
+      return;
+    }
+    this.appLockStatus = '验证身份后进入应用';
+    this.appLockAuthInProgress = true;
+    const unlocked = await this.runAppLockAuthentication('解锁 E-Harmony');
+    this.runInUiScope(() => {
+      this.appLockAuthInProgress = false;
+      if (unlocked) {
+        this.appLockVerified = true;
+        this.setAppLockForegroundRequired(false);
+        this.appLockStatus = '已解锁';
+        return;
+      }
+      this.appLockVerified = false;
+      this.setAppLockForegroundRequired(true);
+      this.appLockStatus = '未解锁，可重试面容、指纹或锁屏密码。';
+    });
   }
 
-  private parseFavoriteCategoryNames(raw: string): string[] {
-    const names = FAVORITE_SLOT_NAMES.slice();
-    try {
-      const parsed = JSON.parse(raw) as Array<string>;
-      if (!Array.isArray(parsed)) {
-        return names;
-      }
-      for (let index = 0; index < FAVORITE_SLOT_NAMES.length; index++) {
-        const value = parsed[index];
-        if (typeof value === 'string' && value.trim().length > 0) {
-          names[index] = value.trim();
-        }
-      }
-      return names;
-    } catch (error) {
-      return names;
+  private async setAppLockEnabled(isOn: boolean): Promise<void> {
+    if (this.appLockAuthInProgress) {
+      return;
     }
+    const currentEnabled = this.appLockEnabled;
+    if (isOn === currentEnabled) {
+      return;
+    }
+    this.appLockStatus = isOn ? '验证一次身份以开启锁定' : '验证身份以关闭锁定';
+    this.appLockAuthInProgress = true;
+    const unlocked = await this.runAppLockAuthentication(isOn ? '开启锁定 App' : '关闭锁定 App');
+    this.runInUiScope(() => {
+      this.appLockAuthInProgress = false;
+      this.setAppLockForegroundRequired(false);
+      if (!unlocked) {
+        this.appLockEnabled = currentEnabled;
+        this.appLockVerified = currentEnabled;
+        this.appLockStatus = isOn ? '验证失败，未开启锁定 App。' : '验证失败，锁定 App 仍保持开启。';
+        this.privacySettingsRevision++;
+        this.toast(isOn ? '验证失败，未开启锁定 App' : '验证失败，锁定 App 未关闭');
+        return;
+      }
+      if (!this.writeValue(APP_LOCK_ENABLED_KEY, isOn)) {
+        this.appLockEnabled = currentEnabled;
+        this.appLockVerified = currentEnabled;
+        this.appLockStatus = currentEnabled ? '锁定 App 仍保持开启。' : '锁定 App 仍保持关闭。';
+        this.privacySettingsRevision++;
+        return;
+      }
+      this.appLockEnabled = isOn;
+      this.appLockVerified = isOn;
+      this.appLockStatus = isOn ? '已开启锁定 App' : '已关闭锁定 App';
+      this.privacySettingsRevision++;
+      this.toast(isOn ? '已开启锁定 App' : '已关闭锁定 App');
+    });
   }
 
-  private parseFavoriteCategoryCounts(raw: string): number[] {
-    const counts = this.emptyFavoriteCategoryCounts();
-    try {
-      const parsed = JSON.parse(raw) as Array<number | string>;
-      if (!Array.isArray(parsed)) {
-        return counts;
-      }
-      for (let index = 0; index < FAVORITE_SLOT_NAMES.length; index++) {
-        const value = parsed[index];
-        const count = typeof value === 'number' ? value : Number(value);
-        counts[index] = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
-      }
-      return counts;
-    } catch (error) {
-      return counts;
-    }
+  private async toggleAppLockEnabledFromStore(): Promise<void> {
+    await this.setAppLockEnabled(!this.appLockEnabled);
   }
 
-  private parseLocalGalleryRecord(item: Record<string, Object>): LocalGalleryRecord | undefined {
-    const gid = this.readObjectNumber(item, 'gid', 0);
-    const detailUrl = this.readObjectString(item, 'detailUrl', '');
-    if (!Number.isFinite(gid) || gid <= 0 || detailUrl.length === 0) {
-      return undefined;
+  private setBackgroundPreviewProtectionEnabled(isOn: boolean): void {
+    const currentEnabled = this.backgroundPreviewProtectionEnabled;
+    if (isOn === currentEnabled) {
+      return;
     }
-    const record: LocalGalleryRecord = {
-      gid,
-      token: this.readObjectString(item, 'token', ''),
-      title: this.readObjectString(item, 'title', ''),
-      titleJpn: this.readObjectString(item, 'titleJpn', ''),
-      cover: this.readObjectString(item, 'cover', ''),
-      detailUrl,
-      site: this.readObjectString(item, 'site', GallerySite.E),
-      uploader: this.readObjectString(item, 'uploader', ''),
-      categoryLabel: this.readObjectString(item, 'categoryLabel', ''),
-      posted: this.readObjectString(item, 'posted', ''),
-      pages: this.readObjectNumber(item, 'pages', 0),
-      language: this.readObjectString(item, 'language', ''),
-      rating: this.readObjectNumber(item, 'rating', -1)
-    };
-    return record;
+    if (!this.writeValue(BACKGROUND_PREVIEW_PROTECTION_KEY, isOn)) {
+      this.backgroundPreviewProtectionEnabled = currentEnabled;
+      this.privacySettingsRevision++;
+      return;
+    }
+    this.backgroundPreviewProtectionEnabled = isOn;
+    this.privacySettingsRevision++;
   }
 
   private parseHistoryItems(raw: string): HistoryItem[] {
@@ -1644,16 +1629,28 @@ struct Index {
       }
       const items: HistoryItem[] = [];
       for (const item of parsed) {
-        const record = this.parseLocalGalleryRecord(item);
+        const record = parseLocalGalleryRecord(item);
         if (!record) {
           continue;
         }
-        items.push(this.toHistoryItem(record, this.readObjectString(item, 'visitedAt', '')));
+        items.push(this.toHistoryItem(record, readObjectString(item, 'visitedAt', '')));
       }
       return items.slice(0, LOCAL_LIST_LOAD_LIMIT);
     } catch (error) {
       return [];
     }
+  }
+
+  private loadReaderProgressSettings(): void {
+    this.readerProgressByGallery.clear();
+    const progressByGallery = parseReaderProgress(this.readString(READER_PROGRESS_KEY, '{}'));
+    for (const key of progressByGallery.keys()) {
+      const page = progressByGallery.get(key);
+      if (page !== undefined) {
+        this.readerProgressByGallery.set(key, page);
+      }
+    }
+    this.readerProgressRevision++;
   }
 
   private parseDownloadItems(raw: string): DownloadQueueItem[] {
@@ -1664,113 +1661,35 @@ struct Index {
       }
       const items: DownloadQueueItem[] = [];
       for (const item of parsed) {
-        const record = this.parseLocalGalleryRecord(item);
+        const record = parseLocalGalleryRecord(item);
         if (!record) {
           continue;
         }
         items.push(this.toDownloadItem(
           record,
-          this.readObjectString(item, 'status', DOWNLOAD_STATUS_QUEUED),
-          this.readObjectString(item, 'queuedAt', ''),
-          this.readObjectString(item, 'lastAction', ''),
-          this.readObjectString(item, 'label', DOWNLOAD_DEFAULT_LABEL),
-          this.readObjectNumber(item, 'downloaded', 0),
-          this.readObjectNumber(item, 'total', record.pages),
-          this.readObjectNumber(item, 'failedCount', 0),
-          this.readObjectString(item, 'archiveUri', ''),
-          this.readObjectString(item, 'createdAt', ''),
-          this.readObjectString(item, 'updatedAt', ''),
-          this.readObjectNumber(item, 'currentPage', 0),
-          this.readObjectString(item, 'currentPageLabel', ''),
-          this.readObjectNumber(item, 'speedBytesPerSecond', 0),
-          this.readObjectNumber(item, 'remainingSeconds', -1),
-          this.readObjectString(item, 'downloadDir', ''),
-          this.readObjectString(item, 'error', ''),
-          this.parseDownloadPageErrorsFromObject(item)
+          readObjectString(item, 'status', DOWNLOAD_STATUS_QUEUED),
+          readObjectString(item, 'queuedAt', ''),
+          readObjectString(item, 'lastAction', ''),
+          readObjectString(item, 'label', DOWNLOAD_DEFAULT_LABEL),
+          readObjectNumber(item, 'downloaded', 0),
+          readObjectNumber(item, 'total', record.pages),
+          readObjectNumber(item, 'failedCount', 0),
+          readObjectString(item, 'archiveUri', ''),
+          readObjectString(item, 'createdAt', ''),
+          readObjectString(item, 'updatedAt', ''),
+          readObjectNumber(item, 'currentPage', 0),
+          readObjectString(item, 'currentPageLabel', ''),
+          readObjectNumber(item, 'speedBytesPerSecond', 0),
+          readObjectNumber(item, 'remainingSeconds', -1),
+          readObjectString(item, 'downloadDir', ''),
+          readObjectString(item, 'error', ''),
+          parseDownloadPageErrorsFromObject(item)
         ));
       }
       return items.slice(0, 80);
     } catch (error) {
       return [];
     }
-  }
-
-  private parseDownloadPageErrorsFromObject(item: Record<string, Object>): DownloadPageError[] {
-    const raw = item['pageErrors'];
-    if (typeof raw === 'string') {
-      return this.parseDownloadPageErrors(raw);
-    }
-    if (Array.isArray(raw)) {
-      return this.normalizeDownloadPageErrors(raw as Array<Record<string, Object>>);
-    }
-    return [];
-  }
-
-  private parseDownloadPageErrors(raw: string): DownloadPageError[] {
-    try {
-      const parsed = JSON.parse(raw) as Array<Record<string, Object>>;
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return this.normalizeDownloadPageErrors(parsed);
-    } catch (error) {
-      return [];
-    }
-  }
-
-  private normalizeDownloadPageErrors(parsed: Array<Record<string, Object>>): DownloadPageError[] {
-    const errors: DownloadPageError[] = [];
-    for (const item of parsed) {
-      const page = this.readObjectNumber(item, 'page', 0);
-      const message = this.readObjectString(item, 'message', '');
-      if (page <= 0 || message.length === 0) {
-        continue;
-      }
-      errors.push({
-        page,
-        message,
-        updatedAt: this.readObjectString(item, 'updatedAt', '')
-      });
-    }
-    return errors.slice(0, 200);
-  }
-
-  private parseDownloadLabels(raw: string): DownloadLabelItem[] {
-    try {
-      const parsed = JSON.parse(raw) as Array<Record<string, Object>>;
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      const labels: DownloadLabelItem[] = [];
-      for (const item of parsed) {
-        const label = this.readObjectString(item, 'label', '').trim();
-        if (label.length === 0 || labels.some((entry: DownloadLabelItem) => entry.label === label)) {
-          continue;
-        }
-        labels.push({
-          label,
-          createdAt: this.readObjectString(item, 'createdAt', this.nowLabel())
-        });
-      }
-      return labels.slice(0, 40);
-    } catch (error) {
-      return [];
-    }
-  }
-
-  private ensureDownloadDefaultLabel(labels: DownloadLabelItem[]): DownloadLabelItem[] {
-    const normalized: DownloadLabelItem[] = [];
-    const now = this.nowLabel();
-    normalized.push({ label: DOWNLOAD_DEFAULT_LABEL, createdAt: now });
-    for (const label of labels) {
-      const name = label.label.trim();
-      if (name.length === 0 || name === DOWNLOAD_DEFAULT_LABEL ||
-        normalized.some((entry: DownloadLabelItem) => entry.label === name)) {
-        continue;
-      }
-      normalized.push({ label: name, createdAt: label.createdAt.length > 0 ? label.createdAt : now });
-    }
-    return normalized;
   }
 
   private recoverInterruptedDownloads(items: DownloadQueueItem[]): DownloadQueueItem[] {
@@ -1845,7 +1764,7 @@ struct Index {
     }
     const dbLabels = await this.loadDownloadLabelsFromDatabase();
     if (dbLabels.length > 0) {
-      this.downloadLabels = this.ensureDownloadDefaultLabel(dbLabels);
+      this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
     }
     this.refreshDownloadManagerStatusFromState();
   }
@@ -1899,6 +1818,11 @@ struct Index {
     }
   }
 
+  private saveReaderProgressSettings(): void {
+    this.writeValue(READER_PROGRESS_KEY, JSON.stringify(readerProgressSnapshot(this.readerProgressByGallery)));
+    this.readerProgressRevision++;
+  }
+
   private saveDownloadItems(): void {
     const snapshot = [...this.downloadItems];
     this.publishSharedDownloadItems();
@@ -1932,10 +1856,6 @@ struct Index {
     }
   }
 
-  private clampNumber(value: number, min: number, max: number): number {
-    return Math.min(max, Math.max(min, value));
-  }
-
   private normalizeReaderSettingValue(value: string, options: string[], fallback: string): string {
     return options.indexOf(value) >= 0 ? value : fallback;
   }
@@ -1965,7 +1885,7 @@ struct Index {
       READER_START_POSITION_VALUES,
       '1'
     );
-    this.readerAutoTransferSeconds = this.clampNumber(Math.floor(this.readNumber(READER_KEY_START_TRANSFER_TIME, 2)), 1, 120);
+    this.readerAutoTransferSeconds = clampNumber(Math.floor(this.readNumber(READER_KEY_START_TRANSFER_TIME, 2)), 1, 120);
     this.readerKeepScreenOn = this.readBoolean(READER_KEY_KEEP_SCREEN_ON, false);
     this.readerShowClock = this.readBoolean(READER_KEY_SHOW_CLOCK, true);
     this.readerShowProgress = this.readBoolean(READER_KEY_SHOW_PROGRESS, true);
@@ -1975,8 +1895,8 @@ struct Index {
     this.readerReverseVolumePage = this.readBoolean(READER_KEY_REVERSE_VOLUME_PAGE, false);
     this.readerReadingFullscreen = this.readBoolean(READER_KEY_FULLSCREEN, true);
     this.readerCustomScreenLightness = this.readBoolean(READER_KEY_CUSTOM_LIGHTNESS, false);
-    this.readerScreenLightness = this.clampNumber(Math.floor(this.readNumber(READER_KEY_SCREEN_LIGHTNESS, 50)), 0, 200);
-    this.readerPreloadImageCount = this.clampNumber(
+    this.readerScreenLightness = clampNumber(Math.floor(this.readNumber(READER_KEY_SCREEN_LIGHTNESS, 50)), 0, 200);
+    this.readerPreloadImageCount = clampNumber(
       Math.floor(this.readNumber(READER_KEY_PRELOAD_IMAGE, READER_DEFAULT_PRELOAD_IMAGE)),
       0,
       READER_MAX_PRELOAD_IMAGE
@@ -1986,12 +1906,12 @@ struct Index {
   }
 
   private loadCachePolicySettings(): void {
-    this.cacheMaxSizeMb = this.clampNumber(
+    this.cacheMaxSizeMb = clampNumber(
       Math.floor(this.readNumber(CACHE_KEY_MAX_SIZE_MB, CACHE_DEFAULT_MAX_SIZE_MB)),
       CACHE_MIN_MAX_SIZE_MB,
       CACHE_MAX_MAX_SIZE_MB
     );
-    this.cacheRetentionDays = this.clampNumber(
+    this.cacheRetentionDays = clampNumber(
       Math.floor(this.readNumber(CACHE_KEY_RETENTION_DAYS, CACHE_DEFAULT_RETENTION_DAYS)),
       CACHE_MIN_RETENTION_DAYS,
       CACHE_MAX_RETENTION_DAYS
@@ -2017,7 +1937,7 @@ struct Index {
     if (nextInput.length === 0) {
       return;
     }
-    const nextValue = this.clampNumber(Number(nextInput), CACHE_MIN_MAX_SIZE_MB, CACHE_MAX_MAX_SIZE_MB);
+    const nextValue = clampNumber(Number(nextInput), CACHE_MIN_MAX_SIZE_MB, CACHE_MAX_MAX_SIZE_MB);
     this.cacheMaxSizeMb = nextValue;
     this.cacheMaxSizeInput = `${nextValue}`;
     this.writeValue(CACHE_KEY_MAX_SIZE_MB, nextValue);
@@ -2030,7 +1950,7 @@ struct Index {
     if (nextInput.length === 0) {
       return;
     }
-    const nextValue = this.clampNumber(Number(nextInput), CACHE_MIN_RETENTION_DAYS, CACHE_MAX_RETENTION_DAYS);
+    const nextValue = clampNumber(Number(nextInput), CACHE_MIN_RETENTION_DAYS, CACHE_MAX_RETENTION_DAYS);
     this.cacheRetentionDays = nextValue;
     this.cacheRetentionDaysInput = `${nextValue}`;
     this.writeValue(CACHE_KEY_RETENTION_DAYS, nextValue);
@@ -2103,7 +2023,7 @@ struct Index {
   }
 
   private setReaderAutoTransferSeconds(value: number): void {
-    this.readerAutoTransferSeconds = this.clampNumber(Math.round(value), 1, 120);
+    this.readerAutoTransferSeconds = clampNumber(Math.round(value), 1, 120);
     this.writeValue(READER_KEY_START_TRANSFER_TIME, this.readerAutoTransferSeconds);
     if (this.readerAutoTransferring) {
       this.startReaderAutoTransfer();
@@ -2115,7 +2035,7 @@ struct Index {
   }
 
   private setReaderScreenLightness(value: number): void {
-    this.readerScreenLightness = this.clampNumber(Math.round(value), 0, 200);
+    this.readerScreenLightness = clampNumber(Math.round(value), 0, 200);
     this.writeValue(READER_KEY_SCREEN_LIGHTNESS, this.readerScreenLightness);
   }
 
@@ -2399,12 +2319,12 @@ struct Index {
   }
 
   private readerPageIndexForSwiperIndex(index: number, total: number = this.readerTotalPageCount()): number {
-    const normalizedIndex = this.clampNumber(Math.floor(index), 0, Math.max(0, total - 1));
+    const normalizedIndex = clampNumber(Math.floor(index), 0, Math.max(0, total - 1));
     return this.isReaderReverseSwiperOrder() ? Math.max(0, total - 1 - normalizedIndex) : normalizedIndex;
   }
 
   private readerSwiperIndexForPageIndex(pageIndex: number, total: number = this.readerTotalPageCount()): number {
-    const normalizedPageIndex = this.clampNumber(Math.floor(pageIndex), 0, Math.max(0, total - 1));
+    const normalizedPageIndex = clampNumber(Math.floor(pageIndex), 0, Math.max(0, total - 1));
     return this.isReaderReverseSwiperOrder() ? Math.max(0, total - 1 - normalizedPageIndex) : normalizedPageIndex;
   }
 
@@ -2452,7 +2372,7 @@ struct Index {
     }
     const previewPageCount = Math.max(1, this.nativePreviewPageCount, this.nativeDetail.previewPageCount,
       this.nativeAllPreviewPageCount);
-    const boundedPageIndex = this.clampNumber(Math.floor(previewPageIndex), 0, Math.max(0, previewPageCount - 1));
+    const boundedPageIndex = clampNumber(Math.floor(previewPageIndex), 0, Math.max(0, previewPageCount - 1));
     const pending = this.readerPreviewPageInFlight.get(boundedPageIndex);
     if (pending) {
       await pending;
@@ -2498,7 +2418,7 @@ struct Index {
 
     const previewPageCount = Math.max(1, this.nativePreviewPageCount, this.nativeDetail.previewPageCount,
       this.nativeAllPreviewPageCount);
-    const guessedPage = this.clampNumber(
+    const guessedPage = clampNumber(
       Math.floor(pageIndex / this.readerPreviewPageSizeEstimate()),
       0,
       Math.max(0, previewPageCount - 1)
@@ -3011,7 +2931,7 @@ struct Index {
 
   private startReaderAutoTransfer(): void {
     this.stopReaderAutoTransfer();
-    const intervalSeconds = this.clampNumber(this.readerAutoTransferSeconds, 1, 120);
+    const intervalSeconds = clampNumber(this.readerAutoTransferSeconds, 1, 120);
     this.readerAutoTransferSeconds = intervalSeconds;
     this.readerAutoTransferring = true;
     const handle = setInterval(() => {
@@ -3895,7 +3815,7 @@ struct Index {
   }
 
   private adjustReaderPreloadImageCount(delta: number): void {
-    this.readerPreloadImageCount = this.clampNumber(this.readerPreloadImageCount + delta, 0, READER_MAX_PRELOAD_IMAGE);
+    this.readerPreloadImageCount = clampNumber(this.readerPreloadImageCount + delta, 0, READER_MAX_PRELOAD_IMAGE);
     this.writeValue(READER_KEY_PRELOAD_IMAGE, this.readerPreloadImageCount);
     if (this.nativeViewMode === 'reader') {
       this.scheduleReaderPreloadWindow(this.nativeReaderPage.pageUrl);
@@ -7443,7 +7363,7 @@ struct Index {
     const created = createdAt.length > 0 ? createdAt : (queuedAt.length > 0 ? queuedAt : this.nowLabel());
     const updated = updatedAt.length > 0 ? updatedAt : created;
     const normalizedTotal = total > 0 ? total : record.pages;
-    const normalizedDownloaded = this.clampNumber(downloaded, 0, Math.max(0, normalizedTotal));
+    const normalizedDownloaded = clampNumber(downloaded, 0, Math.max(0, normalizedTotal));
     const item: DownloadQueueItem = {
       gid: record.gid,
       token: record.token,
@@ -7562,7 +7482,7 @@ struct Index {
   }
 
   private toggleExcludedLanguage(tag: string): void {
-    if (!this.isSupportedExcludedLanguageTag(tag)) {
+    if (!isSupportedExcludedLanguageTag(tag)) {
       return;
     }
     if (this.isExcludedLanguageSelected(tag)) {
@@ -7764,6 +7684,53 @@ struct Index {
 
   private historyKey(record: LocalGalleryRecord): string {
     return `${record.site}-${record.gid}`;
+  }
+
+  private currentGalleryProgressKey(): string {
+    if (this.nativeDetail.gid <= 0) {
+      return '';
+    }
+    return `${this.siteMode}-${this.nativeDetail.gid}`;
+  }
+
+  private currentGalleryProgressPage(): number {
+    this.readerProgressRevision;
+    const key = this.currentGalleryProgressKey();
+    if (key.length === 0) {
+      return 0;
+    }
+    const page = this.readerProgressByGallery.get(key);
+    if (page === undefined || page <= 0) {
+      return 0;
+    }
+    const upperBound = Math.max(1, this.nativeDetail.pages, this.readerTotalPageCount());
+    return clampNumber(Math.floor(page), 1, upperBound);
+  }
+
+  private hasCurrentGalleryProgress(): boolean {
+    return this.currentGalleryProgressPage() > 0;
+  }
+
+  private currentGalleryProgressSubtitle(): string {
+    const page = this.currentGalleryProgressPage();
+    return page > 0 ? `从${page}页` : `${this.nativeDetail.pages} 页`;
+  }
+
+  private persistCurrentReaderProgress(): void {
+    if (this.nativeDetail.gid <= 0 || this.nativeReaderPage.pageIndex < 0) {
+      return;
+    }
+    const key = this.currentGalleryProgressKey();
+    if (key.length === 0) {
+      return;
+    }
+    const page = clampNumber(
+      Math.floor(this.nativeReaderPage.pageIndex) + 1,
+      1,
+      Math.max(1, this.nativeDetail.pages, this.readerTotalPageCount())
+    );
+    this.readerProgressByGallery.set(key, page);
+    this.saveReaderProgressSettings();
   }
 
   private downloadKey(gid: number, site: string): string {
@@ -8507,6 +8474,34 @@ struct Index {
         return;
       }
       await this.openNativeReaderByPageUrl(firstUrl);
+    } catch (error) {
+      this.nativeError = '阅读器启动失败。';
+    } finally {
+      this.nativeLoading = false;
+      this.nativeLoadingMessage = '正在加载图库...';
+    }
+  }
+
+  private async openNativeReaderFromProgress(): Promise<void> {
+    const page = this.currentGalleryProgressPage();
+    if (page <= 0) {
+      await this.openNativeReaderFromStart();
+      return;
+    }
+    if (!this.ensureNativeSiteReady() || this.nativeDetail.detailUrl.length === 0) {
+      return;
+    }
+    this.nativeLoading = true;
+    this.nativeLoadingMessage = `正在跳转到第 ${page} 页...`;
+    this.nativeError = '';
+    try {
+      const pageUrl = await this.resolveReaderPageUrlByIndex(page - 1);
+      if (pageUrl.length === 0) {
+        this.toast('未找到上次阅读页，已从头开始');
+        await this.openNativeReaderFromStart();
+        return;
+      }
+      await this.openNativeReaderByPageUrl(pageUrl);
     } catch (error) {
       this.nativeError = '阅读器启动失败。';
     } finally {
@@ -9388,7 +9383,7 @@ struct Index {
 
   private adjustSelectedRating(delta: number): void {
     const next = Math.round((this.selectedRating + delta) * 2) / 2;
-    this.selectedRating = this.clampNumber(next, 0.5, 5);
+    this.selectedRating = clampNumber(next, 0.5, 5);
   }
 
   private async submitSelectedRating(): Promise<void> {
@@ -9597,7 +9592,7 @@ struct Index {
     this.torrentStatus = `正在保存 ${item.name}...`;
     try {
       const data = await NativeEhClient.downloadBinary(this.siteMode, item.url, this.nativeDetail.detailUrl);
-      const name = this.safeFileName(item.name, `torrent-${this.nativeDetail.gid}`);
+      const name = safeFileName(item.name, `torrent-${this.nativeDetail.gid}`);
       const path = `${dir}/${name.endsWith('.torrent') ? name : `${name}.torrent`}`;
       this.writeBinaryFile(path, data);
       this.torrentStatus = `已保存到 ${path}`;
@@ -9812,6 +9807,7 @@ struct Index {
   }
 
   private returnFromNativeReader(): void {
+    this.persistCurrentReaderProgress();
     const targetViewMode = this.normalizeReaderReturnViewMode(this.readerReturnViewMode);
     this.stopReaderRuntimeState();
     this.clearReaderTransitionSnapshot();
@@ -10509,7 +10505,7 @@ struct Index {
       pageFractions = new Map<number, number>();
       this.downloadPageTransferFractions.set(key, pageFractions);
     }
-    pageFractions.set(pageIndex, this.clampNumber(fraction, 0, 0.99));
+    pageFractions.set(pageIndex, clampNumber(fraction, 0, 0.99));
   }
 
   private clearDownloadPageTransferFraction(item: DownloadQueueItem, pageIndex: number): void {
@@ -10535,7 +10531,7 @@ struct Index {
     }
     let total = 0;
     pageFractions.forEach((value: number) => {
-      total += this.clampNumber(value, 0, 0.99);
+      total += clampNumber(value, 0, 0.99);
     });
     return total;
   }
@@ -10599,7 +10595,7 @@ struct Index {
 
   private moveDownloadItemToNextLabel(item: DownloadQueueItem): void {
     const current = this.latestDownloadItem(item);
-    const labels = this.ensureDownloadDefaultLabel(this.downloadLabels);
+    const labels = ensureDownloadDefaultLabel(this.downloadLabels, this.nowLabel());
     const currentIndex = Math.max(0, labels.findIndex((entry: DownloadLabelItem) => entry.label === current.label));
     const nextLabel = labels[(currentIndex + 1) % labels.length].label;
     this.replaceDownloadItem(this.toDownloadItem(
@@ -11741,7 +11737,7 @@ struct Index {
             }
             const elapsedSeconds = Math.max(1, (now - startedAt) / 1000);
             lastSpeed = Math.round(Math.max(0, receivedBytes) / elapsedSeconds);
-            const fraction = totalBytes > 0 ? this.clampNumber(receivedBytes / totalBytes, 0, 0.99) : 0;
+            const fraction = totalBytes > 0 ? clampNumber(receivedBytes / totalBytes, 0, 0.99) : 0;
             this.updateDownloadPageTransferFraction(current, index, fraction);
             const activeFraction = this.downloadPageTransferFractionSum(current);
             const remainingPages = Math.max(0, total - downloaded - failedCount - activeFraction);
@@ -11749,8 +11745,8 @@ struct Index {
             const remainingSeconds = lastSpeed > 0 ? Math.round(remainingPages * bytesBasis / lastSpeed) : -1;
             const percent = totalBytes > 0 ? ` ${Math.round(fraction * 100)}%` : '';
             const byteText = totalBytes > 0 ?
-              `${this.formatByteSize(receivedBytes)}/${this.formatByteSize(totalBytes)}` :
-              this.formatByteSize(receivedBytes);
+              `${formatByteSize(receivedBytes)}/${formatByteSize(totalBytes)}` :
+              formatByteSize(receivedBytes);
             const pageLabel = `第 ${index + 1} 页${percent}`;
             const shouldPersist = now - lastProgressPersistAt >= DOWNLOAD_PROGRESS_PERSIST_INTERVAL_MS || complete;
             if (shouldPersist) {
@@ -11831,7 +11827,7 @@ struct Index {
           }
         }
       };
-      const workerCount = this.clampNumber(this.downloadConcurrency, 1, DOWNLOAD_MAX_CONCURRENCY);
+      const workerCount = clampNumber(this.downloadConcurrency, 1, DOWNLOAD_MAX_CONCURRENCY);
       const workers: Promise<void>[] = [];
       for (let index = 0; index < workerCount; index++) {
         workers.push(runPageWorker());
@@ -12097,63 +12093,6 @@ struct Index {
     return items;
   }
 
-  private formatRating(value: number): string {
-    return value >= 0 ? value.toFixed(1) : 'N/A';
-  }
-
-  private compactTags(tags: string[]): string {
-    const values = tags
-      .slice(0, 4)
-      .map((tag: string) => {
-        const separatorIndex = tag.indexOf(':');
-        if (separatorIndex < 0) {
-          return EhTagTranslator.translateFullTag(tag);
-        }
-        const namespace = tag.substring(0, separatorIndex);
-        const body = tag.substring(separatorIndex + 1);
-        return EhTagTranslator.translateTag(namespace, body);
-      });
-    return values.join('  ·  ');
-  }
-
-  private categoryColor(categoryLabel: string): string {
-    switch (categoryLabel.toLowerCase()) {
-      case 'doujinshi':
-        return '#F44336';
-      case 'manga':
-        return '#FF9800';
-      case 'artist cg sets':
-      case 'artist cg':
-      case 'artistcg':
-        return '#FBC02D';
-      case 'game cg sets':
-      case 'game cg':
-      case 'gamecg':
-        return '#4CAF50';
-      case 'western':
-        return '#8BC34A';
-      case 'non-h':
-        return '#2196F3';
-      case 'image sets':
-      case 'image set':
-      case 'imageset':
-        return '#3F51B5';
-      case 'cosplay':
-        return '#9C27B0';
-      case 'asian porn':
-      case 'asianporn':
-        return '#9575CD';
-      case 'misc':
-        return '#F06292';
-      default:
-        return '#757575';
-    }
-  }
-
-  private metaLine(label: string, value: string): string {
-    return `${label}: ${value.length > 0 ? value : '-'}`;
-  }
-
   private downloadStatusLabel(status: string): string {
     switch (status) {
       case DOWNLOAD_STATUS_DOWNLOADING:
@@ -12213,7 +12152,7 @@ struct Index {
       return 0;
     }
     const activeFraction = this.isDownloadItemRunning(item) ? this.downloadPageTransferFractionSum(item) : 0;
-    return this.clampNumber((Math.floor(item.downloaded) + activeFraction) / item.total, 0, 1);
+    return clampNumber((Math.floor(item.downloaded) + activeFraction) / item.total, 0, 1);
   }
 
   private downloadProgressText(item: DownloadQueueItem): string {
@@ -12226,44 +12165,6 @@ struct Index {
     const current = this.isDownloadItemRunning(item) && item.currentPageLabel.length > 0 ?
       ` · ${item.currentPageLabel}` : '';
     return `${downloaded}/${total}${failed}${current}`;
-  }
-
-  private formatByteSize(value: number): string {
-    if (value <= 0) {
-      return '0 B';
-    }
-    if (value >= 1024 * 1024) {
-      return `${(value / 1024 / 1024).toFixed(1)} MB`;
-    }
-    if (value >= 1024) {
-      return `${(value / 1024).toFixed(0)} KB`;
-    }
-    return `${Math.round(value)} B`;
-  }
-
-  private formatBytesPerSecond(value: number): string {
-    if (value <= 0) {
-      return '--';
-    }
-    if (value >= 1024 * 1024) {
-      return `${(value / 1024 / 1024).toFixed(1)} MB/s`;
-    }
-    if (value >= 1024) {
-      return `${(value / 1024).toFixed(0)} KB/s`;
-    }
-    return `${Math.round(value)} B/s`;
-  }
-
-  private formatRemainingSeconds(value: number): string {
-    if (value < 0) {
-      return '--';
-    }
-    if (value < 60) {
-      return `${value}s`;
-    }
-    const minutes = Math.floor(value / 60);
-    const seconds = value % 60;
-    return `${minutes}m ${seconds}s`;
   }
 
   private setDownloadViewMode(value: string): void {
@@ -12635,6 +12536,7 @@ struct Index {
       return;
     }
     if (this.nativeViewMode === 'reader') {
+      this.persistCurrentReaderProgress();
       if (this.routeNativeMode === ROUTE_NATIVE_READER && this.tryRouterBack()) {
         return;
       }
@@ -13308,7 +13210,7 @@ struct Index {
       return;
     }
     const nextNames = FAVORITE_SLOT_NAMES.slice();
-    const nextCounts = this.emptyFavoriteCategoryCounts();
+    const nextCounts = emptyFavoriteCategoryCounts();
     for (const item of slots) {
       if (item.slot < 0 || item.slot >= FAVORITE_SLOT_NAMES.length) {
         continue;
@@ -13404,15 +13306,6 @@ struct Index {
   private setDefaultFavoriteSlot(slot: number): void {
     this.defaultFavoriteSlot = this.normalizeFavoriteSlot(slot, true);
     this.writeValue(FAVORITE_DEFAULT_SLOT_KEY, this.defaultFavoriteSlot);
-  }
-
-  private safeFileName(value: string, fallback: string): string {
-    const cleaned = value
-      .replace(/[\\/:*?"<>|]/g, '_')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .substring(0, 120);
-    return cleaned.length > 0 ? cleaned : fallback;
   }
 
   private torrentMetaLine(item: NativeTorrentItem): string {
@@ -13776,8 +13669,8 @@ struct Index {
         lastEnabled: this.homeLastUrl.length > 0 && !this.homeLoading,
         imageVersion: this.galleryImageCacheVersion,
         imageUrlForItem: (item: NativeGallerySummary): string => this.galleryImageDisplayUrl(item.thumb),
-        categoryColorForItem: (category: string): string => this.categoryColor(category),
-        formatRatingValue: (rating: number): string => this.formatRating(rating),
+        categoryColorForItem: (category: string): string => categoryColor(category),
+        formatRatingValue: (rating: number): string => formatRating(rating),
         transitionIdForItem: (item: NativeGallerySummary): string => this.galleryCoverTransitionIdForSummary(item),
         onOpenItem: (item: NativeGallerySummary): void => {
           void this.openNativeDetail(item);
@@ -13817,8 +13710,8 @@ struct Index {
         lastEnabled: this.favoriteLastUrl.length > 0 && !this.favoriteLoading,
         imageVersion: this.galleryImageCacheVersion,
         imageUrlForItem: (item: NativeGallerySummary): string => this.galleryImageDisplayUrl(item.thumb),
-        categoryColorForItem: (category: string): string => this.categoryColor(category),
-        formatRatingValue: (rating: number): string => this.formatRating(rating),
+        categoryColorForItem: (category: string): string => categoryColor(category),
+        formatRatingValue: (rating: number): string => formatRating(rating),
         transitionIdForItem: (item: NativeGallerySummary): string => this.galleryCoverTransitionIdForSummary(item),
         onOpenItem: (item: NativeGallerySummary): void => {
           if (this.favoriteListFilter === FAVORITE_FILTER_LOCAL) {
@@ -13883,8 +13776,8 @@ struct Index {
         lastEnabled: this.searchLastUrl.length > 0 && !this.searchLoading,
         imageVersion: this.galleryImageCacheVersion,
         imageUrlForItem: (item: NativeGallerySummary): string => this.galleryImageDisplayUrl(item.thumb),
-        categoryColorForItem: (category: string): string => this.categoryColor(category),
-        formatRatingValue: (rating: number): string => this.formatRating(rating),
+        categoryColorForItem: (category: string): string => categoryColor(category),
+        formatRatingValue: (rating: number): string => formatRating(rating),
         transitionIdForItem: (item: NativeGallerySummary): string => this.galleryCoverTransitionIdForSummary(item),
         onOpenItem: (item: NativeGallerySummary): void => {
           void this.openNativeDetail(item);
@@ -14078,7 +13971,7 @@ struct Index {
       .height(28)
       .fontSize(11)
       .fontColor(this.categorySelected(bit) ? '#FFFFFF' : '#2B2027')
-      .backgroundColor(this.categorySelected(bit) ? this.categoryColor(colorKey) : '#F3E3EA')
+      .backgroundColor(this.categorySelected(bit) ? categoryColor(colorKey) : '#F3E3EA')
       .borderRadius(8)
       .margin({ right: 8, bottom: 8 })
       .onClick(() => {
@@ -14315,6 +14208,39 @@ struct Index {
       !this.hasAvailableCookie() &&
       this.fullScreenWebUrl.length === 0 &&
       !this.hasActiveReaderPage();
+  }
+
+  private shouldShowAppLockOverlay(): boolean {
+    return this.isReady && this.appLockEnabled && this.appLockForegroundRequired;
+  }
+
+  private appLockOverlayTransition(): TransitionEffect {
+    const appear = TransitionEffect.opacity(0);
+    const disappear = TransitionEffect.opacity(0)
+      .combine(TransitionEffect.scale({ x: 1.03, y: 1.03, centerX: '50%', centerY: '50%' }));
+    return TransitionEffect.asymmetric(appear, disappear)
+      .animation({ duration: 260, curve: Curve.EaseOut });
+  }
+
+  @Builder
+  private AppLockOverlay(): void {
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+      }
+        .width('100%')
+        .height('100%');
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ top: this.systemSafeTop, bottom: this.systemSafeBottom })
+    .backgroundColor('#FFFFFF')
+    .onClick(() => {
+      if (!this.appLockAuthInProgress) {
+        void this.requireAppUnlockIfNeeded();
+      }
+    })
+    .transition(this.appLockOverlayTransition())
+    .zIndex(190);
   }
 
   @Builder
@@ -15438,9 +15364,9 @@ struct Index {
             .fontSize(11)
             .fontColor('#FFFFFF')
             .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-            .backgroundColor(this.categoryColor(item.categoryLabel))
+            .backgroundColor(categoryColor(item.categoryLabel))
             .borderRadius(6);
-          Text(`评分 ${this.formatRating(item.rating)}`)
+          Text(`评分 ${formatRating(item.rating)}`)
             .fontSize(12)
             .fontColor('#6F5964');
         }
@@ -15448,7 +15374,7 @@ struct Index {
           .fontSize(12)
           .fontColor('#7C6470');
         if (item.simpleTags.length > 0) {
-          Text(this.compactTags(item.simpleTags))
+          Text(compactTags(item.simpleTags))
             .fontSize(11)
             .lineHeight(16)
             .fontColor('#7C6470')
@@ -15845,6 +15771,45 @@ struct Index {
   }
 
   @Builder
+  private NativeDetailReadButton(): void {
+    Stack({ alignContent: Alignment.Top }) {
+      this.NativeDetailSquareButton(
+        this.hasCurrentGalleryProgress() ? '继续阅读' : '阅读',
+        this.hasCurrentGalleryProgress() ? this.currentGalleryProgressSubtitle() : `${this.nativeDetail.pages} 页`,
+        $r('sys.symbol.eye'),
+        true,
+        (): void => {
+          if (this.hasCurrentGalleryProgress()) {
+            void this.openNativeReaderFromProgress();
+          } else {
+            void this.openNativeReaderFromStart();
+          }
+        }
+      );
+
+      if (this.hasCurrentGalleryProgress()) {
+        Button('重新阅读')
+          .height(22)
+          .padding({ left: 8, right: 8 })
+          .fontSize(10)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#A85474')
+          .backgroundColor('#FFFFFF')
+          .border({ width: 1, color: '#E8C8D6' })
+          .borderRadius(11)
+          .shadow(ShadowStyle.OUTER_DEFAULT_XS)
+          .translate({ y: -8 })
+          .zIndex(2)
+          .onClick(() => {
+            void this.openNativeReaderFromStart();
+          });
+      }
+    }
+    .width('100%')
+    .height('100%');
+  }
+
+  @Builder
   private NativeFavoriteBar(): void {
     Row({ space: FAVORITE_BAR_GAP }) {
       Button() {
@@ -15894,9 +15859,7 @@ struct Index {
     Column({ space: 8 }) {
       Grid() {
         GridItem() {
-          this.NativeDetailSquareButton('阅读', `${this.nativeDetail.pages} 页`, $r('sys.symbol.eye'), true, (): void => {
-            void this.openNativeReaderFromStart();
-          });
+          this.NativeDetailReadButton();
         }
         GridItem() {
           this.NativeDetailSquareButton('书签', this.galleryBookmarkLabel(), $r('sys.symbol.star_fill'), false, (): void => {
@@ -16483,9 +16446,9 @@ struct Index {
       imageVersion: this.galleryImageCacheVersion + this.nativeDetailRevision,
       coverTransitionId: this.galleryCoverTransitionIdForDetail(),
       coverUrlFor: (value: string): string => this.galleryImageDisplayUrl(value),
-      categoryColorFor: (value: string): string => this.categoryColor(value),
-      formatRatingValue: (rating: number): string => this.formatRating(rating),
-      metaLineFor: (label: string, value: string): string => this.metaLine(label, value),
+      categoryColorFor: (value: string): string => categoryColor(value),
+      formatRatingValue: (rating: number): string => formatRating(rating),
+      metaLineFor: (label: string, value: string): string => metaLine(label, value),
       onRead: (): void => {
         void this.openNativeReaderFromStart();
       },
@@ -17628,8 +17591,8 @@ struct Index {
       statusColorForItem: (item: DownloadQueueItem): string => this.downloadItemStatusColor(item),
       progressRatioForItem: (item: DownloadQueueItem): number => this.downloadProgressRatio(item),
       progressTextForItem: (item: DownloadQueueItem): string => this.downloadProgressText(item),
-      speedTextForItem: (item: DownloadQueueItem): string => this.formatBytesPerSecond(item.speedBytesPerSecond),
-      remainingTextForItem: (item: DownloadQueueItem): string => this.formatRemainingSeconds(item.remainingSeconds),
+      speedTextForItem: (item: DownloadQueueItem): string => formatBytesPerSecond(item.speedBytesPerSecond),
+      remainingTextForItem: (item: DownloadQueueItem): string => formatRemainingSeconds(item.remainingSeconds),
       isItemRunning: (item: DownloadQueueItem): boolean => this.isDownloadItemRunning(item),
       onViewModeChange: (value: string): void => {
         this.setDownloadViewMode(value);
@@ -17718,7 +17681,7 @@ struct Index {
               .fontSize(10)
               .fontColor('#FFFFFF')
               .padding({ left: 7, right: 7, top: 3, bottom: 3 })
-              .backgroundColor(this.categoryColor(item.categoryLabel))
+              .backgroundColor(categoryColor(item.categoryLabel))
               .borderRadius(9);
           }
           Text(`${item.pages}P`)
@@ -18051,6 +18014,18 @@ struct Index {
           this.BlacklistManagementSection();
         } else {
           this.MyAccountCard();
+          PrivacySettingsCard({
+            appLockEnabled: this.currentAppLockEnabled(),
+            appLockAuthInProgress: this.appLockAuthInProgress,
+            appLockStatus: this.appLockStatus,
+            backgroundPreviewProtectionEnabled: this.currentBackgroundPreviewProtectionEnabled(),
+            onAppLockChange: (isOn: boolean): void => {
+              void this.setAppLockEnabled(isOn);
+            },
+            onBackgroundPreviewProtectionChange: (isOn: boolean): void => {
+              this.setBackgroundPreviewProtectionEnabled(isOn);
+            }
+          });
           this.MyCacheSettingsCard();
           this.MyDownloadSettingsCard();
         }
@@ -19283,6 +19258,10 @@ struct Index {
 
       if (this.shouldShowLoginGate()) {
         this.LoginGateOverlay();
+      }
+
+      if (this.shouldShowAppLockOverlay()) {
+        this.AppLockOverlay();
       }
     }
     .width('100%')
