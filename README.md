@@ -1,10 +1,10 @@
-# E-Harmony
+# HarmonyOS-EhViewer / E-Harmony
 
-E-Harmony 是一个面向 HarmonyOS 平台的非官方 E-Hentai 浏览器，用于浏览该网站的插画、漫画等资源页面。
+HarmonyOS-EhViewer（E-Harmony）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+ 的非官方 E-Hentai / ExHentai 浏览器，使用 ArkTS、ArkUI 和 DevEco Studio 原生开发。
 
-本项目使用 ArkTS 原生开发，支持 HarmonyOS 6.1 及以上版本。项目完全免费，仅供学习交流使用，不提供任何 VPN、代理、网络加速、绕过访问限制或类似服务。
+> 项目完全免费，仅供学习交流使用，不提供任何 VPN、代理、网络加速、绕过访问限制或类似服务，请在遵守所在地法律法规与目标站点规则的前提下使用。有问题欢迎在 [Issues](../../issues) 留言。
 
-> 本项目仅供学习交流。有问题欢迎在 [Issues](../../issues) 留言，请在遵守所在地法律法规与目标站点规则的前提下使用。
+关键词：HarmonyOS EhViewer、鸿蒙 EhViewer、HarmonyOS NEXT 漫画阅读器、ArkTS E-Hentai client、ExHentai viewer。
 
 ## 功能
 
