@@ -174,7 +174,11 @@ export struct GalleryDetailPage {
   private InfoActionBlock(): void {
     Row({ space: 12 }) {
       this.metadataContent();
-      this.actionsContent();
+      if (this.detailRevision % 2 === 0) {
+        this.actionsContent();
+      } else {
+        this.actionsContent();
+      }
     }
     .width('100%')
     .padding(12)

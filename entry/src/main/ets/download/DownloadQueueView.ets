@@ -1,6 +1,7 @@
 import {
   DOWNLOAD_STATUS_DELETED,
   DOWNLOAD_STATUS_DONE,
+  DOWNLOAD_STATUS_QUEUED,
   DOWNLOAD_STATUS_PAUSED,
   DownloadQueueItem
 } from './DownloadModels';
@@ -27,6 +28,7 @@ export struct DownloadQueueView {
   @Prop viewMode: string = DOWNLOAD_VIEW_DOWNLOADED;
   @Prop managerStatus: string = '下载器空闲';
   @Prop downloadRootText: string = '';
+  @Prop revision: number = 0;
   @State private containerWidth: number = 0;
 
   imageUrlForCover: DownloadQueueStringResolver = (value: string): string => value;
@@ -52,6 +54,12 @@ export struct DownloadQueueView {
       item.status !== DOWNLOAD_STATUS_DONE && item.status !== DOWNLOAD_STATUS_DELETED);
   }
 
+  private activeProgressItems(): DownloadQueueItem[] {
+    return this.activeItems().filter((item: DownloadQueueItem) =>
+      item.status !== DOWNLOAD_STATUS_PAUSED &&
+        (this.isItemRunning(item) || item.status === DOWNLOAD_STATUS_QUEUED));
+  }
+
   private downloadedItems(): DownloadQueueItem[] {
     return this.items.filter((item: DownloadQueueItem) => item.status === DOWNLOAD_STATUS_DONE);
   }
@@ -75,7 +83,7 @@ export struct DownloadQueueView {
 
   private totalProgressPages(): number {
     let total = 0;
-    for (const item of this.activeItems()) {
+    for (const item of this.activeProgressItems()) {
       total += this.progressBaseForItem(item);
     }
     return total;
@@ -83,7 +91,7 @@ export struct DownloadQueueView {
 
   private totalCompletedPages(): number {
     let total = 0;
-    for (const item of this.activeItems()) {
+    for (const item of this.activeProgressItems()) {
       total += Math.floor(this.clampRatio(this.progressRatioForItem(item)) * this.progressBaseForItem(item));
     }
     return total;
@@ -106,24 +114,53 @@ export struct DownloadQueueView {
   }
 
   private itemRenderKey(item: DownloadQueueItem): string {
-    const running = this.isItemRunning(item) ? 'running' : 'idle';
-    const progress = Math.round(this.progressRatioForItem(item) * 10000);
-    return [
-      item.site,
-      `${item.gid}`,
-      item.status,
-      running,
-      `${Math.floor(item.downloaded)}`,
-      `${item.total}`,
-      `${item.failedCount}`,
-      `${item.currentPage}`,
-      item.currentPageLabel,
-      `${Math.round(item.speedBytesPerSecond)}`,
-      `${item.remainingSeconds}`,
-      `${progress}`,
-      item.lastAction,
-      item.error
-    ].join('|');
+    const displayState = this.isItemRunning(item) ? 'running' : item.status;
+    return `${item.site}-${item.gid}-${displayState}`;
+  }
+
+  private refreshAwareNumber(value: number): number {
+    return this.revision >= 0 ? value : value;
+  }
+
+  private refreshAwareText(value: string): string {
+    return this.revision >= 0 ? value : value;
+  }
+
+  private itemProgressPercentLive(item: DownloadQueueItem): number {
+    return this.refreshAwareNumber(this.itemProgressPercent(item));
+  }
+
+  private itemStatusLabelLive(item: DownloadQueueItem): string {
+    return this.refreshAwareText(this.statusLabelForItem(item));
+  }
+
+  private itemStatusColorLive(item: DownloadQueueItem): string {
+    return this.refreshAwareText(this.statusColorForItem(item));
+  }
+
+  private itemProgressTextLive(item: DownloadQueueItem): string {
+    return this.refreshAwareText(this.progressTextForItem(item));
+  }
+
+  private itemSpeedTextLive(item: DownloadQueueItem): string {
+    return this.refreshAwareText(this.speedTextForItem(item));
+  }
+
+  private itemRemainingTextLive(item: DownloadQueueItem): string {
+    return this.refreshAwareText(this.remainingTextForItem(item));
+  }
+
+  private itemActionTextLive(item: DownloadQueueItem): string {
+    const text = item.error.length > 0 ? item.error : (item.lastAction.length > 0 ? item.lastAction : item.queuedAt);
+    return this.refreshAwareText(text);
+  }
+
+  private itemActionColorLive(item: DownloadQueueItem): string {
+    return this.refreshAwareText(item.error.length > 0 ? '#B42318' : '#7C6470');
+  }
+
+  private shouldPauseItem(item: DownloadQueueItem): boolean {
+    return this.isItemRunning(item) || item.status === DOWNLOAD_STATUS_QUEUED;
   }
 
   private lengthToNumber(value: Length): number {
@@ -278,17 +315,6 @@ export struct DownloadQueueView {
   }
 
   @Builder
-  private LinearProgressBar(value: number, color: string): void {
-    Progress({ value, total: 100, type: ProgressType.Linear })
-      .width('100%')
-      .height(8)
-      .color(color)
-      .backgroundColor('#EEE4E9')
-      .borderRadius(4)
-      .style({ strokeWidth: 8 });
-  }
-
-  @Builder
   private TotalProgressBlock(clickable: boolean): void {
     Column({ space: 8 }) {
       Row() {
@@ -297,7 +323,7 @@ export struct DownloadQueueView {
             .fontSize(15)
             .fontWeight(FontWeight.Bold)
             .fontColor('#2B2027');
-          Text(`${this.activeItems().length} 个任务 · ${this.totalCompletedPages()}/${this.totalProgressPages()} 页`)
+          Text(`${this.activeProgressItems().length} 个任务 · ${this.totalCompletedPages()}/${this.totalProgressPages()} 页`)
             .fontSize(11)
             .fontColor('#7C6470')
             .maxLines(1);
@@ -310,7 +336,13 @@ export struct DownloadQueueView {
           .fontColor('#A85474');
       }
       .width('100%');
-      this.LinearProgressBar(this.totalProgressPercent(), '#C86B8C');
+      Progress({ value: this.totalProgressPercent(), total: 100, type: ProgressType.Linear })
+        .width('100%')
+        .height(8)
+        .color('#C86B8C')
+        .backgroundColor('#EEE4E9')
+        .borderRadius(4)
+        .style({ strokeWidth: 8 });
       if (this.managerStatus.length > 0) {
         Text(this.managerStatus)
           .fontSize(11)
@@ -455,39 +487,56 @@ export struct DownloadQueueView {
           .fontWeight(FontWeight.Medium)
           .fontColor('#2B2027')
           .maxLines(2);
-        Row({ space: 8 }) {
-          Text(this.statusLabelForItem(item))
+        Column({ space: 7 }) {
+          Row({ space: 8 }) {
+            Text(this.itemStatusLabelLive(item))
+              .fontSize(11)
+              .fontColor('#FFFFFF')
+              .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+              .backgroundColor(this.itemStatusColorLive(item))
+              .borderRadius(6);
+            Text(this.itemProgressTextLive(item))
+              .fontSize(11)
+              .fontColor('#7C6470')
+              .maxLines(1);
+          }
+          .width('100%');
+          Progress({ value: this.itemProgressPercentLive(item), total: 100, type: ProgressType.Linear })
+            .width('100%')
+            .height(8)
+            .color(this.itemStatusColorLive(item))
+            .backgroundColor('#EEE4E9')
+            .borderRadius(4)
+            .style({ strokeWidth: 8 });
+          Row({ space: 10 }) {
+            Text(this.itemSpeedTextLive(item))
+              .fontSize(11)
+              .fontColor('#7C6470');
+            Text(`剩余 ${this.itemRemainingTextLive(item)}`)
+              .fontSize(11)
+              .fontColor('#7C6470');
+          }
+          Text(this.itemActionTextLive(item))
             .fontSize(11)
-            .fontColor('#FFFFFF')
-            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-            .backgroundColor(this.statusColorForItem(item))
-            .borderRadius(6);
-          Text(this.progressTextForItem(item))
-            .fontSize(11)
-            .fontColor('#7C6470')
+            .fontColor(this.itemActionColorLive(item))
             .maxLines(1);
         }
-        .width('100%');
-        this.LinearProgressBar(this.itemProgressPercent(item), this.statusColorForItem(item));
-        Row({ space: 10 }) {
-          Text(this.speedTextForItem(item))
-            .fontSize(11)
-            .fontColor('#7C6470');
-          Text(`剩余 ${this.remainingTextForItem(item)}`)
-            .fontSize(11)
-            .fontColor('#7C6470');
-        }
-        Text(item.error.length > 0 ? item.error : (item.lastAction.length > 0 ? item.lastAction : item.queuedAt))
-          .fontSize(11)
-          .fontColor(item.error.length > 0 ? '#B42318' : '#7C6470')
-          .maxLines(1);
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
         Row({ space: 8 }) {
-          this.IconButton($r('sys.symbol.waveform_folder_fill'), '下载', '#C86B8C', '#FFFFFF', () => {
-            this.onStartItem(item);
-          }, !this.isItemRunning(item));
-          this.IconButton($r('sys.symbol.pause_fill'), '暂停', '#F3E3EA', '#2B2027', () => {
-            this.onPauseItem(item);
-          }, item.status !== DOWNLOAD_STATUS_PAUSED);
+          this.IconButton(
+            this.shouldPauseItem(item) ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
+            this.shouldPauseItem(item) ? '暂停' : '开始',
+            this.shouldPauseItem(item) ? '#F3E3EA' : '#C86B8C',
+            this.shouldPauseItem(item) ? '#2B2027' : '#FFFFFF',
+            () => {
+              if (this.shouldPauseItem(item)) {
+                this.onPauseItem(item);
+              } else {
+                this.onStartItem(item);
+              }
+            }
+          );
           this.IconButton($r('sys.symbol.trash_fill'), '删除', '#FFF3F2', '#B42318', () => {
             this.onRemoveItem(item);
           });
@@ -507,12 +556,10 @@ export struct DownloadQueueView {
   @Builder
   private DownloadedPage(): void {
     Column({ space: 12 }) {
-      if (this.activeItems().length > 0) {
-        this.TotalProgressBlock(true);
-      }
       this.DownloadedWaterfall();
     }
     .width('100%')
+    .justifyContent(FlexAlign.Start)
     .alignItems(HorizontalAlign.Start);
   }
 
@@ -551,6 +598,7 @@ export struct DownloadQueueView {
       }
     }
     .width('100%')
+    .justifyContent(FlexAlign.Start)
     .alignItems(HorizontalAlign.Start);
   }
 

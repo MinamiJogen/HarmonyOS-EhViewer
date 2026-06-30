@@ -1,6 +1,67 @@
 import http from '@ohos.net.http';
 import webview from '@ohos.web.webview';
 import fileIo from '@ohos.file.fs';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { AppNetworkProxy } from '../network/AppNetworkProxy';
+
+const DOMAIN = 0x0000;
+const LOG_TAG = 'EhNative';
+
+interface NativeRequestErrorInfo {
+  code?: number | string;
+  message?: string;
+  data?: string;
+  name?: string;
+}
+
+function isMeaningfulErrorMessage(message: string): boolean {
+  const value = message.replace('Error: ', '').trim();
+  const lower = value.toLowerCase();
+  return value.length > 0 &&
+    lower !== 'undefined' &&
+    lower !== 'null' &&
+    lower !== 'object' &&
+    lower !== 'object object' &&
+    lower !== '[object object]';
+}
+
+function nativeRequestErrorMessage(error: Object | string | undefined, fallback: string): string {
+  const raw = `${error}`.replace('Error: ', '').trim();
+  if (isMeaningfulErrorMessage(raw)) {
+    return raw;
+  }
+  if (error !== undefined && typeof error === 'object') {
+    const info = error as NativeRequestErrorInfo;
+    const parts: string[] = [];
+    const code = `${info.code}`.trim();
+    const message = `${info.message}`.replace('Error: ', '').trim();
+    const data = `${info.data}`.trim();
+    const name = `${info.name}`.trim();
+    if (isMeaningfulErrorMessage(code)) {
+      parts.push(`code=${code}`);
+    }
+    if (isMeaningfulErrorMessage(message)) {
+      parts.push(message);
+    }
+    if (isMeaningfulErrorMessage(data)) {
+      parts.push(data);
+    }
+    if (isMeaningfulErrorMessage(name)) {
+      parts.push(name);
+    }
+    if (parts.length > 0) {
+      return parts.join(' ');
+    }
+    try {
+      const json = JSON.stringify(error);
+      if (isMeaningfulErrorMessage(json)) {
+        return json;
+      }
+    } catch (jsonError) {
+    }
+  }
+  return fallback;
+}
 
 export class GallerySite {
   static readonly E: string = 'e';
@@ -1998,6 +2059,7 @@ export class EhTagTranslator {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.STRING,
         usingCache,
+        usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 30000,
         connectTimeout: 15000,
         header: {
@@ -2011,8 +2073,9 @@ export class EhTagTranslator {
       }
       return typeof response.result === 'string' ? response.result : '';
     } catch (error) {
-      const message = `${error}`.replace('Error: ', '');
-      throw new Error(message.length > 0 ? message : 'Tag translation network request failed');
+      const message = nativeRequestErrorMessage(error, 'Tag translation network request failed');
+      hilog.error(DOMAIN, LOG_TAG, 'Tag translation request failed. Url=%{public}s Cause=%{public}s', url, message);
+      throw new Error(message);
     } finally {
       request.destroy();
     }
@@ -2390,6 +2453,7 @@ export class NativeEhClient {
       method,
       expectDataType: http.HttpDataType.STRING,
       usingCache: false,
+      usingProxy: AppNetworkProxy.requestProxy(),
       readTimeout: 20000,
       connectTimeout: 12000,
       header: headers
@@ -2407,8 +2471,9 @@ export class NativeEhClient {
       }
       return typeof response.result === 'string' ? response.result : '';
     } catch (error) {
-      const message = `${error}`;
-      throw new Error(message.length > 0 ? message : 'Network request failed');
+      const message = nativeRequestErrorMessage(error, 'Network request failed');
+      hilog.error(DOMAIN, LOG_TAG, 'Native text request failed. Url=%{public}s Cause=%{public}s', url, message);
+      throw new Error(message);
     } finally {
       request.destroy();
     }
@@ -2442,6 +2507,7 @@ export class NativeEhClient {
         method: http.RequestMethod.POST,
         expectDataType: http.HttpDataType.STRING,
         usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 30000,
         connectTimeout: 12000,
         header: headers,
@@ -2454,8 +2520,9 @@ export class NativeEhClient {
       }
       return typeof response.result === 'string' ? response.result : '';
     } catch (error) {
-      const message = `${error}`;
-      throw new Error(message.length > 0 ? message : 'Form request failed');
+      const message = nativeRequestErrorMessage(error, 'Form request failed');
+      hilog.error(DOMAIN, LOG_TAG, 'Native form request failed. Url=%{public}s Cause=%{public}s', url, message);
+      throw new Error(message);
     } finally {
       request.destroy();
     }
@@ -2482,6 +2549,7 @@ export class NativeEhClient {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
         usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 60000,
         connectTimeout: 15000,
         header: headers
@@ -2502,8 +2570,9 @@ export class NativeEhClient {
       }
       return result as ArrayBuffer;
     } catch (error) {
-      const message = `${error}`;
-      throw new Error(message.length > 0 ? message : 'Binary request failed');
+      const message = nativeRequestErrorMessage(error, 'Binary request failed');
+      hilog.error(DOMAIN, LOG_TAG, 'Native binary request failed. Url=%{public}s Cause=%{public}s', url, message);
+      throw new Error(message);
     } finally {
       request.destroy();
     }
@@ -2623,6 +2692,7 @@ export class NativeEhClient {
       method: http.RequestMethod.POST,
       expectDataType: http.HttpDataType.STRING,
       usingCache: false,
+      usingProxy: AppNetworkProxy.requestProxy(),
       readTimeout: 60000,
       connectTimeout: 20000,
       maxLimit: 100 * 1024 * 1024,
@@ -2638,8 +2708,9 @@ export class NativeEhClient {
       }
       return typeof response.result === 'string' ? response.result : '';
     } catch (error) {
-      const message = `${error}`;
-      throw new Error(message.length > 0 ? message : 'Multipart request failed');
+      const message = nativeRequestErrorMessage(error, 'Multipart request failed');
+      hilog.error(DOMAIN, LOG_TAG, 'Native multipart request failed. Url=%{public}s Cause=%{public}s', url, message);
+      throw new Error(message);
     } finally {
       request.destroy();
     }

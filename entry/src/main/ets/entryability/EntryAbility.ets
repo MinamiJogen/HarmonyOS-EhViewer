@@ -6,8 +6,13 @@ import webview from '@ohos.web.webview';
 import connection from '@ohos.net.connection';
 import { NativeEhClient } from '../ehviewer/EhNative';
 import {
+  DOWNLOAD_ROUTE_ACTION_ACTIVE,
+  DOWNLOAD_ROUTE_ACTION_KEY,
+  DOWNLOAD_ROUTE_EVENT_STORAGE_KEY,
+  DOWNLOAD_ROUTE_TARGET_STORAGE_KEY
+} from '../constants/AppConstants';
+import {
   initializePrivacyAppStorageDefaults,
-  isAppLockAuthActive as isAppLockAuthActiveStorage,
   isBackgroundPreviewProtectionEnabled as readBackgroundPreviewProtectionEnabled,
   setAppLockForegroundRequired as setAppLockForegroundRequiredStorage,
   syncPrivacySettingsToAppStorage as syncPrivacySettingsStoreToAppStorage
@@ -108,8 +113,33 @@ export default class EntryAbility extends UIAbility {
   private settingsStore?: preferences.Preferences = undefined;
   private windowPrivacyModeApplied: boolean = false;
 
+  private readWantString(want: Want, key: string): string {
+    const value = want.parameters ? want.parameters[key] : undefined;
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return `${value}`;
+    }
+    return '';
+  }
+
+  private publishDownloadRouteWant(want: Want): void {
+    if (this.readWantString(want, DOWNLOAD_ROUTE_ACTION_KEY) !== DOWNLOAD_ROUTE_ACTION_ACTIVE) {
+      return;
+    }
+    try {
+      const currentEventId = AppStorage.get<number>(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY) || 0;
+      AppStorage.setOrCreate<string>(DOWNLOAD_ROUTE_TARGET_STORAGE_KEY, DOWNLOAD_ROUTE_ACTION_ACTIVE);
+      AppStorage.setOrCreate<number>(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY, Math.min(2147483647, currentEventId + 1));
+    } catch (error) {
+      hilog.warn(DOMAIN, 'testTag', 'Failed to publish download route want. Cause: %{public}s', `${error}`);
+    }
+  }
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     initializePrivacyAppStorageDefaults();
+    this.publishDownloadRouteWant(want);
     this.syncPrivacySettingsToAppStorage();
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
@@ -127,6 +157,11 @@ export default class EntryAbility extends UIAbility {
       hilog.error(DOMAIN, 'testTag', 'Failed to initialize web engine. Cause: %{public}s', JSON.stringify(err));
     }
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.publishDownloadRouteWant(want);
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onNewWant');
   }
 
   private configureEhHosts(): void {
@@ -226,10 +261,6 @@ export default class EntryAbility extends UIAbility {
     setAppLockForegroundRequiredStorage(required);
   }
 
-  private isAppLockAuthActive(): boolean {
-    return isAppLockAuthActiveStorage();
-  }
-
   private ensureSettingsStore(): preferences.Preferences | undefined {
     if (this.settingsStore) {
       return this.settingsStore;
@@ -269,16 +300,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   private handleWindowStageEvent(event: window.WindowStageEventType): void {
-    if (event === window.WindowStageEventType.INACTIVE) {
+    if (event === window.WindowStageEventType.INACTIVE || event === window.WindowStageEventType.HIDDEN) {
       this.applyWindowPrivacyMode(this.isBackgroundPreviewProtectionEnabled());
-      if (!this.isAppLockAuthActive()) {
-        this.setAppLockForegroundRequired(true);
-      }
-      return;
-    }
-    if (event === window.WindowStageEventType.HIDDEN) {
-      this.applyWindowPrivacyMode(this.isBackgroundPreviewProtectionEnabled());
-      this.setAppLockForegroundRequired(true);
       return;
     }
     if (event === window.WindowStageEventType.ACTIVE || event === window.WindowStageEventType.SHOWN) {

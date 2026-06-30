@@ -9,6 +9,7 @@ import http from '@ohos.net.http';
 import pasteboard from '@ohos.pasteboard';
 import promptAction from '@ohos.promptAction';
 import webview from '@ohos.web.webview';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   ChipGroup,
   ChipGroupItemOptions,
@@ -71,9 +72,10 @@ import {
   DOWNLOAD_INFO_HEADER,
   DOWNLOAD_LABEL_ALL,
   DOWNLOAD_MAX_CONCURRENCY,
-  DOWNLOAD_NOTIFICATION_ID,
+  DOWNLOAD_NOTIFICATION_BASE_ID,
+  DOWNLOAD_NOTIFICATION_GROUP,
   DOWNLOAD_NOTIFICATION_INTERVAL_MS,
-  DOWNLOAD_NOTIFICATION_LABEL,
+  DOWNLOAD_NOTIFICATION_LABEL_PREFIX,
   DOWNLOAD_PAGE_RETRY_LIMIT,
   DOWNLOAD_PROGRESS_PERSIST_INTERVAL_MS,
   DOWNLOAD_PROGRESS_UI_INTERVAL_MS,
@@ -119,6 +121,9 @@ import {
   ROUTE_SEARCH_ACTIVE
 } from '../navigation/AppRoutes';
 import {
+  AppNetworkProxy
+} from '../network/AppNetworkProxy';
+import {
   APP_ABILITY_NAME,
   APP_BUNDLE_NAME,
   APP_LOCK_ENABLED_KEY,
@@ -148,6 +153,10 @@ import {
   CATEGORY_WESTERN,
   COOKIE_PERSIST_MAX_AGE_SECONDS,
   DETAIL_TORRENT_DIR_NAME,
+  DOWNLOAD_ROUTE_ACTION_ACTIVE,
+  DOWNLOAD_ROUTE_ACTION_KEY,
+  DOWNLOAD_ROUTE_EVENT_STORAGE_KEY,
+  DOWNLOAD_ROUTE_TARGET_STORAGE_KEY,
   EMPTY_FAVORITE_CATEGORY_COUNTS,
   EXCLUDED_LANGUAGE_KEY,
   EXCLUDED_LANGUAGE_OPTIONS,
@@ -318,9 +327,33 @@ let sharedDownloadWorkerRunning: boolean = false;
 let sharedDownloadActiveKey: string = '';
 let sharedDownloadItemsSnapshot: DownloadQueueItem[] = [];
 let sharedDownloadWaitKeys: string[] = [];
+let sharedDownloadBackgroundStopAttempted: boolean = false;
 const sharedDownloadCancelKeys: Set<string> = new Set<string>();
+const sharedDownloadRemovedKeys: Set<string> = new Set<string>();
 const sharedDownloadStartRequestedKeys: Set<string> = new Set<string>();
 const sharedDownloadRunGenerations: Map<string, number> = new Map<string, number>();
+const sharedDownloadNotificationStates: Map<string, string> = new Map<string, string>();
+const sharedDownloadNotificationLastAt: Map<string, number> = new Map<string, number>();
+const sharedDownloadNotificationIds: Map<string, number> = new Map<string, number>();
+const sharedDownloadNotificationLabels: Map<string, string> = new Map<string, string>();
+const DOWNLOAD_RUNTIME_ITEMS_KEY: string = 'download_runtime_items_snapshot';
+const DOWNLOAD_RUNTIME_ACTIVE_KEY: string = 'download_runtime_active_key';
+const DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY: string = 'download_runtime_worker_running';
+const DOWNLOAD_RUNTIME_REVISION_KEY: string = 'download_runtime_revision';
+const DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY: string = 'download_runtime_cancel_keys';
+const DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY: string = 'download_runtime_removed_keys';
+const DOWNLOAD_RUNTIME_HEARTBEAT_KEY: string = 'download_runtime_heartbeat_at';
+const DOWNLOAD_RUNTIME_HEARTBEAT_INTERVAL_MS: number = 1000;
+const DOWNLOAD_RUNTIME_HEARTBEAT_TTL_MS: number = 12000;
+const DIAG_DOMAIN = 0x0000;
+const DIAG_TAG = 'EhIndex';
+
+interface NativeReadableErrorInfo {
+  code?: number | string;
+  message?: string;
+  data?: string;
+  name?: string;
+}
 
 interface NativeRouteSnapshot {
   detail: NativeGalleryDetail;
@@ -345,6 +378,7 @@ const WATERFALL_PREFERRED_ITEM_WIDTH: number = 176;
 const WATERFALL_CARD_EXTRA_HEIGHT: number = 150;
 const WATERFALL_MIN_CONTENT_HEIGHT: number = 180;
 const SEARCH_HISTORY_DEFAULT_VISIBLE_COUNT: number = 3;
+const LOGIN_GATE_SEEN_KEY: string = 'login_gate_seen';
 
 interface TopListPeriodOption {
   key: string;
@@ -365,6 +399,13 @@ const TOP_LIST_PERIOD_SEGMENT_BUTTONS: ItemRestriction<SegmentButtonTextItem> = 
   { text: '过去一年' },
   { text: '所有时间' }
 ];
+
+const DOWNLOAD_VIEW_SEGMENT_BUTTONS: ItemRestriction<SegmentButtonTextItem> = [
+  { text: '已下载' },
+  { text: '下载中' }
+];
+const DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT: number = 54;
+const DOWNLOAD_SCROLL_EXTRA_HEIGHT: number = 80;
 
 @Entry
 @Component
@@ -404,11 +445,9 @@ struct Index {
   private downloadBackgroundRunning: boolean = false;
   private downloadBackgroundStarting: boolean = false;
   private downloadBackgroundTaskId: number = -1;
-  private downloadNotificationPermissionRequested: boolean = false;
-  private downloadNotificationPublished: boolean = false;
-  private downloadNotificationLastAt: number = 0;
-  private downloadNotificationLastState: string = '';
+  private downloadNotificationPermissionAsked: boolean = false;
   private readonly downloadCancelKeys: Set<string> = new Set();
+  private readonly downloadRemovedKeys: Set<string> = new Set();
   private readonly downloadStartRequestedKeys: Set<string> = new Set();
   private readonly downloadRunGenerations: Map<string, number> = new Map();
   private downloadWaitKeys: string[] = [];
@@ -418,6 +457,10 @@ struct Index {
   private readonly downloadActiveRequests: Map<string, http.HttpRequest[]> = new Map();
   private downloadPersistQueue: Promise<void> = Promise.resolve();
   private downloadStatePollTimerId: number = -1;
+  private downloadRuntimeSyncInFlight: boolean = false;
+  private downloadRuntimeSyncPending: boolean = false;
+  private downloadRuntimeSyncPendingForce: boolean = false;
+  private downloadRuntimeHeartbeatLastWriteAt: number = 0;
   private readerHtmlPrefetchQueue: ReaderPrefetchTask[] = [];
   private readerImagePrefetchQueue: ReaderImagePrefetchTask[] = [];
   private readonly homeScroller: Scroller = new Scroller();
@@ -497,6 +540,27 @@ struct Index {
   @State private downloadImportExportText: string = '';
   @State private downloadManagerStatus: string = '下载器空闲';
   @State private downloadViewMode: string = DOWNLOAD_VIEW_DOWNLOADED;
+  @State private downloadViewSelectedIndexes: number[] = [0];
+  @StorageLink(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY) @Watch('handleDownloadRouteEventChanged')
+  private downloadRouteEventId: number = 0;
+  @StorageLink(DOWNLOAD_ROUTE_TARGET_STORAGE_KEY) private downloadRouteTarget: string = '';
+  @State private downloadViewSegmentOptions: SegmentButtonOptions = SegmentButtonOptions.capsule({
+    buttons: DOWNLOAD_VIEW_SEGMENT_BUTTONS,
+    multiply: false,
+    fontColor: '#2B2027',
+    selectedFontColor: '#2B2027',
+    fontSize: 14,
+    selectedFontSize: 14,
+    fontWeight: FontWeight.Regular,
+    selectedFontWeight: FontWeight.Medium,
+    backgroundColor: 'rgba(0,0,0,0.05)',
+    selectedBackgroundColor: 'rgba(255,255,255,0.70)',
+    textPadding: { left: 12, right: 12, top: 7, bottom: 7 }
+  });
+  @StorageLink(DOWNLOAD_RUNTIME_ITEMS_KEY) private downloadRuntimeItemsJson: string = '[]';
+  @StorageLink(DOWNLOAD_RUNTIME_ACTIVE_KEY) private downloadRuntimeActiveKey: string = '';
+  @StorageLink(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY) private downloadRuntimeWorkerRunning: boolean = false;
+  @StorageLink(DOWNLOAD_RUNTIME_REVISION_KEY) private downloadRuntimeRevision: number = 0;
   @State private hasSignInCookie: boolean = false;
   @State private hasExCookie: boolean = false;
   @State private loginGateVisible: boolean = false;
@@ -574,6 +638,7 @@ struct Index {
   @State private nativeViewMode: string = 'list';
   @State private nativeDetail: NativeGalleryDetail = createEmptyNativeGalleryDetail();
   @State private nativeDetailRevision: number = 0;
+  @State private downloadQueueRevision: number = 0;
   @State private nativePreviewItems: NativeGalleryPreview[] = [];
   @State private nativePreviewPageIndex: number = 0;
   @State private nativePreviewPageCount: number = 0;
@@ -747,8 +812,10 @@ struct Index {
   private cacheMaintenanceRunning: boolean = false;
   private lastCacheMaintenanceAt: number = 0;
   private readerAdjacentRefreshSerial: number = 0;
+  private handledDownloadRouteEventId: number = 0;
 
   aboutToAppear(): void {
+    this.ensureDownloadRuntimeStorageDefaults();
     this.resolveBottomBarMaterialLevel();
     this.applyRouteParams(false);
     this.primeInitialRouteDisplay();
@@ -902,11 +969,13 @@ struct Index {
       this.primeInitialRouteDisplay();
     }
     this.refreshSiteCookieState();
-    if (!hasPrimedRoute && !this.hasAvailableCookie()) {
+    if (this.shouldShowLoginGateOnLaunch(hasPrimedRoute)) {
       this.loginGateVisible = true;
+      this.markLoginGateSeen();
     }
     this.refreshTagTranslationState();
     this.isReady = true;
+    this.applyPendingDownloadRouteEvent();
     if (this.appLockEnabled && !hasPrimedRoute) {
       this.setAppLockForegroundRequired(true);
     }
@@ -1338,20 +1407,34 @@ struct Index {
     const dbItems = await this.loadDownloadItemsFromDatabase();
     const dbLabels = await this.loadDownloadLabelsFromDatabase();
 
+    if (sharedDownloadItemsSnapshot.length > 0) {
+      this.downloadItems = this.downloadItemsSource();
+      this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
+      this.publishSharedDownloadItems();
+      this.downloadLabels = ensureDownloadDefaultLabel(dbLabels.length > 0 ? dbLabels : backupLabels, this.nowLabel());
+      this.saveDownloadLabels();
+      this.refreshDownloadManagerStatusFromState();
+      return;
+    }
+
     if (dbItems.length > 0) {
-      this.downloadItems = this.recoverInterruptedDownloads(dbItems);
+      this.downloadItems = this.recoverInterruptedDownloads(this.filterRemovedDownloadItems(dbItems));
+      this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
       this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
       this.saveDownloadItems();
       this.saveDownloadLabels();
       return;
     }
 
-    this.downloadItems = this.recoverInterruptedDownloads(backupItems);
+    this.downloadItems = this.recoverInterruptedDownloads(this.filterRemovedDownloadItems(backupItems));
+    this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
     this.downloadLabels = ensureDownloadDefaultLabel(backupLabels, this.nowLabel());
     this.saveDownloadLabels();
     if (backupItems.length > 0) {
       this.saveDownloadItems();
       this.writeValue('download_items_migrated_to_rdb', true);
+    } else {
+      this.publishSharedDownloadItems();
     }
   }
 
@@ -1692,19 +1775,98 @@ struct Index {
     }
   }
 
+  private downloadedFileCountForItem(item: DownloadQueueItem): number {
+    const dirs: string[] = [];
+    const storedDir = item.downloadDir.trim();
+    if (storedDir.length > 0) {
+      dirs.push(storedDir);
+    }
+    const defaultDir = this.galleryDownloadDir(item);
+    if (defaultDir.length > 0 && dirs.indexOf(defaultDir) < 0) {
+      dirs.push(defaultDir);
+    }
+    let count = 0;
+    for (const dir of dirs) {
+      try {
+        if (!fileIo.accessSync(dir)) {
+          continue;
+        }
+        const names = fileIo.listFileSync(dir);
+        let dirCount = 0;
+        for (const name of names) {
+          const lower = name.toLowerCase();
+          if (lower.endsWith('.tmp') || lower === DOWNLOAD_INFO_FILENAME) {
+            continue;
+          }
+          if (READER_IMAGE_EXTENSIONS.some((extension: string) => lower.endsWith(extension))) {
+            dirCount++;
+          }
+        }
+        count = Math.max(count, dirCount);
+      } catch (error) {
+      }
+    }
+    return count;
+  }
+
+  private reconcileDownloadItemsWithLocalFiles(items: DownloadQueueItem[]): DownloadQueueItem[] {
+    const reconciled: DownloadQueueItem[] = [];
+    for (const item of items) {
+      if (item.status === DOWNLOAD_STATUS_DONE || item.status === DOWNLOAD_STATUS_DELETED) {
+        reconciled.push(item);
+        continue;
+      }
+      const localCount = this.downloadedFileCountForItem(item);
+      if (item.status === DOWNLOAD_STATUS_DOWNLOADING && localCount > item.downloaded) {
+        const total = Math.max(item.total, item.pages, localCount);
+        const key = this.downloadKey(item.gid, item.site);
+        this.writeDownloadRuntimeHeartbeat(key, true, true);
+        reconciled.push(this.toDownloadItem(
+          item,
+          DOWNLOAD_STATUS_DOWNLOADING,
+          item.queuedAt,
+          `正在同步本地下载进度`,
+          item.label,
+          localCount,
+          total,
+          item.failedCount,
+          item.archiveUri,
+          item.createdAt,
+          this.nowLabel(),
+          localCount,
+          `${localCount}/${total}`,
+          item.speedBytesPerSecond,
+          item.remainingSeconds,
+          item.downloadDir,
+          item.error,
+          item.pageErrors
+        ));
+        continue;
+      }
+      reconciled.push(item);
+    }
+    return reconciled;
+  }
+
   private recoverInterruptedDownloads(items: DownloadQueueItem[]): DownloadQueueItem[] {
     const recovered: DownloadQueueItem[] = [];
     for (const item of items) {
       if (item.status === DOWNLOAD_STATUS_DOWNLOADING) {
         const key = this.downloadKey(item.gid, item.site);
-        const runningInCurrentProcess = sharedDownloadWorkerRunning &&
-          sharedDownloadActiveKey === key &&
-          !sharedDownloadCancelKeys.has(key);
+        const sharedItem = this.sharedDownloadItemByKey(key);
+        const runningInCurrentProcess = this.isDownloadKeyRunningInCurrentProcess(key);
+        if (sharedItem && runningInCurrentProcess) {
+          recovered.push(this.cloneDownloadItem(sharedItem));
+          continue;
+        }
+        const lastAction = runningInCurrentProcess && !item.lastAction.startsWith('下载中断') ?
+          item.lastAction :
+          (runningInCurrentProcess ? '正在下载' : '下载中断，点开始继续');
         recovered.push(this.toDownloadItem(
           item,
           DOWNLOAD_STATUS_DOWNLOADING,
           item.queuedAt,
-          runningInCurrentProcess ? item.lastAction : '下载中断，点开始继续',
+          lastAction,
           item.label,
           item.downloaded,
           item.total,
@@ -1727,50 +1889,37 @@ struct Index {
     return recovered;
   }
 
-  private async syncDownloadStateFromDatabase(recoverRunning: boolean): Promise<void> {
+  private async syncDownloadStateFromDatabase(recoverRunning: boolean, selectPreferredView: boolean = false): Promise<void> {
     if (this.downloadWorkerRunning) {
       return;
     }
     if (sharedDownloadItemsSnapshot.length > 0) {
-      this.downloadItems = this.downloadItemsSource().map((item: DownloadQueueItem) => this.toDownloadItem(
-        item,
-        item.status,
-        item.queuedAt,
-        item.lastAction,
-        item.label,
-        item.downloaded,
-        item.total,
-        item.failedCount,
-        item.archiveUri,
-        item.createdAt,
-        item.updatedAt,
-        item.currentPage,
-        item.currentPageLabel,
-        item.speedBytesPerSecond,
-        item.remainingSeconds,
-        item.downloadDir,
-        item.error,
-        item.pageErrors
-      ));
+      this.downloadItems = this.downloadItemsSource();
     } else {
       const dbItems = await this.loadDownloadItemsFromDatabase();
       if (dbItems.length > 0) {
-        this.downloadItems = recoverRunning ? this.recoverInterruptedDownloads(dbItems) : dbItems;
+        const filteredDbItems = this.filterRemovedDownloadItems(dbItems);
+        this.downloadItems = recoverRunning ? this.recoverInterruptedDownloads(filteredDbItems) : filteredDbItems;
       } else {
+        const backupItems = this.filterRemovedDownloadItems(this.parseDownloadItems(this.readString('download_items', '[]')));
         this.downloadItems = recoverRunning ?
-          this.recoverInterruptedDownloads(this.parseDownloadItems(this.readString('download_items', '[]'))) :
-          this.parseDownloadItems(this.readString('download_items', '[]'));
+          this.recoverInterruptedDownloads(backupItems) :
+          backupItems;
       }
     }
+    this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
     const dbLabels = await this.loadDownloadLabelsFromDatabase();
     if (dbLabels.length > 0) {
       this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
     }
+    this.publishSharedDownloadItems();
     this.refreshDownloadManagerStatusFromState();
+    this.reconcileDownloadViewMode(selectPreferredView);
+    this.refreshDownloadRuntimeState(true);
   }
 
   private refreshDownloadManagerStatusFromState(): void {
-    const activeKey = this.downloadActiveKey.length > 0 ? this.downloadActiveKey : sharedDownloadActiveKey;
+    const activeKey = this.activeDownloadRuntimeKey();
     if (activeKey.length > 0) {
       const active = this.findDownloadItemByKey(activeKey);
       if (active) {
@@ -1782,12 +1931,25 @@ struct Index {
       this.downloadManagerStatus = '下载队列运行中';
       return;
     }
-    if (this.downloadItems.some((item: DownloadQueueItem) =>
+    if (this.downloadItemsSource().some((item: DownloadQueueItem) =>
       item.status === DOWNLOAD_STATUS_QUEUED || item.status === DOWNLOAD_STATUS_DOWNLOADING)) {
       this.downloadManagerStatus = '下载等待中';
       return;
     }
     this.downloadManagerStatus = '下载器空闲';
+  }
+
+  private effectiveDownloadManagerStatus(): string {
+    const active = this.activeDownloadItem();
+    if (active && this.isDownloadItemRunning(active)) {
+      return active.lastAction.length > 0 ?
+        active.lastAction :
+        `正在下载 ${active.title.length > 0 ? active.title : active.gid}`;
+    }
+    if (this.downloadRuntimeWorkerRunning || this.downloadWorkerRunning || sharedDownloadWorkerRunning) {
+      return this.downloadManagerStatus === '下载器空闲' ? '下载队列运行中' : this.downloadManagerStatus;
+    }
+    return this.downloadManagerStatus;
   }
 
   private saveBookmarks(): void {
@@ -1823,6 +1985,101 @@ struct Index {
     this.readerProgressRevision++;
   }
 
+  private bumpDownloadQueueRevision(): void {
+    this.downloadQueueRevision = Math.min(2147483647, this.downloadQueueRevision + 1);
+  }
+
+  private ensureDownloadRuntimeStorageDefaults(): void {
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ITEMS_KEY, '[]');
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ACTIVE_KEY, '');
+    AppStorage.setOrCreate<boolean>(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, false);
+    AppStorage.setOrCreate<number>(DOWNLOAD_RUNTIME_REVISION_KEY, 0);
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, '[]');
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY,
+      this.readString(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY, '[]'));
+    AppStorage.setOrCreate<number>(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY, 0);
+    AppStorage.setOrCreate<string>(DOWNLOAD_ROUTE_TARGET_STORAGE_KEY, '');
+  }
+
+  private runtimeStringArray(key: string): string[] {
+    const raw = AppStorage.get<string>(key) || this.readString(key, '[]');
+    try {
+      const parsed = JSON.parse(raw) as Array<string>;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      const values: string[] = [];
+      for (const value of parsed) {
+        if (typeof value === 'string' && value.length > 0 && values.indexOf(value) < 0) {
+          values.push(value);
+        }
+      }
+      return values;
+    } catch (error) {
+      return [];
+    }
+  }
+
+  private updateRuntimeStringArray(key: string, value: string, enabled: boolean, persist: boolean = false): void {
+    const values = this.runtimeStringArray(key).filter((entry: string) => entry !== value);
+    if (enabled && value.length > 0) {
+      values.push(value);
+    }
+    const raw = JSON.stringify(values);
+    AppStorage.setOrCreate<string>(key, raw);
+    if (persist) {
+      this.writeValue(key, raw);
+    }
+  }
+
+  private isRuntimeStringArrayMarked(key: string, value: string): boolean {
+    return value.length > 0 && this.runtimeStringArray(key).indexOf(value) >= 0;
+  }
+
+  private publishDownloadRuntimeStorage(snapshot: DownloadQueueItem[] = sharedDownloadItemsSnapshot, force: boolean = false): void {
+    const localActiveKey = this.downloadActiveKey.length > 0 ? this.downloadActiveKey : sharedDownloadActiveKey;
+    const ownsDownloadRuntime = this.downloadWorkerRunning || sharedDownloadWorkerRunning || localActiveKey.length > 0;
+    if (!force && !ownsDownloadRuntime && this.downloadRuntimeWorkerRunning) {
+      return;
+    }
+    const activeKey = ownsDownloadRuntime ? localActiveKey : this.downloadRuntimeActiveKey;
+    const workerRunning = ownsDownloadRuntime ?
+      (this.downloadWorkerRunning || sharedDownloadWorkerRunning || localActiveKey.length > 0) :
+      this.downloadRuntimeWorkerRunning;
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ITEMS_KEY, JSON.stringify(snapshot));
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ACTIVE_KEY, activeKey);
+    AppStorage.setOrCreate<boolean>(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, workerRunning);
+    const currentRevision = AppStorage.get<number>(DOWNLOAD_RUNTIME_REVISION_KEY) || 0;
+    AppStorage.setOrCreate<number>(DOWNLOAD_RUNTIME_REVISION_KEY, Math.min(2147483647, currentRevision + 1));
+    this.writeDownloadRuntimeHeartbeat(activeKey, workerRunning, force);
+  }
+
+  private writeDownloadRuntimeHeartbeat(activeKey: string, workerRunning: boolean, force: boolean = false): void {
+    const now = Date.now();
+    if (!force && workerRunning && now - this.downloadRuntimeHeartbeatLastWriteAt < DOWNLOAD_RUNTIME_HEARTBEAT_INTERVAL_MS) {
+      return;
+    }
+    this.downloadRuntimeHeartbeatLastWriteAt = now;
+    this.writeValue(DOWNLOAD_RUNTIME_ACTIVE_KEY, activeKey);
+    this.writeValue(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, workerRunning);
+    this.writeValue(DOWNLOAD_RUNTIME_HEARTBEAT_KEY, workerRunning ? now : 0);
+  }
+
+  private activeDownloadRuntimeKeyFromPreferences(): string {
+    if (!this.readBoolean(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, false)) {
+      return '';
+    }
+    const heartbeatAt = this.readNumber(DOWNLOAD_RUNTIME_HEARTBEAT_KEY, 0);
+    if (heartbeatAt <= 0 || Date.now() - heartbeatAt > DOWNLOAD_RUNTIME_HEARTBEAT_TTL_MS) {
+      return '';
+    }
+    return this.readString(DOWNLOAD_RUNTIME_ACTIVE_KEY, '');
+  }
+
+  private isDownloadRuntimeHeartbeatActiveForKey(key: string): boolean {
+    return key.length > 0 && this.activeDownloadRuntimeKeyFromPreferences() === key;
+  }
+
   private saveDownloadItems(): void {
     const snapshot = [...this.downloadItems];
     this.publishSharedDownloadItems();
@@ -1837,13 +2094,30 @@ struct Index {
       return;
     }
     const key = this.downloadKey(item.gid, item.site);
+    if (this.isDownloadKeyRemoved(key)) {
+      return;
+    }
     const nextVersion = (this.downloadPersistVersions.get(key) || 0) + 1;
     this.downloadPersistVersions.set(key, nextVersion);
     const pending = this.downloadPersistQueue.then(async () => {
-      if (this.downloadPersistVersions.get(key) !== nextVersion) {
+      if (this.downloadPersistVersions.get(key) !== nextVersion || this.isDownloadKeyRemoved(key)) {
         return;
       }
       await this.upsertDownloadItemToDatabase(item);
+    });
+    this.downloadPersistQueue = pending.catch(() => {
+    });
+  }
+
+  private scheduleDownloadItemDelete(item: DownloadQueueItem): void {
+    const key = this.downloadKey(item.gid, item.site);
+    this.markDownloadKeyRemoved(key);
+    this.invalidateDownloadPersistForKey(key);
+    if (!this.localDao) {
+      return;
+    }
+    const pending = this.downloadPersistQueue.then(async () => {
+      await this.deleteDownloadItemFromDatabase(item);
     });
     this.downloadPersistQueue = pending.catch(() => {
     });
@@ -3352,6 +3626,7 @@ struct Index {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
         usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 20000,
         connectTimeout: 12000,
         header: headers
@@ -3547,6 +3822,7 @@ struct Index {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
         usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 30000,
         connectTimeout: 12000,
         header: headers
@@ -4200,6 +4476,44 @@ struct Index {
   private readableErrorMessage(error: Object | string | undefined, fallback: string): string {
     const raw = `${error}`.replace('Error: ', '').trim();
     const lower = raw.toLowerCase();
+    if (raw.length > 0 &&
+      lower !== 'undefined' &&
+      lower !== 'null' &&
+      lower !== 'object' &&
+      lower !== 'object object' &&
+      lower !== '[object object]') {
+      return raw;
+    }
+    if (error !== undefined && typeof error === 'object') {
+      const detail = error as NativeReadableErrorInfo;
+      const parts: string[] = [];
+      const code = `${detail.code}`.trim();
+      const message = `${detail.message}`.replace('Error: ', '').trim();
+      const data = `${detail.data}`.trim();
+      const name = `${detail.name}`.trim();
+      const codeLower = code.toLowerCase();
+      const messageLower = message.toLowerCase();
+      const dataLower = data.toLowerCase();
+      const nameLower = name.toLowerCase();
+      if (code.length > 0 && codeLower !== 'undefined' && codeLower !== 'null') {
+        parts.push(`code=${code}`);
+      }
+      if (message.length > 0 &&
+        messageLower !== 'undefined' &&
+        messageLower !== 'null' &&
+        messageLower !== '[object object]') {
+        parts.push(message);
+      }
+      if (data.length > 0 && dataLower !== 'undefined' && dataLower !== 'null') {
+        parts.push(data);
+      }
+      if (name.length > 0 && nameLower !== 'undefined' && nameLower !== 'null') {
+        parts.push(name);
+      }
+      if (parts.length > 0) {
+        return parts.join(' ');
+      }
+    }
     if (raw.length === 0 ||
       lower === 'undefined' ||
       lower === 'null' ||
@@ -4363,6 +4677,24 @@ struct Index {
     return this.hasSignInCookie || this.hasExCookie;
   }
 
+  private hasCurrentSiteCredential(): boolean {
+    return this.siteMode === GallerySite.EX ? this.hasExCookie : this.hasAvailableCookie();
+  }
+
+  private shouldShowLoginGateOnLaunch(hasPrimedRoute: boolean): boolean {
+    if (hasPrimedRoute || this.hasCurrentSiteCredential()) {
+      return false;
+    }
+    if (this.siteMode === GallerySite.EX) {
+      return true;
+    }
+    return !this.readBoolean(LOGIN_GATE_SEEN_KEY, false);
+  }
+
+  private markLoginGateSeen(): void {
+    this.writeValue(LOGIN_GATE_SEEN_KEY, true);
+  }
+
   private refreshSiteCookieState(): void {
     const webCookies = this.collectWebCookies('');
     const stableCookies = this.mergeCookiePieces(this.splitCookiePieces(this.cookieDraft), webCookies).join('; ');
@@ -4378,7 +4710,7 @@ struct Index {
       this.cookieStatusSummary = '未检测到登录 Cookie';
     }
 
-    if (this.hasAvailableCookie()) {
+    if (this.hasCurrentSiteCredential()) {
       this.loginGateVisible = false;
     }
   }
@@ -4794,16 +5126,19 @@ struct Index {
   }
 
   private openWebSignInFromGate(): void {
+    this.markLoginGateSeen();
     this.loginGateVisible = false;
     this.openWebSignIn();
   }
 
   private openCookieSignInFromGate(): void {
+    this.markLoginGateSeen();
     this.loginGateVisible = false;
     this.openMyPage(MY_PAGE_SETTINGS, '设置');
   }
 
   private enterGuestModeFromGate(): void {
+    this.markLoginGateSeen();
     this.loginGateVisible = false;
     const guestHomeUrl = EhUrl.galleryFront(GallerySite.E);
     this.webSrc = guestHomeUrl;
@@ -4944,7 +5279,10 @@ struct Index {
     this.resetNativeState();
     this.resetMyRemoteState();
     if (nextSite === GallerySite.EX && !this.canUseNativeSite(nextSite)) {
+      this.loginGateVisible = true;
       this.toast('EXHentai 需要登录或导入 Cookie');
+    } else if (nextSite === GallerySite.E) {
+      this.loginGateVisible = false;
     }
   }
 
@@ -5106,32 +5444,73 @@ struct Index {
     this.loginGateVisible = true;
   }
 
+  private isAccountOnlyMyAction(action: string): boolean {
+    return action === 'mytags' || action === 'uconfig';
+  }
+
   private runMyActionWhenSignedIn(action: string): void {
-    if (!this.isSignedIn()) {
-      this.showLoginPrompt();
+    if (action === 'logout') {
+      this.confirmClearLocalAccountCache();
       return;
     }
-    if (action === 'logout') {
-      this.clearCookies();
+    if (this.isAccountOnlyMyAction(action) && !this.isSignedIn()) {
+      this.showLoginPrompt();
       return;
     }
     this.handleMyDrawerAction(action);
   }
 
   private clearCookies(): void {
+    this.clearLocalAccountCache();
+  }
+
+  private clearLocalAccountCache(): void {
     try {
-      webview.WebCookieManager.clearAllCookiesSync(false);
-      webview.WebCookieManager.saveCookieSync();
+      this.clearWebCookieStore();
       this.cookieDraft = '';
       this.signInForumProbeStarted = false;
       this.signInExProbeStarted = false;
+      this.signInExPendingNotified = false;
       NativeEhClient.configureCookieHeader('');
       this.writeValue('cookie_draft', '');
+      if (this.siteMode === GallerySite.EX) {
+        this.siteMode = GallerySite.E;
+        this.writeValue('site_mode', GallerySite.E);
+        const targetUrl = EhUrl.galleryFront(GallerySite.E);
+        this.webSrc = targetUrl;
+        this.addressInput = targetUrl;
+        this.writeValue('last_url', targetUrl);
+      }
       this.refreshSiteCookieState();
-      this.toast('Cookie 已清除');
+      this.loginGateVisible = false;
+      this.nativeError = '';
       this.resetNativeState();
+      this.resetMyRemoteState();
+      this.toast('本地账号缓存已删除');
     } catch (error) {
-      this.toast('Cookie 清除失败');
+      this.toast('本地账号缓存删除失败');
+    }
+  }
+
+  private confirmClearLocalAccountCache(): void {
+    const options: promptAction.ShowDialogOptions = {
+      title: '删除本地账号缓存',
+      message: '确定要删除本地保存的登录 Cookie 和账号状态吗？下载、历史、书签和本地收藏不会被删除。',
+      buttons: [
+        { text: '取消', color: '#6F5964' },
+        { text: '删除', color: '#B42318' }
+      ]
+    };
+    try {
+      void this.getUIContext().getPromptAction().showDialog(options)
+        .then((result: promptAction.ShowDialogSuccessResponse) => {
+          if (result.index === 1) {
+            this.clearLocalAccountCache();
+          }
+        })
+        .catch(() => {
+        });
+    } catch (error) {
     }
   }
 
@@ -6608,13 +6987,17 @@ struct Index {
   }
 
   private async fetchGalleryListWithTimeout(url: string): Promise<NativeGalleryListResult> {
+    hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list start. Site=%{public}s Url=%{public}s', this.siteMode, url);
     const result = await Promise.race<NativeGalleryListResult | undefined>([
       NativeEhClient.fetchGalleryList(this.siteMode, url),
       this.delay(GALLERY_LIST_TIMEOUT_MS).then((): undefined => undefined)
     ]);
     if (result === undefined) {
+      hilog.error(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list timeout. Site=%{public}s Url=%{public}s TimeoutMs=%{public}d',
+        this.siteMode, url, GALLERY_LIST_TIMEOUT_MS);
       throw new Error('列表请求超时，请检查网络或 Cookie 状态。');
     }
+    hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list success. Site=%{public}s Url=%{public}s', this.siteMode, url);
     return result;
   }
 
@@ -6684,7 +7067,7 @@ struct Index {
         return;
       }
       this.clearHomeGalleryList(url);
-      this.homeError = HOME_CONTENT_UNAVAILABLE_MESSAGE;
+      this.homeError = this.readableErrorMessage(error, HOME_CONTENT_UNAVAILABLE_MESSAGE);
     } finally {
       if (loadSerial === this.homeListLoadSerial) {
         this.homeLoading = false;
@@ -6799,7 +7182,7 @@ struct Index {
       if (loadSerial !== this.homeListLoadSerial) {
         return;
       }
-      this.homeError = HOME_CONTENT_UNAVAILABLE_MESSAGE;
+      this.homeError = this.readableErrorMessage(error, HOME_CONTENT_UNAVAILABLE_MESSAGE);
       this.toast(this.homeError);
     } finally {
       if (loadSerial === this.homeListLoadSerial) {
@@ -7397,6 +7780,40 @@ struct Index {
       pageErrors
     };
     return item;
+  }
+
+  private cloneDownloadItem(item: DownloadQueueItem): DownloadQueueItem {
+    return this.toDownloadItem(
+      item,
+      item.status,
+      item.queuedAt,
+      item.lastAction,
+      item.label,
+      item.downloaded,
+      item.total,
+      item.failedCount,
+      item.archiveUri,
+      item.createdAt,
+      item.updatedAt,
+      item.currentPage,
+      item.currentPageLabel,
+      item.speedBytesPerSecond,
+      item.remainingSeconds,
+      item.downloadDir,
+      item.error,
+      item.pageErrors
+    );
+  }
+
+  private cloneSharedDownloadItems(): DownloadQueueItem[] {
+    return sharedDownloadItemsSnapshot.map((item: DownloadQueueItem) => this.cloneDownloadItem(item));
+  }
+
+  private runtimeDownloadItemsSnapshot(): DownloadQueueItem[] {
+    const raw = this.downloadRuntimeItemsJson.length > 0 ?
+      this.downloadRuntimeItemsJson :
+      (AppStorage.get<string>(DOWNLOAD_RUNTIME_ITEMS_KEY) || '[]');
+    return this.parseDownloadItems(raw);
   }
 
   private toNativeSummary(record: LocalGalleryRecord): NativeGallerySummary {
@@ -10008,7 +10425,6 @@ struct Index {
       } else if (this.libraryPanel === LIBRARY_HISTORY) {
         void this.loadLocalSideData();
       } else if (this.libraryPanel === LIBRARY_DOWNLOADS) {
-        this.downloadViewMode = DOWNLOAD_VIEW_DOWNLOADED;
         if (!this.downloadWorkerRunning) {
           void this.syncDownloadStateFromDatabase(false);
         }
@@ -10058,7 +10474,7 @@ struct Index {
     if (this.libraryPanel === LIBRARY_HISTORY) {
       return '历史';
     }
-    return this.downloadViewMode === DOWNLOAD_VIEW_ACTIVE ? '下载中' : '已下载';
+    return '下载';
   }
 
   private currentNavigationTitle(): string {
@@ -10207,37 +10623,102 @@ struct Index {
     return index >= 0 ? this.downloadItems[index] : undefined;
   }
 
-  private findDownloadItemByKey(key: string): DownloadQueueItem | undefined {
+  private localDownloadItemByKey(key: string): DownloadQueueItem | undefined {
     for (const item of this.downloadItems) {
       if (this.downloadKey(item.gid, item.site) === key) {
         return item;
       }
     }
-    for (const item of sharedDownloadItemsSnapshot) {
+    return undefined;
+  }
+
+  private findDownloadItemByKey(key: string): DownloadQueueItem | undefined {
+    if (this.isDownloadKeyRemoved(key)) {
+      return undefined;
+    }
+    for (const item of this.downloadItemsSource()) {
       if (this.downloadKey(item.gid, item.site) === key) {
-        return this.toDownloadItem(
-          item,
-          item.status,
-          item.queuedAt,
-          item.lastAction,
-          item.label,
-          item.downloaded,
-          item.total,
-          item.failedCount,
-          item.archiveUri,
-          item.createdAt,
-          item.updatedAt,
-          item.currentPage,
-          item.currentPageLabel,
-          item.speedBytesPerSecond,
-          item.remainingSeconds,
-          item.downloadDir,
-          item.error,
-          item.pageErrors
-        );
+        return item;
       }
     }
     return undefined;
+  }
+
+  private sharedDownloadItemByKey(key: string): DownloadQueueItem | undefined {
+    for (const item of sharedDownloadItemsSnapshot) {
+      if (this.downloadKey(item.gid, item.site) === key) {
+        return item;
+      }
+    }
+    for (const item of this.runtimeDownloadItemsSnapshot()) {
+      if (this.downloadKey(item.gid, item.site) === key) {
+        return item;
+      }
+    }
+    return undefined;
+  }
+
+  private isDownloadKeyCancelled(key: string): boolean {
+    return this.downloadCancelKeys.has(key) ||
+      sharedDownloadCancelKeys.has(key) ||
+      this.isRuntimeStringArrayMarked(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key);
+  }
+
+  private isDownloadKeyRemoved(key: string): boolean {
+    return this.downloadRemovedKeys.has(key) ||
+      sharedDownloadRemovedKeys.has(key) ||
+      this.isRuntimeStringArrayMarked(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY, key);
+  }
+
+  private markDownloadKeyRemoved(key: string): void {
+    this.downloadRemovedKeys.add(key);
+    sharedDownloadRemovedKeys.add(key);
+    this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY, key, true, true);
+    this.downloadCancelKeys.add(key);
+    sharedDownloadCancelKeys.add(key);
+    this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, true);
+    this.downloadStartRequestedKeys.delete(key);
+    sharedDownloadStartRequestedKeys.delete(key);
+    this.downloadWaitKeys = this.downloadWaitKeys.filter((entry: string) => entry !== key);
+    this.removeSharedDownloadWaitKey(key);
+    if (this.downloadActiveKey === key) {
+      this.downloadActiveKey = '';
+    }
+    if (sharedDownloadActiveKey === key) {
+      sharedDownloadActiveKey = '';
+    }
+  }
+
+  private clearDownloadKeyRemoved(key: string): void {
+    this.downloadRemovedKeys.delete(key);
+    sharedDownloadRemovedKeys.delete(key);
+    this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY, key, false, true);
+  }
+
+  private filterRemovedDownloadItems(items: DownloadQueueItem[]): DownloadQueueItem[] {
+    return items.filter((item: DownloadQueueItem) => !this.isDownloadKeyRemoved(this.downloadKey(item.gid, item.site)));
+  }
+
+  private isDownloadKeyRunningInCurrentProcess(key: string): boolean {
+    if (key.length <= 0 || this.isDownloadKeyCancelled(key) || this.isDownloadKeyRemoved(key)) {
+      return false;
+    }
+    if (this.downloadWorkerRunning && this.downloadActiveKey === key) {
+      return true;
+    }
+    if (sharedDownloadWorkerRunning && sharedDownloadActiveKey === key) {
+      return true;
+    }
+    if (this.downloadRuntimeWorkerRunning && this.downloadRuntimeActiveKey === key) {
+      return true;
+    }
+    if (this.isDownloadRuntimeHeartbeatActiveForKey(key)) {
+      return true;
+    }
+    const sharedItem = this.sharedDownloadItemByKey(key);
+    return (this.downloadWorkerRunning || sharedDownloadWorkerRunning || this.downloadRuntimeWorkerRunning) &&
+      !!sharedItem &&
+      sharedItem.status === DOWNLOAD_STATUS_DOWNLOADING;
   }
 
   private latestDownloadItem(item: DownloadQueueItem): DownloadQueueItem {
@@ -10245,18 +10726,83 @@ struct Index {
     return this.findDownloadItemByKey(key) || item;
   }
 
-  private downloadItemsSource(): DownloadQueueItem[] {
-    return sharedDownloadItemsSnapshot.length > 0 ? sharedDownloadItemsSnapshot : this.downloadItems;
+  private activeDownloadRuntimeKey(): string {
+    if (this.downloadActiveKey.length > 0) {
+      return this.downloadActiveKey;
+    }
+    if (sharedDownloadActiveKey.length > 0) {
+      return sharedDownloadActiveKey;
+    }
+    if (this.downloadRuntimeActiveKey.length > 0) {
+      return this.downloadRuntimeActiveKey;
+    }
+    return this.activeDownloadRuntimeKeyFromPreferences();
   }
 
-  private publishSharedDownloadItems(): void {
-    const snapshot: DownloadQueueItem[] = [];
+  private shouldUseSharedDownloadItem(sharedItem: DownloadQueueItem, localItem: DownloadQueueItem | undefined): boolean {
+    if (!localItem) {
+      return true;
+    }
+    if (localItem.downloaded > sharedItem.downloaded) {
+      return false;
+    }
+    if (this.downloadKey(sharedItem.gid, sharedItem.site) === this.activeDownloadRuntimeKey()) {
+      return true;
+    }
+    if (sharedItem.status === DOWNLOAD_STATUS_DOWNLOADING &&
+      localItem.status !== DOWNLOAD_STATUS_DONE &&
+      localItem.status !== DOWNLOAD_STATUS_DELETED) {
+      return true;
+    }
+    return sharedItem.updatedAt.length > 0 && localItem.updatedAt.length > 0 &&
+      sharedItem.updatedAt > localItem.updatedAt;
+  }
+
+  private downloadItemsSource(): DownloadQueueItem[] {
+    const itemsByKey: Map<string, DownloadQueueItem> = new Map<string, DownloadQueueItem>();
     for (const item of this.downloadItems) {
-      snapshot.push(this.toDownloadItem(
+      const key = this.downloadKey(item.gid, item.site);
+      if (!this.isDownloadKeyRemoved(key)) {
+        itemsByKey.set(key, this.cloneDownloadItem(item));
+      }
+    }
+    for (const item of sharedDownloadItemsSnapshot) {
+      const key = this.downloadKey(item.gid, item.site);
+      if (this.isDownloadKeyRemoved(key)) {
+        continue;
+      }
+      const existing = itemsByKey.get(key);
+      if (this.shouldUseSharedDownloadItem(item, existing)) {
+        itemsByKey.set(key, this.cloneDownloadItem(item));
+      }
+    }
+    for (const item of this.runtimeDownloadItemsSnapshot()) {
+      const key = this.downloadKey(item.gid, item.site);
+      if (this.isDownloadKeyRemoved(key)) {
+        continue;
+      }
+      const existing = itemsByKey.get(key);
+      if (this.shouldUseSharedDownloadItem(item, existing)) {
+        itemsByKey.set(key, this.cloneDownloadItem(item));
+      }
+    }
+    const items: DownloadQueueItem[] = [];
+    itemsByKey.forEach((item: DownloadQueueItem) => {
+      items.push(this.downloadDisplayItem(item));
+    });
+    return items;
+  }
+
+  private downloadDisplayItem(item: DownloadQueueItem): DownloadQueueItem {
+    if (item.status === DOWNLOAD_STATUS_DOWNLOADING &&
+      this.isDownloadItemRunning(item) &&
+      item.lastAction.startsWith('下载中断')) {
+      const action = item.currentPage > 0 ? `正在下载第 ${item.currentPage} 页` : '正在下载';
+      return this.toDownloadItem(
         item,
         item.status,
         item.queuedAt,
-        item.lastAction,
+        action,
         item.label,
         item.downloaded,
         item.total,
@@ -10271,9 +10817,19 @@ struct Index {
         item.downloadDir,
         item.error,
         item.pageErrors
-      ));
+      );
+    }
+    return item;
+  }
+
+  private publishSharedDownloadItems(): void {
+    const snapshot: DownloadQueueItem[] = [];
+    for (const item of this.downloadItems) {
+      snapshot.push(this.cloneDownloadItem(item));
     }
     sharedDownloadItemsSnapshot = snapshot;
+    this.publishDownloadRuntimeStorage(snapshot);
+    this.bumpDownloadQueueRevision();
   }
 
   private enqueueSharedDownloadWaitKey(key: string, front: boolean = false): void {
@@ -10290,15 +10846,20 @@ struct Index {
   }
 
   private isRecordQueued(record: LocalGalleryRecord): boolean {
-    return this.findDownloadIndex(record.gid, record.site) >= 0;
+    return !!this.findDownloadItemByKey(this.downloadKey(record.gid, record.site));
   }
 
   private toggleGalleryQueue(record: LocalGalleryRecord): void {
-    const index = this.findDownloadIndex(record.gid, record.site);
-    if (index >= 0) {
-      this.removeDownloadItem(this.downloadItems[index]);
+    const key = this.downloadKey(record.gid, record.site);
+    const existing = this.findDownloadItemByKey(key);
+    if (existing) {
+      this.removeDownloadItem(existing);
       return;
     }
+    this.clearDownloadKeyRemoved(key);
+    this.downloadCancelKeys.delete(key);
+    sharedDownloadCancelKeys.delete(key);
+    this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, false);
     const nextItem = this.toDownloadItem(
       record,
       DOWNLOAD_STATUS_QUEUED,
@@ -10316,6 +10877,7 @@ struct Index {
     this.ensureDownloadLabelExists(nextItem.label);
     this.saveDownloadItems();
     this.libraryPanel = LIBRARY_DOWNLOADS;
+    this.setDownloadViewMode(DOWNLOAD_VIEW_ACTIVE);
     this.toast('已加入下载队列并开始');
     this.startDownloadItem(nextItem);
   }
@@ -10407,19 +10969,27 @@ struct Index {
     const current = this.latestDownloadItem(item);
     const key = this.downloadKey(current.gid, current.site);
     this.bumpDownloadRunGeneration(key);
+    this.invalidateDownloadPersistForKey(key);
     this.clearDownloadTransferProgress(current);
     this.cancelDownloadActiveRequests(key);
+    this.markDownloadKeyRemoved(key);
     this.downloadItems = this.downloadItems.filter((entry: DownloadQueueItem) =>
       !(entry.gid === current.gid && entry.site === current.site));
+    sharedDownloadItemsSnapshot = sharedDownloadItemsSnapshot.filter((entry: DownloadQueueItem) =>
+      this.downloadKey(entry.gid, entry.site) !== key);
+    const runtimeSnapshot = this.runtimeDownloadItemsSnapshot().filter((entry: DownloadQueueItem) =>
+      this.downloadKey(entry.gid, entry.site) !== key);
+    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ITEMS_KEY, JSON.stringify(runtimeSnapshot));
     this.downloadWaitKeys = this.downloadWaitKeys.filter((entry: string) => entry !== key);
     this.downloadStartRequestedKeys.delete(key);
     this.removeSharedDownloadWaitKey(key);
     sharedDownloadStartRequestedKeys.delete(key);
     this.saveDownloadItems();
-    void this.deleteDownloadItemFromDatabase(current);
+    this.scheduleDownloadItemDelete(current);
     this.removeDownloadedFilesForItem(current);
-    this.downloadCancelKeys.add(key);
-    sharedDownloadCancelKeys.add(key);
+    this.downloadItems = this.downloadItemsSource();
+    this.publishSharedDownloadItems();
+    this.reconcileDownloadViewMode();
     this.toast('已删除下载任务和本地文件');
     this.refreshDownloadRuntimeState(true);
   }
@@ -10430,6 +11000,9 @@ struct Index {
 
   private replaceDownloadItemInternal(nextItem: DownloadQueueItem, persist: boolean): void {
     const key = this.downloadKey(nextItem.gid, nextItem.site);
+    if (this.isDownloadKeyRemoved(key)) {
+      return;
+    }
     const nextItems: DownloadQueueItem[] = [];
     let replaced = false;
     for (const item of this.downloadItems) {
@@ -10449,6 +11022,7 @@ struct Index {
     } else {
       this.publishSharedDownloadItems();
     }
+    this.reconcileDownloadViewMode();
   }
 
   private updateDownloadProgress(
@@ -10491,7 +11065,7 @@ struct Index {
       pageErrors
     ), persist);
     const key = this.downloadKey(item.gid, item.site);
-    const activeKey = this.downloadActiveKey.length > 0 ? this.downloadActiveKey : sharedDownloadActiveKey;
+    const activeKey = this.activeDownloadRuntimeKey();
     if (key === activeKey && lastAction.length > 0) {
       this.downloadManagerStatus = lastAction;
     }
@@ -10625,21 +11199,33 @@ struct Index {
     const key = this.downloadKey(item.gid, item.site);
     return item.status !== DOWNLOAD_STATUS_DONE &&
       item.status !== DOWNLOAD_STATUS_DELETED &&
-      ((this.downloadWorkerRunning && this.downloadActiveKey === key && !this.downloadCancelKeys.has(key)) ||
-        (sharedDownloadWorkerRunning && sharedDownloadActiveKey === key && !sharedDownloadCancelKeys.has(key)));
+      this.isDownloadKeyRunningInCurrentProcess(key);
   }
 
   private activeDownloadItem(): DownloadQueueItem | undefined {
-    const key = this.downloadActiveKey.length > 0 ? this.downloadActiveKey : sharedDownloadActiveKey;
-    if (key.length <= 0 || this.downloadCancelKeys.has(key) || sharedDownloadCancelKeys.has(key)) {
+    const key = this.activeDownloadRuntimeKey();
+    if (key.length <= 0 || this.isDownloadKeyCancelled(key) || this.isDownloadKeyRemoved(key)) {
       return undefined;
     }
     return this.findDownloadItemByKey(key);
   }
 
   private downloadRuntimeActive(): boolean {
-    return this.downloadWorkerRunning || this.downloadActiveKey.length > 0 ||
-      sharedDownloadWorkerRunning || sharedDownloadActiveKey.length > 0;
+    if (this.downloadNotificationItems().length <= 0) {
+      return false;
+    }
+    const localActive = this.downloadActiveKey.length > 0 && !this.isDownloadKeyRemoved(this.downloadActiveKey);
+    const sharedActive = sharedDownloadActiveKey.length > 0 && !this.isDownloadKeyRemoved(sharedDownloadActiveKey);
+    const storageActive = this.downloadRuntimeActiveKey.length > 0 && !this.isDownloadKeyRemoved(this.downloadRuntimeActiveKey);
+    const heartbeatActiveKey = this.activeDownloadRuntimeKeyFromPreferences();
+    const heartbeatActive = heartbeatActiveKey.length > 0 && !this.isDownloadKeyRemoved(heartbeatActiveKey);
+    return this.downloadWorkerRunning ||
+      localActive ||
+      sharedDownloadWorkerRunning ||
+      sharedActive ||
+      this.downloadRuntimeWorkerRunning ||
+      storageActive ||
+      heartbeatActive;
   }
 
   private shortDownloadNotificationText(text: string, limit: number): string {
@@ -10649,83 +11235,256 @@ struct Index {
     return `${text.slice(0, Math.max(0, limit - 3))}...`;
   }
 
-  private queuedDownloadCount(): number {
-    let count = 0;
-    for (const item of this.downloadItemsSource()) {
-      if (item.status === DOWNLOAD_STATUS_QUEUED) {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  private downloadNotificationText(): string {
-    const active = this.activeDownloadItem();
-    if (active) {
-      const progress = active.total > 0 ?
-        `${Math.min(active.downloaded, active.total)}/${active.total}` : `${active.downloaded}`;
-      const title = active.title.length > 0 ? active.title : `${active.site}-${active.gid}`;
-      return this.shortDownloadNotificationText(`${progress} ${title}`, 96);
-    }
-    const queuedCount = this.queuedDownloadCount();
-    if (queuedCount <= 0) {
-      return '下载队列运行中';
-    }
-    if (queuedCount === 1) {
-      return '1 个画廊等待中';
-    }
-    return `${queuedCount} 个画廊等待中`;
-  }
-
-  private downloadNotificationDetail(): string {
-    const active = this.activeDownloadItem();
-    if (!active) {
-      return '下载队列运行中';
-    }
-    return active.lastAction.length > 0 ? active.lastAction : '正在下载';
-  }
-
-  private async ensureDownloadNotificationPermission(): Promise<boolean> {
-    try {
-      await notificationManager.addSlot(notificationManager.SlotType.SERVICE_INFORMATION);
-    } catch (error) {
-    }
-    try {
-      if (await notificationManager.isNotificationEnabled()) {
-        return true;
-      }
-    } catch (error) {
-    }
-    if (this.downloadNotificationPermissionRequested) {
-      return false;
-    }
-    const context = this.uiAbilityContext();
-    if (!context) {
-      return false;
-    }
-    this.downloadNotificationPermissionRequested = true;
-    try {
-      await notificationManager.requestEnableNotification(context);
-      return await notificationManager.isNotificationEnabled();
-    } catch (error) {
-      return false;
-    }
-  }
-
-  private async createDownloadWantAgent(): Promise<object | undefined> {
+  private async createDownloadWantAgent(requestCode: number = DOWNLOAD_NOTIFICATION_BASE_ID): Promise<object | undefined> {
+    const parameters: Record<string, Object> = {};
+    parameters[DOWNLOAD_ROUTE_ACTION_KEY] = DOWNLOAD_ROUTE_ACTION_ACTIVE;
     const wantAgentInfo: wantAgent.WantAgentInfo = {
       wants: [{
         bundleName: APP_BUNDLE_NAME,
-        abilityName: APP_ABILITY_NAME
+        abilityName: APP_ABILITY_NAME,
+        parameters
       }],
       actionType: wantAgent.OperationType.START_ABILITY,
-      requestCode: DOWNLOAD_NOTIFICATION_ID,
+      requestCode,
       actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
     };
     try {
       return await wantAgent.getWantAgent(wantAgentInfo);
     } catch (error) {
       return undefined;
+    }
+  }
+
+  private shouldPublishDownloadNotification(item: DownloadQueueItem): boolean {
+    if (item.status === DOWNLOAD_STATUS_DONE ||
+      item.status === DOWNLOAD_STATUS_DELETED ||
+      item.status === DOWNLOAD_STATUS_PAUSED) {
+      return false;
+    }
+    const key = this.downloadKey(item.gid, item.site);
+    return this.isDownloadItemRunning(item) || this.activeDownloadRuntimeKey() === key;
+  }
+
+  private downloadNotificationItems(): DownloadQueueItem[] {
+    const items: DownloadQueueItem[] = [];
+    for (const item of this.downloadItemsSource()) {
+      if (this.shouldPublishDownloadNotification(item)) {
+        items.push(item);
+      }
+    }
+    const active = this.activeDownloadItem();
+    if (active && this.shouldPublishDownloadNotification(active)) {
+      const activeKey = this.downloadKey(active.gid, active.site);
+      const ordered: DownloadQueueItem[] = [];
+      for (const item of items) {
+        if (this.downloadKey(item.gid, item.site) === activeKey) {
+          ordered.push(item);
+        }
+      }
+      for (const item of items) {
+        if (this.downloadKey(item.gid, item.site) !== activeKey) {
+          ordered.push(item);
+        }
+      }
+      return ordered.length > 0 ? ordered : [active];
+    }
+    return items;
+  }
+
+  private downloadNotificationTitle(item: DownloadQueueItem): string {
+    const title = item.title.trim();
+    return this.shortDownloadNotificationText(title.length > 0 ? title : `${item.site}-${item.gid}`, 72);
+  }
+
+  private downloadNotificationBase(item: DownloadQueueItem): number {
+    return Math.max(item.total, item.pages, Math.ceil(item.downloaded), 1);
+  }
+
+  private downloadNotificationCurrent(item: DownloadQueueItem): number {
+    const base = this.downloadNotificationBase(item);
+    return Math.floor(clampNumber(this.downloadProgressRatio(item), 0, 1) * base);
+  }
+
+  private downloadNotificationPercent(item: DownloadQueueItem): number {
+    return Math.round(clampNumber(this.downloadProgressRatio(item), 0, 1) * 100);
+  }
+
+  private downloadNotificationIdForKey(key: string): number {
+    const cached = sharedDownloadNotificationIds.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    let hash = 0;
+    for (let index = 0; index < key.length; index++) {
+      hash = (hash * 31 + key.charCodeAt(index)) & 0x7fffffff;
+    }
+    const id = DOWNLOAD_NOTIFICATION_BASE_ID + (hash % 1000000);
+    sharedDownloadNotificationIds.set(key, id);
+    return id;
+  }
+
+  private downloadNotificationLabelForKey(key: string): string {
+    const cached = sharedDownloadNotificationLabels.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const safeKey = key.replace(/[^0-9A-Za-z_]/g, '_');
+    const label = `${DOWNLOAD_NOTIFICATION_LABEL_PREFIX}${safeKey}`;
+    sharedDownloadNotificationLabels.set(key, label);
+    return label;
+  }
+
+  private downloadNotificationStateKey(item: DownloadQueueItem): string {
+    return [
+      item.site,
+      item.gid,
+      item.status,
+      this.downloadNotificationCurrent(item),
+      this.downloadNotificationBase(item),
+      this.downloadNotificationPercent(item),
+      item.downloaded,
+      item.total,
+      item.failedCount,
+      item.currentPage,
+      item.currentPageLabel,
+      item.speedBytesPerSecond,
+      item.remainingSeconds,
+      item.lastAction,
+      item.error
+    ].join('|');
+  }
+
+  private async ensureDownloadNotificationPermission(): Promise<boolean> {
+    try {
+      await notificationManager.addSlot(notificationManager.SlotType.SERVICE_INFORMATION);
+    } catch (error) {
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download notification add slot failed: %{public}s', JSON.stringify(error));
+    }
+    try {
+      if (await notificationManager.isNotificationEnabled()) {
+        return true;
+      }
+      if (this.downloadNotificationPermissionAsked) {
+        return false;
+      }
+      const context = this.uiAbilityContext();
+      if (!context) {
+        return false;
+      }
+      this.downloadNotificationPermissionAsked = true;
+      await notificationManager.requestEnableNotification(context);
+      return await notificationManager.isNotificationEnabled();
+    } catch (error) {
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download notification permission failed: %{public}s',
+        JSON.stringify(error));
+      return false;
+    }
+  }
+
+  private async publishDownloadNotificationForItem(item: DownloadQueueItem, force: boolean): Promise<void> {
+    const key = this.downloadKey(item.gid, item.site);
+    const id = this.downloadNotificationIdForKey(key);
+    const label = this.downloadNotificationLabelForKey(key);
+    const stateKey = this.downloadNotificationStateKey(item);
+    const now = Date.now();
+    const lastAt = sharedDownloadNotificationLastAt.get(key) || 0;
+    if (!force && stateKey === sharedDownloadNotificationStates.get(key)) {
+      return;
+    }
+    if (!force && now - lastAt < DOWNLOAD_NOTIFICATION_INTERVAL_MS) {
+      return;
+    }
+    if (!(await this.ensureDownloadNotificationPermission())) {
+      return;
+    }
+    const agent = await this.createDownloadWantAgent(id);
+    const percent = this.downloadNotificationPercent(item);
+    const speed = item.speedBytesPerSecond > 0 ? ` · ${formatBytesPerSecond(item.speedBytesPerSecond)}` : '';
+    const remaining = item.remainingSeconds >= 0 ? ` · 剩余 ${formatRemainingSeconds(item.remainingSeconds)}` : '';
+    const detail = item.error.length > 0 ? item.error : (item.lastAction.length > 0 ? item.lastAction : '正在下载');
+    const title = this.downloadNotificationTitle(item);
+    const text = `${percent}% · ${this.downloadProgressText(item)}${speed}${remaining}`;
+    const request: notificationManager.NotificationRequest = {
+      id,
+      label,
+      content: {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
+        normal: {
+          title,
+          text,
+          additionalText: this.shortDownloadNotificationText(detail, 96)
+        }
+      },
+      template: {
+        name: 'downloadTemplate',
+        data: {
+          title: 'E-Harmony 下载',
+          fileName: this.shortDownloadNotificationText(`${title} · ${text}`, 120),
+          progressValue: percent
+        }
+      },
+      notificationSlotType: notificationManager.SlotType.SERVICE_INFORMATION,
+      isOngoing: false,
+      isUnremovable: false,
+      tapDismissed: false,
+      isAlertOnce: true,
+      groupName: DOWNLOAD_NOTIFICATION_GROUP
+    };
+    if (agent) {
+      request.wantAgent = agent;
+    }
+    try {
+      await notificationManager.publish(request);
+      sharedDownloadNotificationStates.set(key, stateKey);
+      sharedDownloadNotificationLastAt.set(key, now);
+    } catch (error) {
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download notification publish failed: %{public}s', JSON.stringify(error));
+    }
+  }
+
+  private async cancelDownloadNotificationByKey(key: string): Promise<void> {
+    const id = sharedDownloadNotificationIds.get(key);
+    const label = sharedDownloadNotificationLabels.get(key);
+    if (id !== undefined && label !== undefined) {
+      try {
+        await notificationManager.cancel(id, label);
+      } catch (error) {
+      }
+    }
+    sharedDownloadNotificationStates.delete(key);
+    sharedDownloadNotificationLastAt.delete(key);
+    sharedDownloadNotificationIds.delete(key);
+    sharedDownloadNotificationLabels.delete(key);
+  }
+
+  private async cancelStaleDownloadNotifications(activeKeys: string[]): Promise<void> {
+    const knownKeys = Array.from(sharedDownloadNotificationIds.keys());
+    for (const key of knownKeys) {
+      if (activeKeys.indexOf(key) < 0) {
+        await this.cancelDownloadNotificationByKey(key);
+      }
+    }
+  }
+
+  private async publishDownloadNotifications(force: boolean): Promise<void> {
+    const items = this.downloadNotificationItems();
+    if (items.length <= 0) {
+      await this.cancelAllDownloadNotifications();
+      return;
+    }
+    const activeKeys: string[] = [];
+    for (const item of items) {
+      const key = this.downloadKey(item.gid, item.site);
+      activeKeys.push(key);
+      await this.publishDownloadNotificationForItem(item, force);
+    }
+    await this.cancelStaleDownloadNotifications(activeKeys);
+  }
+
+  private async cancelAllDownloadNotifications(): Promise<void> {
+    const knownKeys = Array.from(sharedDownloadNotificationIds.keys());
+    for (const key of knownKeys) {
+      await this.cancelDownloadNotificationByKey(key);
     }
   }
 
@@ -10736,21 +11495,44 @@ struct Index {
     this.downloadBackgroundStarting = true;
     try {
       const context = this.uiAbilityContext();
-      if (!context || !(await this.ensureDownloadNotificationPermission())) {
+      if (!context) {
         return;
       }
       const agent = await this.createDownloadWantAgent();
       if (!agent) {
         return;
       }
-      const notification = await backgroundTaskManager.startBackgroundRunning(
-        context,
-        [DOWNLOAD_BACKGROUND_MODE],
-        agent
-      );
+      let taskId = -1;
+      try {
+        const request = new backgroundTaskManager.ContinuousTaskRequest();
+        request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_DATA_TRANSFER];
+        request.combinedTaskNotification = true;
+        request.wantAgent = agent;
+        const notification: backgroundTaskManager.ContinuousTaskNotification =
+          await backgroundTaskManager.startBackgroundRunning(context, request);
+        taskId = notification.continuousTaskId === undefined ? -1 : notification.continuousTaskId;
+      } catch (requestError) {
+        const notification: backgroundTaskManager.ContinuousTaskNotification = await backgroundTaskManager.startBackgroundRunning(
+          context,
+          [DOWNLOAD_BACKGROUND_MODE],
+          agent
+        );
+        taskId = notification.continuousTaskId === undefined ? -1 : notification.continuousTaskId;
+      }
       this.downloadBackgroundRunning = true;
-      this.downloadBackgroundTaskId = notification.continuousTaskId === undefined ? -1 : notification.continuousTaskId;
+      this.downloadBackgroundTaskId = taskId;
+      sharedDownloadBackgroundStopAttempted = false;
+      hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Download background task started: %{public}d', this.downloadBackgroundTaskId);
     } catch (error) {
+      const code = `${(error as NativeReadableErrorInfo).code}`;
+      if (code === '9800005') {
+        this.downloadBackgroundRunning = true;
+        this.downloadBackgroundTaskId = -1;
+        sharedDownloadBackgroundStopAttempted = false;
+        hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Download background task already running');
+        return;
+      }
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download background task start failed: %{public}s', JSON.stringify(error));
       this.downloadBackgroundRunning = false;
       this.downloadBackgroundTaskId = -1;
     } finally {
@@ -10760,7 +11542,16 @@ struct Index {
 
   private async stopDownloadBackgroundTask(): Promise<void> {
     const context = this.uiAbilityContext();
-    if (this.downloadBackgroundRunning && context) {
+    if (!context) {
+      this.downloadBackgroundRunning = false;
+      this.downloadBackgroundTaskId = -1;
+      return;
+    }
+    if (!this.downloadBackgroundRunning && sharedDownloadBackgroundStopAttempted) {
+      this.downloadBackgroundTaskId = -1;
+      return;
+    }
+    if (this.downloadBackgroundRunning || !sharedDownloadBackgroundStopAttempted) {
       try {
         if (this.downloadBackgroundTaskId > 0) {
           await backgroundTaskManager.stopBackgroundRunning(context, this.downloadBackgroundTaskId);
@@ -10776,77 +11567,47 @@ struct Index {
     }
     this.downloadBackgroundRunning = false;
     this.downloadBackgroundTaskId = -1;
-    await this.cancelDownloadNotification();
-  }
-
-  private async publishDownloadNotification(force: boolean = false): Promise<void> {
-    if (!this.downloadRuntimeActive()) {
-      await this.cancelDownloadNotification();
-      return;
-    }
-    const text = this.downloadNotificationText();
-    const detail = this.downloadNotificationDetail();
-    const stateKey = `${this.downloadActiveKey.length > 0 ? this.downloadActiveKey : sharedDownloadActiveKey}|${text}|${detail}`;
-    const now = Date.now();
-    if (!force && stateKey === this.downloadNotificationLastState &&
-      now - this.downloadNotificationLastAt < DOWNLOAD_NOTIFICATION_INTERVAL_MS) {
-      return;
-    }
-    if (!(await this.ensureDownloadNotificationPermission())) {
-      return;
-    }
-    const request: notificationManager.NotificationRequest = {
-      id: DOWNLOAD_NOTIFICATION_ID,
-      label: DOWNLOAD_NOTIFICATION_LABEL,
-      notificationSlotType: notificationManager.SlotType.SERVICE_INFORMATION,
-      isOngoing: true,
-      isAlertOnce: true,
-      tapDismissed: false,
-      content: {
-        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
-        normal: {
-          title: 'E-Harmony 下载',
-          text,
-          additionalText: this.shortDownloadNotificationText(detail, 96)
-        }
-      }
-    };
-    const agent = await this.createDownloadWantAgent();
-    if (agent) {
-      request.wantAgent = agent;
-    }
-    try {
-      await notificationManager.publish(request);
-      this.downloadNotificationPublished = true;
-      this.downloadNotificationLastAt = now;
-      this.downloadNotificationLastState = stateKey;
-    } catch (error) {
-    }
-  }
-
-  private async cancelDownloadNotification(): Promise<void> {
-    if (!this.downloadNotificationPublished && this.downloadNotificationLastState.length === 0) {
-      return;
-    }
-    try {
-      await notificationManager.cancel(DOWNLOAD_NOTIFICATION_ID, DOWNLOAD_NOTIFICATION_LABEL);
-    } catch (error) {
-    }
-    this.downloadNotificationPublished = false;
-    this.downloadNotificationLastState = '';
+    sharedDownloadBackgroundStopAttempted = true;
   }
 
   private refreshDownloadRuntimeState(force: boolean = false): void {
     this.updateDownloadStatePolling();
-    void this.syncDownloadRuntimeState(force);
+    this.queueDownloadRuntimeStateSync(force);
+  }
+
+  private queueDownloadRuntimeStateSync(force: boolean): void {
+    this.downloadRuntimeSyncPending = true;
+    this.downloadRuntimeSyncPendingForce = this.downloadRuntimeSyncPendingForce || force;
+    if (this.downloadRuntimeSyncInFlight) {
+      return;
+    }
+    this.downloadRuntimeSyncInFlight = true;
+    void this.drainDownloadRuntimeStateSync();
+  }
+
+  private async drainDownloadRuntimeStateSync(): Promise<void> {
+    try {
+      while (this.downloadRuntimeSyncPending) {
+        const force = this.downloadRuntimeSyncPendingForce;
+        this.downloadRuntimeSyncPending = false;
+        this.downloadRuntimeSyncPendingForce = false;
+        await this.syncDownloadRuntimeState(force);
+      }
+    } finally {
+      this.downloadRuntimeSyncInFlight = false;
+      if (this.downloadRuntimeSyncPending) {
+        this.queueDownloadRuntimeStateSync(this.downloadRuntimeSyncPendingForce);
+      }
+    }
   }
 
   private async syncDownloadRuntimeState(force: boolean): Promise<void> {
     if (this.downloadRuntimeActive()) {
+      await this.publishDownloadNotifications(force);
       await this.startDownloadBackgroundTask();
-      await this.publishDownloadNotification(force);
     } else {
       await this.stopDownloadBackgroundTask();
+      await this.cancelAllDownloadNotifications();
     }
   }
 
@@ -10907,6 +11668,7 @@ struct Index {
     this.bumpDownloadRunGeneration(key);
     this.downloadCancelKeys.delete(key);
     sharedDownloadCancelKeys.delete(key);
+    this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, false);
     this.downloadStartRequestedKeys.add(key);
     sharedDownloadStartRequestedKeys.add(key);
     this.enqueueDownloadWaitKey(key);
@@ -10933,6 +11695,9 @@ struct Index {
     );
     this.replaceDownloadItem(runnable);
     this.downloadManagerStatus = '下载等待中';
+    if (this.libraryPanel === LIBRARY_DOWNLOADS) {
+      this.setDownloadViewMode(DOWNLOAD_VIEW_ACTIVE);
+    }
     this.ensureDownloadWorker();
     this.refreshDownloadRuntimeState(true);
   }
@@ -10970,6 +11735,7 @@ struct Index {
     this.cancelDownloadActiveRequests(key);
     this.downloadCancelKeys.add(key);
     sharedDownloadCancelKeys.add(key);
+    this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, true);
     this.downloadStartRequestedKeys.delete(key);
     sharedDownloadStartRequestedKeys.delete(key);
     this.downloadWaitKeys = this.downloadWaitKeys.filter((entry: string) => entry !== key);
@@ -11000,7 +11766,7 @@ struct Index {
 
   private startAllDownloads(): void {
     const nextItems: DownloadQueueItem[] = [];
-    for (const item of this.downloadItems) {
+    for (const item of this.downloadItemsSource()) {
       if (item.status === DOWNLOAD_STATUS_DONE || this.isDownloadItemRunning(item)) {
         nextItems.push(item);
         continue;
@@ -11009,6 +11775,7 @@ struct Index {
       this.bumpDownloadRunGeneration(key);
       this.downloadCancelKeys.delete(key);
       sharedDownloadCancelKeys.delete(key);
+      this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, false);
       this.downloadStartRequestedKeys.add(key);
       sharedDownloadStartRequestedKeys.add(key);
       this.enqueueDownloadWaitKey(key);
@@ -11041,21 +11808,22 @@ struct Index {
 
   private pauseAllDownloads(): void {
     const nextItems: DownloadQueueItem[] = [];
-    for (const item of this.downloadItems) {
+    for (const item of this.downloadItemsSource()) {
+      if (item.status === DOWNLOAD_STATUS_DONE) {
+        nextItems.push(item);
+        continue;
+      }
       const key = this.downloadKey(item.gid, item.site);
       this.bumpDownloadRunGeneration(key);
       this.clearDownloadTransferProgress(item);
       this.cancelDownloadActiveRequests(key);
       this.downloadCancelKeys.add(key);
       sharedDownloadCancelKeys.add(key);
+      this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, true);
       this.downloadStartRequestedKeys.delete(key);
       sharedDownloadStartRequestedKeys.delete(key);
       this.downloadWaitKeys = this.downloadWaitKeys.filter((entry: string) => entry !== key);
       this.removeSharedDownloadWaitKey(key);
-      if (item.status === DOWNLOAD_STATUS_DONE) {
-        nextItems.push(item);
-        continue;
-      }
       nextItems.push(this.toDownloadItem(
         item,
         DOWNLOAD_STATUS_PAUSED,
@@ -11083,12 +11851,16 @@ struct Index {
   }
 
   private clearCompletedDownloads(): void {
-    const removed = this.downloadItems.filter((item: DownloadQueueItem) => item.status === DOWNLOAD_STATUS_DONE);
-    this.downloadItems = this.downloadItems.filter((item: DownloadQueueItem) => item.status !== DOWNLOAD_STATUS_DONE);
-    this.saveDownloadItems();
+    const source = this.downloadItemsSource();
+    const removed = source.filter((item: DownloadQueueItem) => item.status === DOWNLOAD_STATUS_DONE);
+    const removedKeys: string[] = removed.map((item: DownloadQueueItem) => this.downloadKey(item.gid, item.site));
     for (const item of removed) {
-      void this.deleteDownloadItemFromDatabase(item);
+      const key = this.downloadKey(item.gid, item.site);
+      this.markDownloadKeyRemoved(key);
+      this.scheduleDownloadItemDelete(item);
     }
+    this.downloadItems = source.filter((item: DownloadQueueItem) => removedKeys.indexOf(this.downloadKey(item.gid, item.site)) < 0);
+    this.saveDownloadItems();
     this.refreshDownloadRuntimeState(true);
   }
 
@@ -11112,13 +11884,9 @@ struct Index {
       this.invalidateDownloadPersistForKey(key);
       this.clearDownloadTransferProgress(item);
       this.cancelDownloadActiveRequests(key);
-      this.downloadCancelKeys.add(key);
-      sharedDownloadCancelKeys.add(key);
-      this.downloadStartRequestedKeys.delete(key);
-      sharedDownloadStartRequestedKeys.delete(key);
-      this.removeSharedDownloadWaitKey(key);
+      this.markDownloadKeyRemoved(key);
       this.removeDownloadedFilesForItem(item);
-      void this.deleteDownloadItemFromDatabase(item);
+      this.scheduleDownloadItemDelete(item);
     }
 
     this.downloadWaitKeys = this.downloadWaitKeys.filter((entry: string) => removedKeys.indexOf(entry) < 0);
@@ -11231,11 +11999,13 @@ struct Index {
           this.downloadManagerStatus = '下载器空闲';
           this.downloadActiveKey = '';
           sharedDownloadActiveKey = '';
+          this.publishDownloadRuntimeStorage();
           return;
         }
         this.downloadActiveKey = this.downloadKey(item.gid, item.site);
         sharedDownloadActiveKey = this.downloadActiveKey;
         sharedDownloadWorkerRunning = true;
+        this.publishDownloadRuntimeStorage();
         this.refreshDownloadRuntimeState(true);
         const runGeneration = this.currentDownloadRunGeneration(this.downloadActiveKey);
         const runningItem = this.markDownloadItemRunning(item);
@@ -11244,6 +12014,7 @@ struct Index {
     } finally {
       this.downloadWorkerRunning = false;
       sharedDownloadWorkerRunning = false;
+      this.publishDownloadRuntimeStorage(sharedDownloadItemsSnapshot, true);
       if (this.hasRunnableDownload()) {
         this.ensureDownloadWorker();
       } else {
@@ -11455,6 +12226,7 @@ struct Index {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
         usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 45000,
         connectTimeout: 15000,
         header: headers
@@ -11546,6 +12318,9 @@ struct Index {
 
   private shouldStopDownload(item: DownloadQueueItem, runGeneration: number): boolean {
     const key = this.downloadKey(item.gid, item.site);
+    if (this.isDownloadKeyRemoved(key)) {
+      return true;
+    }
     if (this.currentDownloadRunGeneration(key) !== runGeneration) {
       return true;
     }
@@ -11899,12 +12674,14 @@ struct Index {
       this.clearDownloadTransferProgress(seed);
       this.downloadCancelKeys.delete(key);
       sharedDownloadCancelKeys.delete(key);
+      this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, false);
       if (this.downloadActiveKey === key) {
         this.downloadActiveKey = '';
       }
       if (sharedDownloadActiveKey === key) {
         sharedDownloadActiveKey = '';
       }
+      this.publishDownloadRuntimeStorage();
       this.refreshDownloadRuntimeState(true);
     }
   }
@@ -11979,6 +12756,7 @@ struct Index {
       if (existingKeys.indexOf(this.downloadKey(item.gid, item.site)) >= 0) {
         continue;
       }
+      this.clearDownloadKeyRemoved(this.downloadKey(item.gid, item.site));
       merged.unshift(item);
     }
     this.downloadItems = merged.slice(0, 120);
@@ -12168,12 +12946,71 @@ struct Index {
   }
 
   private setDownloadViewMode(value: string): void {
-    this.downloadViewMode = value === DOWNLOAD_VIEW_ACTIVE ? DOWNLOAD_VIEW_ACTIVE : DOWNLOAD_VIEW_DOWNLOADED;
+    const nextMode = value === DOWNLOAD_VIEW_ACTIVE ? DOWNLOAD_VIEW_ACTIVE : DOWNLOAD_VIEW_DOWNLOADED;
+    this.downloadViewMode = nextMode;
+    this.downloadViewSelectedIndexes = [nextMode === DOWNLOAD_VIEW_ACTIVE ? 1 : 0];
+  }
+
+  private setDownloadViewModeByIndex(index: number): void {
+    this.setDownloadViewMode(index === 1 ? DOWNLOAD_VIEW_ACTIVE : DOWNLOAD_VIEW_DOWNLOADED);
+  }
+
+  private handleDownloadRouteEventChanged(): void {
+    this.applyPendingDownloadRouteEvent();
+  }
+
+  private applyPendingDownloadRouteEvent(): boolean {
+    if (!this.isReady ||
+      this.downloadRouteEventId <= 0 ||
+      this.downloadRouteEventId === this.handledDownloadRouteEventId) {
+      return false;
+    }
+    this.handledDownloadRouteEventId = this.downloadRouteEventId;
+    if (this.downloadRouteTarget !== DOWNLOAD_ROUTE_ACTION_ACTIVE) {
+      return false;
+    }
+    this.fullScreenWebUrl = '';
+    this.fullScreenWebTitle = '';
+    this.fullScreenWebMode = '';
+    this.routeNativeSummary = undefined;
+    this.routeNativeMode = '';
+    this.routeReaderPageUrl = '';
+    this.prepareMySubPageLocal(MY_PAGE_DOWNLOADS, '下载');
+    this.setDownloadViewMode(DOWNLOAD_VIEW_ACTIVE);
+    if (!this.downloadWorkerRunning) {
+      void this.syncDownloadStateFromDatabase(false);
+    }
+    return true;
+  }
+
+  private preferredDownloadViewMode(): string {
+    return this.activeDownloadTaskCount() > 0 ? DOWNLOAD_VIEW_ACTIVE : DOWNLOAD_VIEW_DOWNLOADED;
+  }
+
+  private effectiveDownloadViewMode(): string {
+    return this.downloadViewMode === DOWNLOAD_VIEW_ACTIVE ? DOWNLOAD_VIEW_ACTIVE : DOWNLOAD_VIEW_DOWNLOADED;
+  }
+
+  private hasRunningDownloadTask(): boolean {
+    for (const item of this.downloadItemsSource()) {
+      if (this.isDownloadItemRunning(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private reconcileDownloadViewMode(selectPreferredView: boolean = false): void {
+    if (selectPreferredView) {
+      this.setDownloadViewMode(this.preferredDownloadViewMode());
+      return;
+    }
+    this.setDownloadViewMode(this.downloadViewMode);
   }
 
   private activeDownloadTaskCount(): number {
     let count = 0;
-    for (const item of this.downloadItems) {
+    for (const item of this.downloadItemsSource()) {
       if (item.status !== DOWNLOAD_STATUS_DONE && item.status !== DOWNLOAD_STATUS_DELETED) {
         count++;
       }
@@ -12183,7 +13020,7 @@ struct Index {
 
   private downloadedTaskCount(): number {
     let count = 0;
-    for (const item of this.downloadItems) {
+    for (const item of this.downloadItemsSource()) {
       if (item.status === DOWNLOAD_STATUS_DONE) {
         count++;
       }
@@ -12454,6 +13291,10 @@ struct Index {
     return this.activeSection === NAV_LIBRARY && this.myPage === MY_PAGE_DOWNLOADS && !this.hasVisibleNativeSubPage();
   }
 
+  private shouldShowDownloadTitleSegment(): boolean {
+    return this.activeSection === NAV_LIBRARY && this.myPage === MY_PAGE_DOWNLOADS && !this.hasVisibleNativeSubPage();
+  }
+
   private historyNavigationMenuContent(): HdsNavigationMenuContentOptions {
     return {
       value: [
@@ -12473,29 +13314,7 @@ struct Index {
   }
 
   private downloadNavigationMenuContent(): HdsNavigationMenuContentOptions {
-    return {
-      value: [
-        {
-          content: {
-            label: `已下载 (${this.downloadedTaskCount()})`,
-            icon: this.homeMenuSymbol($r('sys.symbol.checkmark_circle_fill')),
-            action: (): void => {
-              this.setDownloadViewMode(DOWNLOAD_VIEW_DOWNLOADED);
-            }
-          }
-        },
-        {
-          content: {
-            label: `下载中 (${this.activeDownloadTaskCount()})`,
-            icon: this.homeMenuSymbol($r('sys.symbol.waveform_folder_fill')),
-            action: (): void => {
-              this.setDownloadViewMode(DOWNLOAD_VIEW_ACTIVE);
-            }
-          }
-        }
-      ],
-      maxCount: 1
-    };
+    return this.emptyNavigationMenuContent();
   }
 
   private currentBackTitleBarMenuContent(): HdsNavigationMenuContentOptions {
@@ -12662,6 +13481,41 @@ struct Index {
       };
     }
     if (this.shouldShowNativeTitleBarBack()) {
+      if (this.shouldShowDownloadTitleSegment()) {
+        return {
+          content: {
+            title: {
+              mainTitle: this.currentNavigationTitle()
+            },
+            backIcon: {
+              label: '返回',
+              isEnabled: true,
+              action: (): void => {
+                this.handleNativeTitleBarBack();
+              }
+            },
+            menu: this.emptyNavigationMenuContent(),
+            bottomBuilder: {
+              builder: (): void => {
+                this.DownloadTitleBarSegment();
+              },
+              height: DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT
+            }
+          },
+          style: {
+            scrollEffectOpts: {
+              enableScrollEffect: true,
+              scrollEffectType: ScrollEffectType.GRADIENT_BLUR
+            },
+            systemMaterialEffect: {
+              materialType: hdsMaterial.MaterialType.ADAPTIVE,
+              materialLevel: this.customMaterialLevel
+            }
+          },
+          avoidLayoutSafeArea: true,
+          enableComponentSafeArea: false
+        };
+      }
       return {
         content: {
           title: {
@@ -12713,12 +13567,17 @@ struct Index {
   }
 
   private pageContentTopPadding(): number {
-    return this.systemSafeTop + HDS_MINI_TITLE_BAR_HEIGHT;
+    const titleBarBottomInset = this.shouldShowDownloadTitleSegment() ? DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT : 0;
+    return this.systemSafeTop + HDS_MINI_TITLE_BAR_HEIGHT + titleBarBottomInset;
   }
 
   private pageContentBottomPadding(): number {
     const floatingTabInset = this.shouldShowBottomTabs() ? FLOATING_BOTTOM_TAB_BAR_HEIGHT : 0;
     return this.systemSafeBottom + floatingTabInset + PAGE_BOTTOM_SPACING;
+  }
+
+  private downloadScrollContentMinHeight(): number {
+    return Math.max(1, this.pageViewportHeight + DOWNLOAD_SCROLL_EXTRA_HEIGHT);
   }
 
   private viewportLengthToNumber(value: Length): number {
@@ -14093,6 +14952,24 @@ struct Index {
   }
 
   @Builder
+  private DownloadTitleBarSegment(): void {
+    Column() {
+      SegmentButton({
+        options: this.downloadViewSegmentOptions,
+        selectedIndexes: $downloadViewSelectedIndexes,
+        onItemClicked: (index: number): void => {
+          this.setDownloadViewModeByIndex(index);
+        }
+      })
+        .width('100%');
+    }
+    .width('100%')
+    .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: 6, bottom: 8 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center);
+  }
+
+  @Builder
   private SearchTitleBar(): void {
     Row({ space: 10 }) {
       Row({ space: 8 }) {
@@ -14205,7 +15082,7 @@ struct Index {
   private shouldShowLoginGate(): boolean {
     return this.isReady &&
       this.loginGateVisible &&
-      !this.hasAvailableCookie() &&
+      !this.hasCurrentSiteCredential() &&
       this.fullScreenWebUrl.length === 0 &&
       !this.hasActiveReaderPage();
   }
@@ -15739,32 +16616,29 @@ struct Index {
     highlighted: boolean,
     action: () => void
   ): void {
-    Button() {
-      Column({ space: 3 }) {
-        SymbolGlyph(symbol)
-          .fontSize(19)
-          .fontColor([highlighted ? '#FFFFFF' : '#A85474']);
-        Text(title)
-          .fontSize(13)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(highlighted ? '#FFFFFF' : '#2B2027')
-          .maxLines(1);
-        Text(subtitle)
-          .fontSize(9)
-          .fontColor(highlighted ? '#FBEAF1' : '#7C6470')
-          .maxLines(1);
-      }
-      .width('100%')
-      .height('100%')
-      .justifyContent(FlexAlign.Center)
-      .alignItems(HorizontalAlign.Center);
+    Column({ space: 3 }) {
+      SymbolGlyph(symbol)
+        .fontSize(19)
+        .fontColor([highlighted ? '#FFFFFF' : '#A85474']);
+      Text(title)
+        .fontSize(13)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(highlighted ? '#FFFFFF' : '#2B2027')
+        .maxLines(1);
+      Text(subtitle)
+        .fontSize(9)
+        .fontColor(highlighted ? '#FBEAF1' : '#7C6470')
+        .maxLines(1);
     }
     .width('100%')
     .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
     .padding(0)
     .backgroundColor(highlighted ? '#C86B8C' : '#FFFFFF')
     .borderRadius(8)
     .accessibilityText(title)
+    .hitTestBehavior(HitTestMode.Default)
     .onClick(() => {
       action();
     });
@@ -15857,36 +16731,49 @@ struct Index {
   @Builder
   private NativeDetailActions(): void {
     Column({ space: 8 }) {
-      Grid() {
-        GridItem() {
-          this.NativeDetailReadButton();
+      Column({ space: 8 }) {
+        Row({ space: 8 }) {
+          Column() {
+            this.NativeDetailReadButton();
+          }
+          .layoutWeight(1)
+          .height('100%');
+          Column() {
+            this.NativeDetailSquareButton('书签', this.galleryBookmarkLabel(), $r('sys.symbol.star_fill'), false, (): void => {
+              this.toggleCurrentGalleryBookmark();
+            });
+          }
+          .layoutWeight(1)
+          .height('100%');
         }
-        GridItem() {
-          this.NativeDetailSquareButton('书签', this.galleryBookmarkLabel(), $r('sys.symbol.star_fill'), false, (): void => {
-            this.toggleCurrentGalleryBookmark();
-          });
+        .width('100%')
+        .height(72);
+
+        Row({ space: 8 }) {
+          Column() {
+            this.NativeDetailSquareButton('下载', this.queuedStateText(), $r('sys.symbol.waveform_folder_fill'), false, (): void => {
+              this.toggleCurrentGalleryQueue();
+            });
+          }
+          .layoutWeight(1)
+          .height('100%');
+          Column() {
+            this.NativeDetailSquareButton(
+              'Torrent',
+              this.nativeDetail.torrentCount > 0 ? `${this.nativeDetail.torrentCount} 个` : '列表',
+              $r('sys.symbol.folder_fill'),
+              false,
+              (): void => {
+                void this.openTorrentPanel();
+              }
+            );
+          }
+          .layoutWeight(1)
+          .height('100%');
         }
-        GridItem() {
-          this.NativeDetailSquareButton('下载', this.queuedStateText(), $r('sys.symbol.waveform_folder_fill'), false, (): void => {
-            this.toggleCurrentGalleryQueue();
-          });
-        }
-        GridItem() {
-          this.NativeDetailSquareButton(
-            'Torrent',
-            this.nativeDetail.torrentCount > 0 ? `${this.nativeDetail.torrentCount} 个` : '列表',
-            $r('sys.symbol.folder_fill'),
-            false,
-            (): void => {
-              void this.openTorrentPanel();
-            }
-          );
-        }
+        .width('100%')
+        .height(72);
       }
-      .columnsTemplate('1fr 1fr')
-      .rowsTemplate('1fr 1fr')
-      .columnsGap(8)
-      .rowsGap(8)
       .width(168)
       .height(168)
       .padding(8)
@@ -16436,7 +17323,7 @@ struct Index {
   private NativeDetailCard(): void {
     GalleryDetailPage({
       detail: this.nativeDetailSnapshot(),
-      detailRevision: this.nativeDetailRevision,
+      detailRevision: this.nativeDetailRevision + this.downloadQueueRevision,
       metaLanguage: this.nativeDetail.language,
       metaVisible: this.nativeDetail.visible,
       metaFileSize: this.nativeDetail.fileSize,
@@ -17581,10 +18468,11 @@ struct Index {
   @Builder
   private DownloadQueueSection(): void {
     DownloadQueueView({
-      items: this.downloadItems,
-      viewMode: this.downloadViewMode,
-      managerStatus: this.downloadManagerStatus,
+      items: this.downloadItemsSource(),
+      viewMode: this.effectiveDownloadViewMode(),
+      managerStatus: this.effectiveDownloadManagerStatus(),
       downloadRootText: this.downloadRoot(),
+      revision: this.downloadQueueRevision + this.downloadRuntimeRevision,
       imageUrlForCover: (value: string): string => this.galleryImageDisplayUrl(value),
       siteDisplayNameForItem: (item: DownloadQueueItem): string => this.siteDisplayName(item.site),
       statusLabelForItem: (item: DownloadQueueItem): string => this.downloadItemStatusLabel(item),
@@ -17982,12 +18870,16 @@ struct Index {
           this.DownloadQueueSection();
         }
         .width('100%')
+        .constraintSize({ minHeight: this.downloadScrollContentMinHeight() })
+        .justifyContent(FlexAlign.Start)
         .alignItems(HorizontalAlign.Start)
         .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
       }
       .layoutWeight(1)
       .width('100%')
-      .height('100%');
+      .height('100%')
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring);
     }
   }
 
@@ -18028,6 +18920,7 @@ struct Index {
           });
           this.MyCacheSettingsCard();
           this.MyDownloadSettingsCard();
+          this.MyLocalAccountCacheSettingsCard();
         }
       }
       .width('100%')
@@ -18572,7 +19465,7 @@ struct Index {
           .backgroundColor('#FFF3F2')
           .borderRadius(8)
           .onClick(() => {
-            this.clearCookies();
+            this.confirmClearLocalAccountCache();
           });
       }
       .width('100%');
@@ -19043,6 +19936,41 @@ struct Index {
           });
       }
       .width('100%');
+      Row({ space: 8 }) {
+        Button('导入 CSV')
+          .layoutWeight(1)
+          .height(28)
+          .backgroundColor('#F3E3EA')
+          .borderRadius(8)
+          .onClick(() => {
+            this.importDownloadCsv();
+          });
+        Button('导出 CSV')
+          .layoutWeight(1)
+          .height(28)
+          .backgroundColor('#F3E3EA')
+          .borderRadius(8)
+          .onClick(() => {
+            this.exportDownloadCsv();
+          });
+      }
+      .width('100%');
+      TextArea({
+        text: this.downloadImportExportText,
+        placeholder: 'Android CSV，可粘贴导入或导出当前下载队列'
+      })
+        .width('100%')
+        .height(86)
+        .maxLines(4)
+        .fontSize(12)
+        .lineHeight(18)
+        .fontColor('#6F5964')
+        .padding(10)
+        .backgroundColor('#F8F8F8')
+        .borderRadius(8)
+        .onChange((value: string) => {
+          this.downloadImportExportText = value;
+        });
       Button('清空下载内容')
         .width('100%')
         .height(30)
@@ -19051,6 +19979,35 @@ struct Index {
         .borderRadius(8)
         .onClick(() => {
           this.confirmClearAllDownloadContent();
+        });
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(8)
+    .alignItems(HorizontalAlign.Start);
+  }
+
+  @Builder
+  private MyLocalAccountCacheSettingsCard(): void {
+    Column({ space: 10 }) {
+      Text('本地账号缓存')
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#2B2027');
+      Text(this.cookieStatusSummary)
+        .width('100%')
+        .fontSize(12)
+        .fontColor('#7C6470')
+        .maxLines(2);
+      Button('删除本地账号缓存')
+        .width('100%')
+        .height(30)
+        .fontColor('#B42318')
+        .backgroundColor('#FFF3F2')
+        .borderRadius(8)
+        .onClick(() => {
+          this.confirmClearLocalAccountCache();
         });
     }
     .width('100%')

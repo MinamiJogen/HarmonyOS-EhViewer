@@ -38,6 +38,10 @@ export const APP_LOCK_AUTH_ACTIVE_STORAGE_KEY: string = 'app_lock_auth_active';
 export const APP_LOCK_ENABLED_KEY: string = 'app_lock_enabled';
 export const APP_LOCK_FOREGROUND_REQUIRED_STORAGE_KEY: string = 'app_lock_foreground_required';
 export const BACKGROUND_PREVIEW_PROTECTION_KEY: string = 'background_preview_protection_enabled';
+export const DOWNLOAD_ROUTE_ACTION_KEY: string = 'downloadRouteAction';
+export const DOWNLOAD_ROUTE_ACTION_ACTIVE: string = 'active';
+export const DOWNLOAD_ROUTE_EVENT_STORAGE_KEY: string = 'download_route_event_id';
+export const DOWNLOAD_ROUTE_TARGET_STORAGE_KEY: string = 'download_route_target';
 
 export const MY_PAGE_MAIN: string = 'main';
 export const MY_PAGE_FAVORITES: string = 'favorites';
