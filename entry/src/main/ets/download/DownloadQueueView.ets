@@ -2,7 +2,6 @@ import {
   DOWNLOAD_STATUS_DELETED,
   DOWNLOAD_STATUS_DONE,
   DOWNLOAD_STATUS_QUEUED,
-  DOWNLOAD_STATUS_PAUSED,
   DownloadQueueItem
 } from './DownloadModels';
 
@@ -55,9 +54,7 @@ export struct DownloadQueueView {
   }
 
   private activeProgressItems(): DownloadQueueItem[] {
-    return this.activeItems().filter((item: DownloadQueueItem) =>
-      item.status !== DOWNLOAD_STATUS_PAUSED &&
-        (this.isItemRunning(item) || item.status === DOWNLOAD_STATUS_QUEUED));
+    return this.activeItems();
   }
 
   private downloadedItems(): DownloadQueueItem[] {
@@ -455,6 +452,7 @@ export struct DownloadQueueView {
       .onAreaChange((_oldValue: Area, newValue: Area) => {
         this.updateContainerWidth(newValue.width);
       })
+      .edgeEffect(EdgeEffect.Spring)
       .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST });
     }
   }

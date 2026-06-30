@@ -22,12 +22,17 @@ import {
   SymbolGlyphModifier
 } from '@kit.ArkUI';
 import {
+  BlurStrategy,
   HdsNavigation,
+  HdsNavigationBackButtonItemOptions,
+  HdsNavigationIconItemStyle,
   HdsNavigationMenuContentOptions,
   HdsNavigationTitleBarOptions,
   HdsNavigationTitleMode,
   HdsTabs,
+  IconStyleMode,
   ScrollEffectType,
+  TitleBarStyleOptions,
   hdsMaterial
 } from '@kit.UIDesignKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
@@ -379,6 +384,8 @@ const WATERFALL_CARD_EXTRA_HEIGHT: number = 150;
 const WATERFALL_MIN_CONTENT_HEIGHT: number = 180;
 const SEARCH_HISTORY_DEFAULT_VISIBLE_COUNT: number = 3;
 const LOGIN_GATE_SEEN_KEY: string = 'login_gate_seen';
+const LOGIN_GATE_DEFAULT_MESSAGE: string = '请选择网页登录或 Cookie 登录，也可以先以游客模式继续。';
+const LOGIN_GATE_CLOUD_FAVORITE_MESSAGE: string = '登录后才能使用云端收藏夹。本地收藏可继续保存在本机。';
 
 interface TopListPeriodOption {
   key: string;
@@ -404,8 +411,14 @@ const DOWNLOAD_VIEW_SEGMENT_BUTTONS: ItemRestriction<SegmentButtonTextItem> = [
   { text: '已下载' },
   { text: '下载中' }
 ];
+const HDS_FULL_TITLE_BAR_HEIGHT: number = 112;
 const DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT: number = 54;
-const DOWNLOAD_SCROLL_EXTRA_HEIGHT: number = 80;
+const SEARCH_INPUT_BAR_HEIGHT: number = 44;
+const SEARCH_TITLE_BAR_BOTTOM_HEIGHT: number = 60;
+const SEARCH_SUGGESTION_OVERLAY_GAP: number = 8;
+const TITLE_BAR_GRADIENT_MASK_EXTRA_HEIGHT: number = 32;
+const TITLE_BAR_GRADIENT_BLUR_RADIUS: number = 20;
+const TITLE_BAR_DIVIDER_COLOR: string = 'rgba(43,32,39,0.08)';
 
 @Entry
 @Component
@@ -457,6 +470,7 @@ struct Index {
   private readonly downloadActiveRequests: Map<string, http.HttpRequest[]> = new Map();
   private downloadPersistQueue: Promise<void> = Promise.resolve();
   private downloadStatePollTimerId: number = -1;
+  private downloadStateLoadSerial: number = 0;
   private downloadRuntimeSyncInFlight: boolean = false;
   private downloadRuntimeSyncPending: boolean = false;
   private downloadRuntimeSyncPendingForce: boolean = false;
@@ -466,12 +480,18 @@ struct Index {
   private readonly homeScroller: Scroller = new Scroller();
   private readonly searchScroller: Scroller = new Scroller();
   private readonly nativeScroller: Scroller = new Scroller();
+  private readonly nativeDetailScroller: Scroller = new Scroller();
+  private readonly nativeCommentsScroller: Scroller = new Scroller();
+  private readonly nativePreviewsScroller: Scroller = new Scroller();
   private readonly libraryScroller: Scroller = new Scroller();
   private readonly settingsScroller: Scroller = new Scroller();
   private readonly myScroller: Scroller = new Scroller();
   private homeScrollOffsetY: number = 0;
   private searchScrollOffsetY: number = 0;
   private libraryScrollOffsetY: number = 0;
+  private libraryHistoryScrollOffsetY: number = 0;
+  private libraryDownloadsScrollOffsetY: number = 0;
+  private nativeDetailScrollOffsetY: number = 0;
   private restoringGalleryListScroll: boolean = false;
   private lastHomeTabClickAt: number = 0;
   private homeRawResults: NativeGallerySummary[] = [];
@@ -539,6 +559,7 @@ struct Index {
   @State private downloadUseOriginImage: boolean = false;
   @State private downloadImportExportText: string = '';
   @State private downloadManagerStatus: string = '下载器空闲';
+  @State private downloadStateLoading: boolean = false;
   @State private downloadViewMode: string = DOWNLOAD_VIEW_DOWNLOADED;
   @State private downloadViewSelectedIndexes: number[] = [0];
   @StorageLink(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY) @Watch('handleDownloadRouteEventChanged')
@@ -564,6 +585,7 @@ struct Index {
   @State private hasSignInCookie: boolean = false;
   @State private hasExCookie: boolean = false;
   @State private loginGateVisible: boolean = false;
+  @State private loginGateMessage: string = LOGIN_GATE_DEFAULT_MESSAGE;
   @State private cookieStatusSummary: string = '未检测到登录 Cookie';
   @State private nativeQuery: string = '';
   @State private tagSearchTransitionQuery: string = '';
@@ -803,6 +825,7 @@ struct Index {
   @State private pageViewportWidth: number = 1;
   @State private pageViewportHeight: number = 1;
   @State private customMaterialLevel: hdsMaterial.MaterialLevel = hdsMaterial.MaterialLevel.EXQUISITE;
+  @State private titleBarMaterialType: hdsMaterial.MaterialType = hdsMaterial.MaterialType.ADAPTIVE;
   private signInSyncSerial: number = 0;
   private signInForumProbeStarted: boolean = false;
   private signInExProbeStarted: boolean = false;
@@ -829,9 +852,11 @@ struct Index {
   private resolveBottomBarMaterialLevel(): void {
     const materialTypes = hdsMaterial.getSystemMaterialTypes();
     if (materialTypes.indexOf(hdsMaterial.MaterialType.IMMERSIVE) < 0) {
+      this.titleBarMaterialType = hdsMaterial.MaterialType.ADAPTIVE;
       this.customMaterialLevel = hdsMaterial.MaterialLevel.SMOOTH;
       return;
     }
+    this.titleBarMaterialType = hdsMaterial.MaterialType.IMMERSIVE;
     this.customMaterialLevel = hdsMaterial.MaterialLevel.EXQUISITE;
   }
 
@@ -941,7 +966,9 @@ struct Index {
     );
     this.favoriteCategoryNames = parseFavoriteCategoryNames(this.readString(FAVORITE_CATEGORY_NAMES_KEY, '[]'));
     this.favoriteCategoryCounts = parseFavoriteCategoryCounts(this.readString(FAVORITE_CATEGORY_COUNTS_KEY, '[]'));
-    this.favoriteListFilter = FAVORITE_FILTER_ALL;
+    this.favoriteListFilter = this.normalizeFavoriteListFilter(
+      this.readNumber(FAVORITE_RECENT_FILTER_KEY, FAVORITE_FILTER_ALL)
+    );
     await this.migratePreferencesToLocalDatabase();
     await this.loadLocalSideData();
     await this.loadLocalFilterData();
@@ -969,8 +996,9 @@ struct Index {
       this.primeInitialRouteDisplay();
     }
     this.refreshSiteCookieState();
+    this.ensureFavoriteListFilterAllowedForAccount();
     if (this.shouldShowLoginGateOnLaunch(hasPrimedRoute)) {
-      this.loginGateVisible = true;
+      this.showLoginPrompt();
       this.markLoginGateSeen();
     }
     this.refreshTagTranslationState();
@@ -1893,29 +1921,37 @@ struct Index {
     if (this.downloadWorkerRunning) {
       return;
     }
-    if (sharedDownloadItemsSnapshot.length > 0) {
-      this.downloadItems = this.downloadItemsSource();
-    } else {
-      const dbItems = await this.loadDownloadItemsFromDatabase();
-      if (dbItems.length > 0) {
-        const filteredDbItems = this.filterRemovedDownloadItems(dbItems);
-        this.downloadItems = recoverRunning ? this.recoverInterruptedDownloads(filteredDbItems) : filteredDbItems;
+    const loadSerial = ++this.downloadStateLoadSerial;
+    this.downloadStateLoading = true;
+    try {
+      if (sharedDownloadItemsSnapshot.length > 0) {
+        this.downloadItems = this.downloadItemsSource();
       } else {
-        const backupItems = this.filterRemovedDownloadItems(this.parseDownloadItems(this.readString('download_items', '[]')));
-        this.downloadItems = recoverRunning ?
-          this.recoverInterruptedDownloads(backupItems) :
-          backupItems;
+        const dbItems = await this.loadDownloadItemsFromDatabase();
+        if (dbItems.length > 0) {
+          const filteredDbItems = this.filterRemovedDownloadItems(dbItems);
+          this.downloadItems = recoverRunning ? this.recoverInterruptedDownloads(filteredDbItems) : filteredDbItems;
+        } else {
+          const backupItems = this.filterRemovedDownloadItems(this.parseDownloadItems(this.readString('download_items', '[]')));
+          this.downloadItems = recoverRunning ?
+            this.recoverInterruptedDownloads(backupItems) :
+            backupItems;
+        }
+      }
+      this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
+      const dbLabels = await this.loadDownloadLabelsFromDatabase();
+      if (dbLabels.length > 0) {
+        this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
+      }
+      this.publishSharedDownloadItems();
+      this.refreshDownloadManagerStatusFromState();
+      this.reconcileDownloadViewMode(selectPreferredView);
+      this.refreshDownloadRuntimeState(true);
+    } finally {
+      if (loadSerial === this.downloadStateLoadSerial) {
+        this.downloadStateLoading = false;
       }
     }
-    this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
-    const dbLabels = await this.loadDownloadLabelsFromDatabase();
-    if (dbLabels.length > 0) {
-      this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
-    }
-    this.publishSharedDownloadItems();
-    this.refreshDownloadManagerStatusFromState();
-    this.reconcileDownloadViewMode(selectPreferredView);
-    this.refreshDownloadRuntimeState(true);
   }
 
   private refreshDownloadManagerStatusFromState(): void {
@@ -4681,6 +4717,58 @@ struct Index {
     return this.siteMode === GallerySite.EX ? this.hasExCookie : this.hasAvailableCookie();
   }
 
+  private isCloudFavoriteSlot(slot: number): boolean {
+    return slot >= 0 && slot <= 9;
+  }
+
+  private isCloudFavoriteFilter(filter: number): boolean {
+    return filter === FAVORITE_FILTER_ALL || this.isCloudFavoriteSlot(filter);
+  }
+
+  private defaultFavoriteListFilterForAccount(): number {
+    if (!this.hasCurrentSiteCredential()) {
+      return FAVORITE_FILTER_LOCAL;
+    }
+    return this.normalizeFavoriteListFilter(this.readNumber(FAVORITE_RECENT_FILTER_KEY, FAVORITE_FILTER_ALL));
+  }
+
+  private ensureFavoriteListFilterAllowedForAccount(): void {
+    if (this.hasCurrentSiteCredential()) {
+      return;
+    }
+    if (this.isCloudFavoriteFilter(this.favoriteListFilter)) {
+      this.favoriteListFilter = FAVORITE_FILTER_LOCAL;
+    }
+    if (this.isCloudFavoriteSlot(this.favoritePanelSlotDraft)) {
+      this.favoritePanelSlotDraft = FAVORITE_LOCAL_SLOT;
+    }
+  }
+
+  private showCloudFavoriteLoginPrompt(): void {
+    this.showLoginPrompt(LOGIN_GATE_CLOUD_FAVORITE_MESSAGE);
+    this.toast('登录后才能使用云端收藏夹');
+  }
+
+  private canUseCloudFavoriteSlot(slot: number, showPrompt: boolean = true): boolean {
+    if (!this.isCloudFavoriteSlot(slot) || this.hasCurrentSiteCredential()) {
+      return true;
+    }
+    if (showPrompt) {
+      this.showCloudFavoriteLoginPrompt();
+    }
+    return false;
+  }
+
+  private canUseFavoriteFilter(filter: number, showPrompt: boolean = true): boolean {
+    if (!this.isCloudFavoriteFilter(filter) || this.hasCurrentSiteCredential()) {
+      return true;
+    }
+    if (showPrompt) {
+      this.showCloudFavoriteLoginPrompt();
+    }
+    return false;
+  }
+
   private shouldShowLoginGateOnLaunch(hasPrimedRoute: boolean): boolean {
     if (hasPrimedRoute || this.hasCurrentSiteCredential()) {
       return false;
@@ -4712,6 +4800,9 @@ struct Index {
 
     if (this.hasCurrentSiteCredential()) {
       this.loginGateVisible = false;
+      this.loginGateMessage = LOGIN_GATE_DEFAULT_MESSAGE;
+    } else {
+      this.ensureFavoriteListFilterAllowedForAccount();
     }
   }
 
@@ -5137,16 +5228,22 @@ struct Index {
     this.openMyPage(MY_PAGE_SETTINGS, '设置');
   }
 
-  private enterGuestModeFromGate(): void {
+  private dismissLoginGateFromGate(): void {
+    const shouldSwitchToPublicSite = this.siteMode === GallerySite.EX && !this.hasCurrentSiteCredential();
     this.markLoginGateSeen();
     this.loginGateVisible = false;
-    const guestHomeUrl = EhUrl.galleryFront(GallerySite.E);
-    this.webSrc = guestHomeUrl;
-    this.addressInput = guestHomeUrl;
-    this.writeValue('last_url', guestHomeUrl);
-    this.toggleSite(GallerySite.E);
-    this.nativeError = '';
-    this.openHomePrimaryPage(HOME_PAGE_DEFAULT);
+    this.loginGateMessage = LOGIN_GATE_DEFAULT_MESSAGE;
+    if (shouldSwitchToPublicSite) {
+      this.siteMode = GallerySite.E;
+      this.writeValue('site_mode', GallerySite.E);
+      this.nativeError = '';
+      this.resetNativeState();
+      this.resetMyRemoteState();
+    }
+  }
+
+  private enterGuestModeFromGate(): void {
+    this.dismissLoginGateFromGate();
   }
 
   private async openWebSignInAsync(): Promise<void> {
@@ -5279,7 +5376,7 @@ struct Index {
     this.resetNativeState();
     this.resetMyRemoteState();
     if (nextSite === GallerySite.EX && !this.canUseNativeSite(nextSite)) {
-      this.loginGateVisible = true;
+      this.showLoginPrompt();
       this.toast('EXHentai 需要登录或导入 Cookie');
     } else if (nextSite === GallerySite.E) {
       this.loginGateVisible = false;
@@ -5440,7 +5537,8 @@ struct Index {
     return this.hasSignInCookie;
   }
 
-  private showLoginPrompt(): void {
+  private showLoginPrompt(message: string = LOGIN_GATE_DEFAULT_MESSAGE): void {
+    this.loginGateMessage = message;
     this.loginGateVisible = true;
   }
 
@@ -5721,6 +5819,7 @@ struct Index {
     this.nativeLastUrl = '';
     this.nativeFilteredCount = 0;
     this.nativeViewMode = 'list';
+    this.nativeDetailScrollOffsetY = 0;
     this.nativeDetail = createEmptyNativeGalleryDetail();
     this.nativeDetailRevision++;
     this.nativePreviewItems = [];
@@ -6728,6 +6827,11 @@ struct Index {
       this.loadLocalFavoriteGalleryList();
       return;
     }
+    if (!this.canUseFavoriteFilter(this.favoriteListFilter)) {
+      this.favoriteListFilter = FAVORITE_FILTER_LOCAL;
+      this.loadLocalFavoriteGalleryList();
+      return;
+    }
     const targetUrl = this.favoriteFilterUrl(this.favoriteListFilter);
     if (resetList) {
       this.prepareFavoriteGalleryReload(targetUrl);
@@ -7077,6 +7181,10 @@ struct Index {
   }
 
   private async loadFavoriteGalleryList(url: string): Promise<void> {
+    if (!this.canUseFavoriteFilter(this.favoriteListFilter)) {
+      this.favoriteError = '登录后才能使用云端收藏夹';
+      return;
+    }
     if (!this.ensureNativeSiteReady()) {
       this.favoriteError = this.nativeError;
       return;
@@ -7338,6 +7446,12 @@ struct Index {
       } finally {
         this.isFavoriteRefreshing = false;
       }
+      return;
+    }
+    if (!this.canUseFavoriteFilter(this.favoriteListFilter)) {
+      this.favoriteListFilter = FAVORITE_FILTER_LOCAL;
+      this.loadLocalFavoriteGalleryList();
+      this.isFavoriteRefreshing = false;
       return;
     }
     if (!this.canUseNativeSite(this.siteMode)) {
@@ -8278,6 +8392,11 @@ struct Index {
     this.nativeLoading = false;
     this.nativeLoadingMessage = '正在加载图库...';
     const targetViewMode = this.nativeRouteTargetViewMode();
+    if (targetViewMode === 'comments') {
+      this.nativeViewMode = targetViewMode;
+      this.rebuildReaderPageDataSource();
+      return true;
+    }
     this.nativeViewMode = 'detail';
     if (targetViewMode !== 'detail') {
       const showTarget = (): void => {
@@ -8379,14 +8498,20 @@ struct Index {
   private showNativeDetailPreview(item: NativeGallerySummary, animate: boolean = true): void {
     this.hideSearchSuggestionOverlay();
     const action = (): void => {
+      let shouldResetDetailScroll = false;
       if (this.shouldReplaceNativeDetailPreview(item)) {
         this.nativeDetail = this.createDetailPreviewFromSummary(item);
         this.nativeDetailRevision++;
         this.nativePreviewItems = [];
         this.nativePreviewPageIndex = 0;
         this.nativePreviewPageCount = 1;
+        this.nativeDetailScrollOffsetY = 0;
+        shouldResetDetailScroll = true;
       }
       this.nativeViewMode = 'detail';
+      if (shouldResetDetailScroll) {
+        this.scrollNativeSubPageToTop(this.nativeDetailScroller);
+      }
     };
     if (animate && this.nativeViewMode === 'list') {
       this.runGalleryCoverTransition(action);
@@ -9711,6 +9836,10 @@ struct Index {
     if (!record) {
       return;
     }
+    if (!this.canUseCloudFavoriteSlot(normalizedSlot)) {
+      this.detailActionStatus = '登录后才能使用云端收藏夹';
+      return;
+    }
     this.detailActionLoading = true;
     this.detailActionStatus = `正在添加到 ${this.favoriteSlotName(normalizedSlot)}...`;
     try {
@@ -9833,19 +9962,28 @@ struct Index {
   }
 
   private async loadNativeCommentsPageLocal(): Promise<void> {
-    this.nativeViewMode = 'comments';
+    this.saveNativeDetailScrollOffset();
+    this.routeNativeMode = ROUTE_NATIVE_DETAIL;
+    this.routeReaderPageUrl = '';
+    this.runGalleryCoverTransition((): void => {
+      this.nativeViewMode = 'comments';
+    });
+    this.scrollNativeSubPageToTop(this.nativeCommentsScroller);
     if (this.nativeDetail.hasMoreComments || this.nativeDetail.comments.length === 0) {
       await this.loadNativeAllComments();
     }
   }
 
+  private showNativeCommentsPageLocal(): void {
+    void this.loadNativeCommentsPageLocal();
+  }
+
   private async openNativeComments(): Promise<void> {
     const currentSummary = this.createSummaryFromDetail();
     if (currentSummary) {
-      this.pushNativeRoute(currentSummary, ROUTE_NATIVE_COMMENTS);
-      return;
+      this.saveNativeRouteSnapshot(currentSummary);
     }
-    await this.loadNativeCommentsPageLocal();
+    this.showNativeCommentsPageLocal();
   }
 
   private async loadNativeAllComments(): Promise<void> {
@@ -10152,7 +10290,10 @@ struct Index {
     this.pendingReaderReturnViewMode = '';
     this.routeNativeMode = ROUTE_NATIVE_DETAIL;
     this.routeReaderPageUrl = '';
-    this.nativeViewMode = 'detail';
+    this.runGalleryCoverTransition((): void => {
+      this.nativeViewMode = 'detail';
+      this.restoreNativeDetailScrollOffset();
+    });
   }
 
   private prepareTagSearchReturnDetail(): void {
@@ -10420,7 +10561,7 @@ struct Index {
     if (this.activeSection === NAV_LIBRARY) {
       this.libraryPanel = this.libraryPanelForPage(page);
       if (this.libraryPanel === LIBRARY_FAVORITES) {
-        this.favoriteListFilter = FAVORITE_FILTER_ALL;
+        this.favoriteListFilter = this.defaultFavoriteListFilterForAccount();
         this.ensureCurrentLibraryPageLoaded();
       } else if (this.libraryPanel === LIBRARY_HISTORY) {
         void this.loadLocalSideData();
@@ -10478,6 +10619,9 @@ struct Index {
   }
 
   private currentNavigationTitle(): string {
+    if (this.nativeViewMode === 'comments' && this.nativeDetail.gid > 0) {
+      return this.nativeCommentsTitle();
+    }
     if (this.hasVisibleNativeSubPage()) {
       return '';
     }
@@ -12991,6 +13135,10 @@ struct Index {
     return this.downloadViewMode === DOWNLOAD_VIEW_ACTIVE ? DOWNLOAD_VIEW_ACTIVE : DOWNLOAD_VIEW_DOWNLOADED;
   }
 
+  private shouldShowDownloadStateLoading(): boolean {
+    return this.downloadStateLoading && this.downloadItemsSource().length === 0;
+  }
+
   private hasRunningDownloadTask(): boolean {
     for (const item of this.downloadItemsSource()) {
       if (this.isDownloadItemRunning(item)) {
@@ -13029,8 +13177,11 @@ struct Index {
   }
 
   private homeMenuSymbol(symbol: Resource): SymbolGlyphModifier {
-    return new SymbolGlyphModifier(symbol)
-      .fontColor(['#A85474']);
+    return new SymbolGlyphModifier(symbol);
+  }
+
+  private neutralTitleBarMenuSymbol(symbol: Resource): SymbolGlyphModifier {
+    return new SymbolGlyphModifier(symbol);
   }
 
   private homeNavigationMenuContent(): HdsNavigationMenuContentOptions {
@@ -13069,6 +13220,23 @@ struct Index {
             icon: this.homeMenuSymbol($r('sys.symbol.star_fill')),
             action: () => {
               this.openHomePrimaryPage(HOME_PAGE_TOP);
+            }
+          }
+        }
+      ],
+      maxCount: 1
+    };
+  }
+
+  private searchNavigationMenuContent(): HdsNavigationMenuContentOptions {
+    return {
+      value: [
+        {
+          content: {
+            label: '高级筛选',
+            icon: this.neutralTitleBarMenuSymbol($r('sys.symbol.slider_horizontal_2_square')),
+            action: (): void => {
+              this.toggleSearchFiltersExpanded();
             }
           }
         }
@@ -13157,6 +13325,22 @@ struct Index {
   }
 
   private favoriteNavigationMenuContent(): HdsNavigationMenuContentOptions {
+    if (!this.hasCurrentSiteCredential()) {
+      return {
+        value: [
+          {
+            content: {
+              label: this.favoriteMenuLabel(FAVORITE_FILTER_LOCAL),
+              icon: this.favoriteMenuSymbol(FAVORITE_FILTER_LOCAL),
+              action: (): void => {
+                this.setFavoriteListFilter(FAVORITE_FILTER_LOCAL);
+              }
+            }
+          }
+        ],
+        maxCount: 1
+      };
+    }
     return {
       value: [
         {
@@ -13295,14 +13479,18 @@ struct Index {
     return this.activeSection === NAV_LIBRARY && this.myPage === MY_PAGE_DOWNLOADS && !this.hasVisibleNativeSubPage();
   }
 
+  private shouldShowSearchTitleBarInput(): boolean {
+    return this.activeSection === NAV_SEARCH && this.nativeViewMode === 'list';
+  }
+
   private historyNavigationMenuContent(): HdsNavigationMenuContentOptions {
     return {
       value: [
         {
           content: {
             label: '清空',
-            icon: this.homeMenuSymbol($r('sys.symbol.trash')),
-            isEnabled: this.historyItems.length > 0,
+            icon: this.neutralTitleBarMenuSymbol($r('sys.symbol.trash')),
+            isEnabled: true,
             action: (): void => {
               this.confirmClearHistory();
             }
@@ -13317,7 +13505,45 @@ struct Index {
     return this.emptyNavigationMenuContent();
   }
 
+  private nativeCommentsTitle(): string {
+    return `共有${this.nativeDetail.comments.length}条评论`;
+  }
+
+  private commentsNavigationMenuContent(): HdsNavigationMenuContentOptions {
+    return {
+      value: [
+        {
+          content: {
+            label: '刷新',
+            icon: this.neutralTitleBarMenuSymbol($r('sys.symbol.arrow_clockwise')),
+            isEnabled: !this.nativeCommentsLoading,
+            action: (): void => {
+              void this.loadNativeAllComments();
+            }
+          }
+        },
+        {
+          content: {
+            label: '写评论',
+            icon: this.neutralTitleBarMenuSymbol($r('sys.symbol.square_and_pencil')),
+            isEnabled: this.nativeDetail.gid > 0 && this.nativeDetail.token.length > 0,
+            action: (): void => {
+              this.openCommentWebFallback();
+            }
+          }
+        }
+      ],
+      maxCount: 2
+    };
+  }
+
   private currentBackTitleBarMenuContent(): HdsNavigationMenuContentOptions {
+    if (this.nativeViewMode === 'comments' && this.nativeDetail.gid > 0) {
+      return this.commentsNavigationMenuContent();
+    }
+    if (this.activeSection === NAV_SEARCH && this.nativeViewMode === 'list') {
+      return this.searchNavigationMenuContent();
+    }
     if (this.shouldShowDownloadNavigationMenu()) {
       return this.downloadNavigationMenuContent();
     }
@@ -13336,6 +13562,9 @@ struct Index {
     }
     if (this.activeSection === NAV_HOME) {
       return this.homeNavigationMenuContent();
+    }
+    if (this.activeSection === NAV_SEARCH && this.nativeViewMode === 'list') {
+      return this.searchNavigationMenuContent();
     }
     if (this.shouldShowFavoriteNavigationMenu()) {
       return this.favoriteNavigationMenuContent();
@@ -13415,40 +13644,137 @@ struct Index {
       this.hasVisibleNativeSubPage() || this.isMySubPage();
   }
 
+  private isPrimaryTitlePage(): boolean {
+    if (this.shouldShowNativeTitleBarBack()) {
+      return false;
+    }
+    if (this.activeSection === NAV_HOME) {
+      return this.myPage === MY_PAGE_MAIN && this.nativeViewMode === 'list';
+    }
+    if (this.activeSection === NAV_SEARCH) {
+      return this.nativeViewMode === 'list';
+    }
+    if (this.activeSection === NAV_LIBRARY) {
+      return this.myPage === MY_PAGE_MAIN && this.nativeViewMode === 'list';
+    }
+    return false;
+  }
+
+  private currentTitleMode(): HdsNavigationTitleMode {
+    return this.isPrimaryTitlePage() ? HdsNavigationTitleMode.FREE : HdsNavigationTitleMode.MINI;
+  }
+
+  private currentTitleBarHeight(): number {
+    return this.isPrimaryTitlePage() ?
+      HDS_FULL_TITLE_BAR_HEIGHT :
+      HDS_MINI_TITLE_BAR_HEIGHT;
+  }
+
+  private titleBarIconSurfaceStyle(): HdsNavigationIconItemStyle {
+    return {
+      backgroundColor: $r('sys.color.comp_background_tertiary'),
+      iconColor: $r('sys.color.icon_primary'),
+      textColor: $r('sys.color.font_primary')
+    };
+  }
+
+  private navigationBackIconOptions(): HdsNavigationBackButtonItemOptions {
+    return {
+      label: '返回',
+      isEnabled: true,
+      type: IconStyleMode.NORMAL,
+      action: (): void => {
+        this.handleNativeTitleBarBack();
+      }
+    };
+  }
+
+  private titleBarStyleOptions(): TitleBarStyleOptions {
+    const isPrimaryTitlePage = this.isPrimaryTitlePage();
+    const useDefaultMaterialBackground = this.shouldShowSearchTitleBarInput();
+    const maskExtraHeight = isPrimaryTitlePage ? TITLE_BAR_GRADIENT_MASK_EXTRA_HEIGHT : 0;
+    const backgroundColor = isPrimaryTitlePage ? 'rgba(255,255,255,0.92)' : '#FFFFFF';
+    return {
+      scrollEffectOpts: {
+        enableScrollEffect: true,
+        scrollEffectType: isPrimaryTitlePage ? ScrollEffectType.IMMERSIVE_GRADIENT_BLUR : ScrollEffectType.GRADIENT_BLUR,
+        enableRefreshOffsetChange: true
+      },
+      originalStyle: {
+        backgroundStyle: useDefaultMaterialBackground ? {
+          maskExtraHeight,
+          blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
+        } : {
+          backgroundColor,
+          maskExtraHeight,
+          blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
+        },
+        contentStyle: {
+          titleStyle: {
+            mainTitleColor: $r('sys.color.font_primary'),
+            subTitleColor: $r('sys.color.font_secondary'),
+            mainTitleShadowColor: $r('sys.color.comp_background_gray'),
+            subTitleShadowColor: $r('sys.color.comp_background_gray')
+          },
+          menuStyle: this.titleBarIconSurfaceStyle(),
+          backIconStyle: this.titleBarIconSurfaceStyle(),
+          subIconStyle: this.titleBarIconSurfaceStyle(),
+          dividerStyle: {
+            dividerColor: TITLE_BAR_DIVIDER_COLOR
+          }
+        }
+      },
+      scrollEffectStyle: {
+        backgroundStyle: useDefaultMaterialBackground ? {
+          maskExtraHeight,
+          blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
+        } : {
+          backgroundColor: '#FFFFFF',
+          maskExtraHeight,
+          blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
+        },
+        contentStyle: {
+          titleStyle: {
+            mainTitleColor: $r('sys.color.font_primary'),
+            subTitleColor: $r('sys.color.font_secondary'),
+            mainTitleShadowColor: $r('sys.color.comp_background_gray'),
+            subTitleShadowColor: $r('sys.color.comp_background_gray')
+          },
+          menuStyle: this.titleBarIconSurfaceStyle(),
+          backIconStyle: this.titleBarIconSurfaceStyle(),
+          subIconStyle: this.titleBarIconSurfaceStyle(),
+          dividerStyle: {
+            dividerColor: TITLE_BAR_DIVIDER_COLOR
+          }
+        }
+      },
+      blurStrategy: BlurStrategy.ENABLE,
+      systemMaterialEffect: {
+        materialType: this.titleBarMaterialType,
+        materialLevel: this.customMaterialLevel
+      }
+    };
+  }
+
   private currentTitleBarOptions(): HdsNavigationTitleBarOptions {
-    if (this.activeSection === NAV_SEARCH && this.nativeViewMode === 'list') {
+    if (this.shouldShowSearchTitleBarInput()) {
       const searchBackEnabled = this.hasTagSearchReturnDetail() || this.isRouteSearchBackAvailable();
       if (searchBackEnabled) {
         return {
           content: {
             title: {
-              mainTitle: ''
+              mainTitle: this.currentNavigationTitle()
             },
-            backIcon: {
-              label: '返回',
-              isEnabled: true,
-              action: (): void => {
-                this.handleNativeTitleBarBack();
-              }
-            },
-            menu: {
-              value: [],
-              maxCount: 0
-            },
-            stackBuilder: (): void => {
-              this.SearchTitleBar();
+            backIcon: this.navigationBackIconOptions(),
+            menu: this.searchNavigationMenuContent(),
+            bottomBuilder: {
+              builder: (): void => {
+                this.SearchTitleBarBottom();
+              },
+              height: SEARCH_TITLE_BAR_BOTTOM_HEIGHT
             }
           },
-          style: {
-            scrollEffectOpts: {
-              enableScrollEffect: true,
-              scrollEffectType: ScrollEffectType.GRADIENT_BLUR
-            },
-            systemMaterialEffect: {
-              materialType: hdsMaterial.MaterialType.ADAPTIVE,
-              materialLevel: this.customMaterialLevel
-            }
-          },
+          style: this.titleBarStyleOptions(),
           avoidLayoutSafeArea: true,
           enableComponentSafeArea: false
         };
@@ -13456,26 +13782,17 @@ struct Index {
       return {
         content: {
           title: {
-            mainTitle: ''
+            mainTitle: this.currentNavigationTitle()
           },
-          menu: {
-            value: [],
-            maxCount: 0
-          },
-          stackBuilder: (): void => {
-            this.SearchTitleBar();
+          menu: this.searchNavigationMenuContent(),
+          bottomBuilder: {
+            builder: (): void => {
+              this.SearchTitleBarBottom();
+            },
+            height: SEARCH_TITLE_BAR_BOTTOM_HEIGHT
           }
         },
-        style: {
-          scrollEffectOpts: {
-            enableScrollEffect: true,
-            scrollEffectType: ScrollEffectType.GRADIENT_BLUR
-          },
-          systemMaterialEffect: {
-            materialType: hdsMaterial.MaterialType.ADAPTIVE,
-            materialLevel: this.customMaterialLevel
-          }
-        },
+        style: this.titleBarStyleOptions(),
         avoidLayoutSafeArea: true,
         enableComponentSafeArea: false
       };
@@ -13487,13 +13804,7 @@ struct Index {
             title: {
               mainTitle: this.currentNavigationTitle()
             },
-            backIcon: {
-              label: '返回',
-              isEnabled: true,
-              action: (): void => {
-                this.handleNativeTitleBarBack();
-              }
-            },
+            backIcon: this.navigationBackIconOptions(),
             menu: this.emptyNavigationMenuContent(),
             bottomBuilder: {
               builder: (): void => {
@@ -13502,16 +13813,7 @@ struct Index {
               height: DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT
             }
           },
-          style: {
-            scrollEffectOpts: {
-              enableScrollEffect: true,
-              scrollEffectType: ScrollEffectType.GRADIENT_BLUR
-            },
-            systemMaterialEffect: {
-              materialType: hdsMaterial.MaterialType.ADAPTIVE,
-              materialLevel: this.customMaterialLevel
-            }
-          },
+          style: this.titleBarStyleOptions(),
           avoidLayoutSafeArea: true,
           enableComponentSafeArea: false
         };
@@ -13521,25 +13823,10 @@ struct Index {
           title: {
             mainTitle: this.currentNavigationTitle()
           },
-          backIcon: {
-            label: '返回',
-            isEnabled: true,
-            action: (): void => {
-              this.handleNativeTitleBarBack();
-            }
-          },
+          backIcon: this.navigationBackIconOptions(),
           menu: this.currentBackTitleBarMenuContent()
         },
-        style: {
-          scrollEffectOpts: {
-            enableScrollEffect: true,
-            scrollEffectType: ScrollEffectType.GRADIENT_BLUR
-          },
-          systemMaterialEffect: {
-            materialType: hdsMaterial.MaterialType.ADAPTIVE,
-            materialLevel: this.customMaterialLevel
-          }
-        },
+        style: this.titleBarStyleOptions(),
         avoidLayoutSafeArea: true,
         enableComponentSafeArea: false
       };
@@ -13551,33 +13838,53 @@ struct Index {
         },
         menu: this.currentNavigationMenuContent()
       },
-      style: {
-        scrollEffectOpts: {
-          enableScrollEffect: true,
-          scrollEffectType: ScrollEffectType.GRADIENT_BLUR
-        },
-        systemMaterialEffect: {
-          materialType: hdsMaterial.MaterialType.ADAPTIVE,
-          materialLevel: this.customMaterialLevel
-        }
-      },
+      style: this.titleBarStyleOptions(),
       avoidLayoutSafeArea: true,
       enableComponentSafeArea: false
     };
   }
 
-  private pageContentTopPadding(): number {
-    const titleBarBottomInset = this.shouldShowDownloadTitleSegment() ? DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT : 0;
-    return this.systemSafeTop + HDS_MINI_TITLE_BAR_HEIGHT + titleBarBottomInset;
+  private pageContentStartOffset(): number {
+    let titleBarBottomInset = this.shouldShowDownloadTitleSegment() ? DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT : 0;
+    if (this.shouldShowSearchTitleBarInput()) {
+      titleBarBottomInset = SEARCH_TITLE_BAR_BOTTOM_HEIGHT;
+    }
+    return this.systemSafeTop + this.currentTitleBarHeight() + titleBarBottomInset;
   }
 
-  private pageContentBottomPadding(): number {
+  private pageContentStartSpacerHeight(followingGap: number): number {
+    return Math.max(0, this.pageContentStartOffset() - followingGap);
+  }
+
+  private shouldUsePageContentStartSpacer(): boolean {
+    return this.isPrimaryTitlePage() || this.hasVisibleNativeSubPage() ||
+      (this.activeSection === NAV_LIBRARY && this.myPage === MY_PAGE_HISTORY && !this.hasVisibleNativeSubPage());
+  }
+
+  private pageContentContainerStartOffset(): number {
+    return this.shouldUsePageContentStartSpacer() ? 0 : this.pageContentStartOffset();
+  }
+
+  private pageContentBodyMinHeight(): number {
+    return Math.max(1, this.pageViewportHeight - this.pageContentContainerStartOffset() - this.pageContentEndOffset());
+  }
+
+  @Builder
+  private PageContentStartSpacer(followingGap: number): void {
+    if (this.shouldUsePageContentStartSpacer()) {
+      Blank()
+        .width('100%')
+        .height(this.pageContentStartSpacerHeight(followingGap));
+    }
+  }
+
+  private pageContentEndOffset(): number {
     const floatingTabInset = this.shouldShowBottomTabs() ? FLOATING_BOTTOM_TAB_BAR_HEIGHT : 0;
     return this.systemSafeBottom + floatingTabInset + PAGE_BOTTOM_SPACING;
   }
 
   private downloadScrollContentMinHeight(): number {
-    return Math.max(1, this.pageViewportHeight + DOWNLOAD_SCROLL_EXTRA_HEIGHT);
+    return this.pageContentBodyMinHeight();
   }
 
   private viewportLengthToNumber(value: Length): number {
@@ -13674,7 +13981,7 @@ struct Index {
   }
 
   private waterfallEstimatedContentHeight(items: NativeGallerySummary[]): number {
-    return this.pageContentTopPadding() + this.waterfallItemsContentHeight(items) + this.pageContentBottomPadding();
+    return this.pageContentStartOffset() + this.waterfallItemsContentHeight(items) + this.pageContentEndOffset();
   }
 
   private shouldLoadWaterfallByRemainingContent(
@@ -13715,14 +14022,62 @@ struct Index {
     return undefined;
   }
 
+  private currentNativeSubPageScroller(): Scroller {
+    if (this.nativeViewMode === 'comments') {
+      return this.nativeCommentsScroller;
+    }
+    if (this.nativeViewMode === 'previews') {
+      return this.nativePreviewsScroller;
+    }
+    return this.nativeDetailScroller;
+  }
+
+  private currentHomeScroller(): Scroller {
+    return this.hasVisibleNativeSubPage() ? this.currentNativeSubPageScroller() : this.homeScroller;
+  }
+
+  private currentSearchScroller(): Scroller {
+    return this.hasVisibleNativeSubPage() ? this.currentNativeSubPageScroller() : this.searchScroller;
+  }
+
+  private currentLibraryScroller(): Scroller {
+    return this.hasVisibleNativeSubPage() ? this.currentNativeSubPageScroller() : this.libraryScroller;
+  }
+
+  private currentNativeSectionScroller(): Scroller {
+    return this.hasVisibleNativeSubPage() ? this.currentNativeSubPageScroller() : this.nativeScroller;
+  }
+
   private currentGalleryListScrollOffsetY(): number {
     if (this.activeSection === NAV_SEARCH) {
       return this.searchScrollOffsetY;
     }
     if (this.activeSection === NAV_LIBRARY) {
-      return this.libraryScrollOffsetY;
+      return this.currentLibraryScrollOffsetY();
     }
     return this.homeScrollOffsetY;
+  }
+
+  private currentLibraryScrollOffsetY(): number {
+    if (this.libraryPanel === LIBRARY_HISTORY) {
+      return this.libraryHistoryScrollOffsetY;
+    }
+    if (this.libraryPanel === LIBRARY_DOWNLOADS) {
+      return this.libraryDownloadsScrollOffsetY;
+    }
+    return this.libraryScrollOffsetY;
+  }
+
+  private saveCurrentLibraryScrollOffset(yOffset: number): void {
+    if (this.libraryPanel === LIBRARY_HISTORY) {
+      this.libraryHistoryScrollOffsetY = yOffset;
+      return;
+    }
+    if (this.libraryPanel === LIBRARY_DOWNLOADS) {
+      this.libraryDownloadsScrollOffsetY = yOffset;
+      return;
+    }
+    this.libraryScrollOffsetY = yOffset;
   }
 
   private currentScrollerOffsetY(scroller: Scroller): number {
@@ -13748,12 +14103,32 @@ struct Index {
       return;
     }
     if (this.activeSection === NAV_LIBRARY) {
-      this.libraryScrollOffsetY = yOffset;
+      this.saveCurrentLibraryScrollOffset(yOffset);
       return;
     }
     if (this.activeSection === NAV_HOME) {
       this.homeScrollOffsetY = yOffset;
     }
+  }
+
+  private saveNativeDetailScrollOffset(): void {
+    if (this.nativeViewMode !== 'detail' || this.nativeDetail.gid <= 0) {
+      return;
+    }
+    this.nativeDetailScrollOffsetY = this.currentScrollerOffsetY(this.nativeDetailScroller);
+  }
+
+  private restoreNativeDetailScrollOffset(): void {
+    const yOffset = this.nativeDetailScrollOffsetY;
+    setTimeout(() => {
+      try {
+        this.nativeDetailScroller.scrollTo({
+          xOffset: 0,
+          yOffset
+        });
+      } catch (error) {
+      }
+    }, 0);
   }
 
   private restoreCurrentGalleryListScrollOffset(): void {
@@ -13778,7 +14153,22 @@ struct Index {
     }, 0);
   }
 
+  private scrollNativeSubPageToTop(scroller: Scroller): void {
+    setTimeout(() => {
+      try {
+        scroller.scrollTo({
+          xOffset: 0,
+          yOffset: 0
+        });
+      } catch (error) {
+      }
+    }, 0);
+  }
+
   private activeNavigationScrollers(): Scroller[] {
+    if (this.hasVisibleNativeSubPage()) {
+      return [this.currentNativeSubPageScroller()];
+    }
     if (this.activeSection === NAV_SEARCH) {
       return [this.searchScroller];
     }
@@ -13925,6 +14315,9 @@ struct Index {
       name: this.favoriteSlotName(FAVORITE_LOCAL_SLOT),
       count: this.localFavorites.length
     }];
+    if (!this.hasCurrentSiteCredential()) {
+      return slots;
+    }
     for (let index = 0; index < FAVORITE_SLOT_NAMES.length; index++) {
       slots.push({
         slot: index,
@@ -13954,11 +14347,15 @@ struct Index {
       filter: FAVORITE_FILTER_LOCAL,
       name: '本地收藏',
       count: this.localFavorites.length
-    }, {
+    }];
+    if (!this.hasCurrentSiteCredential()) {
+      return options;
+    }
+    options.push({
       filter: FAVORITE_FILTER_ALL,
       name: '全部收藏',
       count: this.cloudFavoriteCount() + this.localFavorites.length
-    }];
+    });
     for (let index = 0; index < FAVORITE_SLOT_NAMES.length; index++) {
       options.push({
         filter: index,
@@ -14030,7 +14427,8 @@ struct Index {
     if (this.isCurrentGalleryLocalFavorite()) {
       return FAVORITE_LOCAL_SLOT;
     }
-    if (this.defaultFavoriteSlot !== FAVORITE_INVALID_DEFAULT_SLOT) {
+    if (this.defaultFavoriteSlot !== FAVORITE_INVALID_DEFAULT_SLOT &&
+      this.canUseCloudFavoriteSlot(this.defaultFavoriteSlot, false)) {
       return this.defaultFavoriteSlot;
     }
     return FAVORITE_LOCAL_SLOT;
@@ -14045,16 +14443,23 @@ struct Index {
 
   private favoritePanelSelectedIndex(): number {
     const options = this.favoriteSlots();
-    const index = options.findIndex((item: NativeFavoriteSlot) => item.slot === this.favoritePanelSlotDraft);
+    const index = options.findIndex((item: NativeFavoriteSlot) => item.slot === this.effectiveFavoritePanelSlot());
     return index >= 0 ? index : 0;
   }
 
+  private effectiveFavoritePanelSlot(): number {
+    return this.canUseCloudFavoriteSlot(this.favoritePanelSlotDraft, false) ?
+      this.favoritePanelSlotDraft :
+      FAVORITE_LOCAL_SLOT;
+  }
+
   private favoritePanelSlotSummary(): string {
-    return this.favoriteSlotName(this.favoritePanelSlotDraft);
+    return this.favoriteSlotName(this.effectiveFavoritePanelSlot());
   }
 
   private favoriteQuickSlot(): number {
-    if (this.defaultFavoriteSlot !== FAVORITE_INVALID_DEFAULT_SLOT) {
+    if (this.defaultFavoriteSlot !== FAVORITE_INVALID_DEFAULT_SLOT &&
+      this.canUseCloudFavoriteSlot(this.defaultFavoriteSlot, false)) {
       return this.defaultFavoriteSlot;
     }
     return this.preferredFavoritePanelSlot();
@@ -14088,6 +14493,9 @@ struct Index {
   private setFavoriteListFilter(filter: number): void {
     const normalized = this.normalizeFavoriteListFilter(filter);
     if (this.favoriteListFilter === normalized) {
+      return;
+    }
+    if (!this.canUseFavoriteFilter(normalized)) {
       return;
     }
     this.favoriteListFilter = normalized;
@@ -14139,12 +14547,13 @@ struct Index {
     if (this.isCurrentGalleryFavorited()) {
       await this.removeCurrentGalleryFavorite();
     } else {
-      await this.applyFavoriteSlot(this.favoritePanelSlotDraft, true);
+      await this.applyFavoriteSlot(this.effectiveFavoritePanelSlot(), true);
     }
   }
 
   private defaultFavoriteLabel(): string {
-    return this.defaultFavoriteSlot === FAVORITE_INVALID_DEFAULT_SLOT ?
+    return this.defaultFavoriteSlot === FAVORITE_INVALID_DEFAULT_SLOT ||
+      !this.canUseCloudFavoriteSlot(this.defaultFavoriteSlot, false) ?
       '未使用过收藏夹' : `上次 ${this.favoriteSlotName(this.defaultFavoriteSlot)}`;
   }
 
@@ -14163,7 +14572,11 @@ struct Index {
   }
 
   private setDefaultFavoriteSlot(slot: number): void {
-    this.defaultFavoriteSlot = this.normalizeFavoriteSlot(slot, true);
+    const normalizedSlot = this.normalizeFavoriteSlot(slot, true);
+    if (!this.canUseCloudFavoriteSlot(normalizedSlot)) {
+      return;
+    }
+    this.defaultFavoriteSlot = normalizedSlot;
     this.writeValue(FAVORITE_DEFAULT_SLOT_KEY, this.defaultFavoriteSlot);
   }
 
@@ -14746,8 +15159,9 @@ struct Index {
   @Builder
   private HomeSection(): void {
     if (this.homePage === HOME_PAGE_TOP) {
-      Scroll(this.homeScroller) {
+      Scroll(this.currentHomeScroller()) {
         Column({ space: 12 }) {
+          this.PageContentStartSpacer(12);
           if (!this.canUseNativeSite(this.siteMode)) {
             this.NativeGateCard();
           } else if (this.shouldShowNativeRouteLoading()) {
@@ -14764,32 +15178,40 @@ struct Index {
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
-        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
       .layoutWeight(1)
       .width('100%')
-      .height('100%');
+      .height('100%')
+      .contentStartOffset(this.pageContentContainerStartOffset())
+      .contentEndOffset(this.pageContentEndOffset())
+      .edgeEffect(EdgeEffect.Spring);
     } else if (this.hasVisibleNativeSubPage()) {
-      Scroll(this.homeScroller) {
+      Scroll(this.currentHomeScroller()) {
         Column({ space: 12 }) {
+          this.PageContentStartSpacer(12);
           this.NativeGalleryListHost();
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
-        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
       .layoutWeight(1)
       .width('100%')
-      .height('100%');
+      .height('100%')
+      .contentStartOffset(this.pageContentContainerStartOffset())
+      .contentEndOffset(this.pageContentEndOffset())
+      .edgeEffect(EdgeEffect.Spring);
     } else {
       Refresh({ refreshing: $$this.isHomeRefreshing, offset: 64 }) {
         Scroll(this.homeScroller) {
           Column({ space: 12 }) {
+            this.PageContentStartSpacer(12);
             this.NativeGalleryListHost();
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)
-          .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+          .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
         }
         .onDidScroll((_xOffset: number, _yOffset: number, _scrollState: ScrollState) => {
           this.handleHomeScrollProgress();
@@ -14799,7 +15221,10 @@ struct Index {
         })
         .layoutWeight(1)
         .width('100%')
-        .height('100%');
+        .height('100%')
+        .contentStartOffset(this.pageContentContainerStartOffset())
+        .contentEndOffset(this.pageContentEndOffset())
+        .edgeEffect(EdgeEffect.Spring);
       }
       .onRefreshing(() => {
         void this.refreshHomeWaterfall();
@@ -14970,101 +15395,60 @@ struct Index {
   }
 
   @Builder
-  private SearchTitleBar(): void {
-    Row({ space: 10 }) {
-      Row({ space: 8 }) {
-        SymbolGlyph($r('sys.symbol.magnifyingglass'))
-          .fontSize(17)
-          .fontColor(['#6B5260']);
-
-        TextInput({
-          text: this.nativeQuery,
-          placeholder: this.searchInputPlaceholder()
-        })
-          .layoutWeight(1)
-          .height(34)
-          .type(InputType.Normal)
-          .enterKeyType(EnterKeyType.Search)
-          .cancelButton({ style: CancelButtonStyle.INPUT })
-          .backgroundColor(Color.Transparent)
-          .border({ width: 0 })
-          .fontSize(14)
-          .fontColor('#2B2027')
-          .placeholderColor('#9A7D8A')
-          .placeholderFont({ size: 14 })
-          .caretColor('#A85474')
-          .onFocus(() => {
-            this.handleSearchInputFocus();
-          })
-          .onBlur(() => {
-            this.handleSearchInputBlur();
-          })
-          .onEditChange((isEditing: boolean) => {
-            if (isEditing) {
-              this.handleSearchInputFocus();
-            } else {
-              this.handleSearchInputBlur();
-            }
-          })
-          .onTouch((event: TouchEvent) => {
-            if (event.type === TouchType.Down) {
-              this.handleSearchInputUserInteraction();
-            }
-          })
-          .onChange((value: string) => {
-            this.setNativeQueryFromSearchInput(value);
-          })
-          .onSubmit((_enterKey: EnterKeyType, event: SubmitEvent) => {
-            this.setNativeQuery(event.text);
-            this.hideSearchSuggestionOverlay();
-            void this.searchNative();
-          });
-
-        Text('搜索')
-          .width(48)
-          .height(30)
-          .fontSize(12)
-          .fontWeight(FontWeight.Medium)
-          .fontColor('#6B5260')
-          .backgroundColor('rgba(0,0,0,0.04)')
-          .borderRadius(15)
-          .textAlign(TextAlign.Center)
-          .align(Alignment.Center)
-          .onClick(() => {
-            this.hideSearchSuggestionOverlay();
-            void this.searchNative();
-          });
-      }
-      .layoutWeight(1)
-      .height(38)
-      .padding({ left: 12, right: 4 })
-      .alignItems(VerticalAlign.Center)
-      .backgroundColor('#FFFFFF')
-      .border({ width: 1, color: 'rgba(0,0,0,0.10)' })
-      .borderRadius(19)
-      .shadow(ShadowStyle.OUTER_DEFAULT_SM)
-      .geometryTransition(this.tagSearchTransitionId());
-
-      Stack({ alignContent: Alignment.Center }) {
-        SymbolGlyph($r('sys.symbol.slider_horizontal_2_square'))
-          .fontSize(18)
-          .fontColor(['#6B5260']);
-      }
-      .width(40)
-      .height(38)
-      .backgroundColor('#FFFFFF')
-      .border({ width: 1, color: 'rgba(0,0,0,0.10)' })
-      .borderRadius(19)
-      .shadow(ShadowStyle.OUTER_DEFAULT_SM)
-      .accessibilityText('复杂筛选')
-      .accessibilityDescription('打开或关闭复杂筛选')
-      .onClick(() => {
-        this.toggleSearchFiltersExpanded();
-      });
+  private SearchTitleBarBottom(): void {
+    Column() {
+      this.SearchInputBar();
     }
     .width('100%')
-    .padding({ left: 4, top: 8, right: 8, bottom: 8 })
-    .alignItems(VerticalAlign.Center);
+    .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: 6, bottom: 10 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center);
+  }
+
+  @Builder
+  private SearchInputBar(): void {
+    Search({
+      value: this.nativeQuery,
+      placeholder: this.searchInputPlaceholder()
+    })
+    .width('100%')
+    .height(SEARCH_INPUT_BAR_HEIGHT)
+    .enterKeyType(EnterKeyType.Search)
+    .backgroundColor($r('sys.color.comp_background_tertiary'))
+    .searchIcon({ size: 18, color: $r('sys.color.icon_primary') })
+    .cancelButton({ style: CancelButtonStyle.INPUT })
+    .fontColor($r('sys.color.font_primary'))
+    .textFont({ size: 14 })
+    .placeholderColor($r('sys.color.font_secondary'))
+    .placeholderFont({ size: 14 })
+    .caretStyle({ width: 1.2, color: '#A85474' })
+    .geometryTransition(this.tagSearchTransitionId())
+    .onFocus(() => {
+      this.handleSearchInputFocus();
+    })
+    .onBlur(() => {
+      this.handleSearchInputBlur();
+    })
+    .onEditChange((isEditing: boolean) => {
+      if (isEditing) {
+        this.handleSearchInputFocus();
+      } else {
+        this.handleSearchInputBlur();
+      }
+    })
+    .onTouch((event: TouchEvent) => {
+      if (event.type === TouchType.Down) {
+        this.handleSearchInputUserInteraction();
+      }
+    })
+    .onChange((value: string) => {
+      this.setNativeQueryFromSearchInput(value);
+    })
+    .onSubmit((value: string) => {
+      this.setNativeQuery(value);
+      this.hideSearchSuggestionOverlay();
+      void this.searchNative();
+    });
   }
 
   @Builder
@@ -15123,6 +15507,14 @@ struct Index {
   @Builder
   private LoginGateOverlay(): void {
     Stack({ alignContent: Alignment.Center }) {
+      Column() {
+      }
+      .width('100%')
+      .height('100%')
+      .onClick(() => {
+        this.dismissLoginGateFromGate();
+      });
+
       Column({ space: 18 }) {
         Column({ space: 10 }) {
           Image($r('app.media.eh_logo'))
@@ -15147,7 +15539,7 @@ struct Index {
             .fontWeight(FontWeight.Bold)
             .fontColor('#2B2027')
             .textAlign(TextAlign.Center);
-          Text('请选择网页登录或 Cookie 登录，也可以先以游客模式继续。')
+          Text(this.loginGateMessage)
             .fontSize(13)
             .lineHeight(20)
             .fontColor('#6F5964')
@@ -15325,6 +15717,7 @@ struct Index {
         }
         .width('100%')
         .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
         .listDirection(Axis.Vertical);
       }
 
@@ -15345,6 +15738,7 @@ struct Index {
         }
         .width('100%')
         .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
         .listDirection(Axis.Vertical);
       }
 
@@ -15379,7 +15773,7 @@ struct Index {
   }
 
   private searchSuggestionOverlayTop(): number {
-    return this.pageContentTopPadding() - 2;
+    return this.pageContentStartOffset() + SEARCH_SUGGESTION_OVERLAY_GAP;
   }
 
   private searchSuggestionOverlayTransition(): TransitionEffect {
@@ -15447,7 +15841,7 @@ struct Index {
     if (this.shouldShowSearchHistoryOverlay() && !this.searchHistoryExpanded) {
       return 0;
     }
-    return this.shouldShowBottomTabs() ? this.pageContentBottomPadding() : 0;
+    return this.shouldShowBottomTabs() ? this.pageContentEndOffset() : 0;
   }
 
   @Builder
@@ -15478,6 +15872,7 @@ struct Index {
       .width('100%')
       .constraintSize({ maxHeight: this.searchSuggestionOverlayMaxHeight() })
       .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
       .padding({ left: PAGE_SIDE_GUTTER + 4, right: PAGE_SIDE_GUTTER + 8 })
       .position({ x: 0, y: this.searchSuggestionOverlayTop() })
       .transition(this.searchSuggestionOverlayTransition())
@@ -15662,6 +16057,7 @@ struct Index {
       }
       .width('100%')
       .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
       .listDirection(Axis.Vertical);
     }
   }
@@ -15836,6 +16232,7 @@ struct Index {
         }
         .width('100%')
         .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
         .listDirection(Axis.Vertical);
       }
       .width('100%')
@@ -15844,7 +16241,8 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .scrollBar(BarState.Auto);
+    .scrollBar(BarState.Auto)
+    .edgeEffect(EdgeEffect.Spring);
   }
 
   @Builder
@@ -15885,8 +16283,9 @@ struct Index {
   @Builder
   private SearchSection(): void {
     Stack({ alignContent: Alignment.TopStart }) {
-      Scroll(this.searchScroller) {
+      Scroll(this.currentSearchScroller()) {
         Column({ space: 12 }) {
+          this.PageContentStartSpacer(12);
           if (!this.canUseNativeSite(this.siteMode)) {
             this.NativeGateCard();
           } else if (this.shouldShowNativeRouteLoading()) {
@@ -15897,7 +16296,7 @@ struct Index {
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
-        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
       .onDidScroll((_xOffset: number, _yOffset: number, _scrollState: ScrollState) => {
         this.handleSearchScrollProgress();
@@ -15919,7 +16318,10 @@ struct Index {
         this.handleSearchScrollEdge(side);
       })
       .width('100%')
-      .height('100%');
+      .height('100%')
+      .contentStartOffset(this.pageContentContainerStartOffset())
+      .contentEndOffset(this.pageContentEndOffset())
+      .edgeEffect(EdgeEffect.Spring);
 
       this.SearchSuggestionOverlay();
     }
@@ -16482,7 +16884,8 @@ struct Index {
         .columnsTemplate(this.previewStripColumnsTemplate())
         .columnsGap(10)
         .rowsGap(10)
-        .width('100%');
+        .width('100%')
+        .edgeEffect(EdgeEffect.Spring);
       }
       this.NativePreviewPager();
     }
@@ -16718,7 +17121,12 @@ struct Index {
         .onSelect((index: number, _value: string) => {
           const slots = this.favoriteSlots();
           if (index >= 0 && index < slots.length) {
-            this.favoritePanelSlotDraft = slots[index].slot;
+            const nextSlot = slots[index].slot;
+            if (!this.canUseCloudFavoriteSlot(nextSlot)) {
+              this.favoritePanelSlotDraft = FAVORITE_LOCAL_SLOT;
+              return;
+            }
+            this.favoritePanelSlotDraft = nextSlot;
           }
         });
     }
@@ -16842,11 +17250,18 @@ struct Index {
           .onSelect((index: number, _value: string) => {
             const slots = this.favoriteSlots();
             if (index >= 0 && index < slots.length) {
-              this.favoritePanelSlotDraft = slots[index].slot;
+              const nextSlot = slots[index].slot;
+              if (!this.canUseCloudFavoriteSlot(nextSlot)) {
+                this.favoritePanelSlotDraft = FAVORITE_LOCAL_SLOT;
+                return;
+              }
+              this.favoritePanelSlotDraft = nextSlot;
             }
           });
 
-        Text(this.favoritePanelSlotDraft === FAVORITE_LOCAL_SLOT ? '仅保存在本机数据库。' : `当前选择：站点槽 ${this.favoritePanelSlotDraft}`)
+        Text(this.effectiveFavoritePanelSlot() === FAVORITE_LOCAL_SLOT ?
+          '仅保存在本机数据库。' :
+          `当前选择：站点槽 ${this.effectiveFavoritePanelSlot()}`)
           .fontSize(11)
           .fontColor('#6F5964');
 
@@ -16859,7 +17274,7 @@ struct Index {
             .backgroundColor('#C86B8C')
             .borderRadius(8)
             .onClick(() => {
-              void this.applyFavoriteSlot(this.favoritePanelSlotDraft, false);
+              void this.applyFavoriteSlot(this.effectiveFavoritePanelSlot(), false);
             });
           Button('设为上次')
             .layoutWeight(1)
@@ -16868,8 +17283,9 @@ struct Index {
             .backgroundColor('#F8E4ED')
             .borderRadius(8)
             .onClick(() => {
-              this.setDefaultFavoriteSlot(this.favoritePanelSlotDraft);
-              this.toast(`上次使用已设为 ${this.favoriteSlotName(this.favoritePanelSlotDraft)}`);
+              const slot = this.effectiveFavoritePanelSlot();
+              this.setDefaultFavoriteSlot(slot);
+              this.toast(`上次使用已设为 ${this.favoriteSlotName(slot)}`);
             });
           Button('清除上次')
             .layoutWeight(1)
@@ -17196,21 +17612,25 @@ struct Index {
         Button(comment.voteUpEd ? '取消赞同' : '赞同')
           .height(28)
           .fontSize(12)
-          .backgroundColor(comment.voteUpEd ? '#C86B8C' : '#F3E3EA')
-          .fontColor(comment.voteUpEd ? '#FFFFFF' : '#2B2027')
+          .backgroundColor('#F3E3EA')
+          .fontColor('#2B2027')
           .borderRadius(8)
-          .enabled(comment.voteUpAble && comment.id > 0)
           .onClick(() => {
+            if (!comment.voteUpAble || comment.id <= 0) {
+              return;
+            }
             void this.voteGalleryComment(comment, 1);
           });
         Button(comment.voteDownEd ? '取消反对' : '反对')
           .height(28)
           .fontSize(12)
-          .backgroundColor(comment.voteDownEd ? '#B42318' : '#F3E3EA')
-          .fontColor(comment.voteDownEd ? '#FFFFFF' : '#2B2027')
+          .backgroundColor('#F3E3EA')
+          .fontColor('#2B2027')
           .borderRadius(8)
-          .enabled(comment.voteDownAble && comment.id > 0)
           .onClick(() => {
+            if (!comment.voteDownAble || comment.id <= 0) {
+              return;
+            }
             void this.voteGalleryComment(comment, -1);
           });
         if (comment.voteState.length > 0) {
@@ -17223,11 +17643,13 @@ struct Index {
         Button('拉黑')
           .height(28)
           .fontSize(12)
-          .backgroundColor(this.isBlacklistedUser(comment.user) ? '#FFF3F2' : '#F3E3EA')
-          .fontColor(this.isBlacklistedUser(comment.user) ? '#B42318' : '#2B2027')
+          .backgroundColor('#F3E3EA')
+          .fontColor('#2B2027')
           .borderRadius(8)
-          .enabled(!this.isBlacklistedUser(comment.user))
           .onClick(() => {
+            if (this.isBlacklistedUser(comment.user)) {
+              return;
+            }
             void this.addBlacklistUser(comment.user, `来自画廊 ${this.nativeDetail.gid}`);
           });
       }
@@ -17240,52 +17662,27 @@ struct Index {
     .alignItems(HorizontalAlign.Start);
   }
 
+  private nativeCommentsPageTransition(): TransitionEffect {
+    const appear = TransitionEffect.opacity(0)
+      .combine(TransitionEffect.translate({ x: 24 }));
+    const disappear = TransitionEffect.opacity(0)
+      .combine(TransitionEffect.translate({ x: -16 }));
+    return TransitionEffect.asymmetric(appear, disappear)
+      .animation({ duration: 220, curve: Curve.EaseOut });
+  }
+
+  private nativeDetailPageTransition(): TransitionEffect {
+    const appear = TransitionEffect.opacity(0)
+      .combine(TransitionEffect.translate({ x: -16 }));
+    const disappear = TransitionEffect.opacity(0)
+      .combine(TransitionEffect.translate({ x: 24 }));
+    return TransitionEffect.asymmetric(appear, disappear)
+      .animation({ duration: 220, curve: Curve.EaseOut });
+  }
+
   @Builder
   private NativeCommentsPage(): void {
     Column({ space: 12 }) {
-      Row({ space: 8 }) {
-        Button('返回详情')
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(6)
-          .onClick(() => {
-            this.handleNativeTitleBarBack();
-          });
-        Button('刷新')
-          .height(28)
-          .backgroundColor('#F8E4ED')
-          .borderRadius(6)
-          .onClick(() => {
-            void this.loadNativeAllComments();
-          });
-        Button('网页发表/编辑')
-          .height(28)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#C86B8C')
-          .borderRadius(6)
-          .onClick(() => {
-            this.openCommentWebFallback();
-          });
-      }
-      .width('100%');
-
-      Column({ space: 6 }) {
-        Text('评论')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#2B2027');
-        Text(this.nativeCommentsStatus.length > 0 ? this.nativeCommentsStatus :
-          `${this.visibleNativeComments().length} 条评论${this.hiddenNativeCommentCount() > 0 ? `，已隐藏 ${this.hiddenNativeCommentCount()} 条` : ''}`)
-          .fontSize(12)
-          .fontColor('#7C6470')
-          .maxLines(2);
-      }
-      .width('100%')
-      .padding(10)
-      .backgroundColor('#FFFFFF')
-      .borderRadius(8)
-      .alignItems(HorizontalAlign.Start);
-
       if (this.nativeCommentsLoading) {
         SystemLoadingBlock({
           message: '正在加载评论...',
@@ -17302,7 +17699,7 @@ struct Index {
           .backgroundColor('#FFFFFF')
           .borderRadius(8);
       } else if (this.visibleNativeComments().length === 0 && !this.nativeCommentsLoading) {
-        Text(`已按黑名单隐藏 ${this.hiddenNativeCommentCount()} 条评论。`)
+        Text('评论已按黑名单全部隐藏。')
           .width('100%')
           .fontSize(13)
           .fontColor('#6F5964')
@@ -17316,7 +17713,8 @@ struct Index {
       }
     }
     .width('100%')
-    .alignItems(HorizontalAlign.Start);
+    .alignItems(HorizontalAlign.Start)
+    .transition(this.nativeCommentsPageTransition());
   }
 
   @Builder
@@ -17378,7 +17776,8 @@ struct Index {
       metadataContent: (): void => {
         this.NativeDetailMetadata();
       }
-    });
+    })
+      .transition(this.nativeDetailPageTransition());
   }
 
   @Builder
@@ -17707,7 +18106,8 @@ struct Index {
       .alignItems(HorizontalAlign.Start);
     }
     .width('100%')
-    .height(320);
+    .height(320)
+    .edgeEffect(EdgeEffect.Spring);
   }
 
   @Builder
@@ -18391,8 +18791,9 @@ struct Index {
 
   @Builder
   private NativeSection(): void {
-    Scroll(this.nativeScroller) {
+    Scroll(this.currentNativeSectionScroller()) {
       Column({ space: 12 }) {
+        this.PageContentStartSpacer(12);
         this.SiteStatusCard();
         this.NativeHeaderCard();
 
@@ -18458,52 +18859,62 @@ struct Index {
       }
       .width('100%')
       .alignItems(HorizontalAlign.Start)
-      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
     }
     .layoutWeight(1)
     .width('100%')
-    .height('100%');
+    .height('100%')
+    .contentStartOffset(this.pageContentContainerStartOffset())
+    .contentEndOffset(this.pageContentEndOffset())
+    .edgeEffect(EdgeEffect.Spring);
   }
 
   @Builder
   private DownloadQueueSection(): void {
-    DownloadQueueView({
-      items: this.downloadItemsSource(),
-      viewMode: this.effectiveDownloadViewMode(),
-      managerStatus: this.effectiveDownloadManagerStatus(),
-      downloadRootText: this.downloadRoot(),
-      revision: this.downloadQueueRevision + this.downloadRuntimeRevision,
-      imageUrlForCover: (value: string): string => this.galleryImageDisplayUrl(value),
-      siteDisplayNameForItem: (item: DownloadQueueItem): string => this.siteDisplayName(item.site),
-      statusLabelForItem: (item: DownloadQueueItem): string => this.downloadItemStatusLabel(item),
-      statusColorForItem: (item: DownloadQueueItem): string => this.downloadItemStatusColor(item),
-      progressRatioForItem: (item: DownloadQueueItem): number => this.downloadProgressRatio(item),
-      progressTextForItem: (item: DownloadQueueItem): string => this.downloadProgressText(item),
-      speedTextForItem: (item: DownloadQueueItem): string => formatBytesPerSecond(item.speedBytesPerSecond),
-      remainingTextForItem: (item: DownloadQueueItem): string => formatRemainingSeconds(item.remainingSeconds),
-      isItemRunning: (item: DownloadQueueItem): boolean => this.isDownloadItemRunning(item),
-      onViewModeChange: (value: string): void => {
-        this.setDownloadViewMode(value);
-      },
-      onStartAll: (): void => {
-        this.startAllDownloads();
-      },
-      onPauseAll: (): void => {
-        this.pauseAllDownloads();
-      },
-      onStartItem: (item: DownloadQueueItem): void => {
-        this.startDownloadItem(item);
-      },
-      onPauseItem: (item: DownloadQueueItem): void => {
-        this.pauseDownloadItem(item);
-      },
-      onOpenItemDetail: (item: DownloadQueueItem): void => {
-        void this.openStoredGalleryInNative(item);
-      },
-      onRemoveItem: (item: DownloadQueueItem): void => {
-        this.removeDownloadItem(item);
-      }
-    });
+    if (this.shouldShowDownloadStateLoading()) {
+      SystemLoadingBlock({
+        message: '正在加载下载历史...',
+        minHeight: 160
+      });
+    } else {
+      DownloadQueueView({
+        items: this.downloadItemsSource(),
+        viewMode: this.effectiveDownloadViewMode(),
+        managerStatus: this.effectiveDownloadManagerStatus(),
+        downloadRootText: this.downloadRoot(),
+        revision: this.downloadQueueRevision + this.downloadRuntimeRevision,
+        imageUrlForCover: (value: string): string => this.galleryImageDisplayUrl(value),
+        siteDisplayNameForItem: (item: DownloadQueueItem): string => this.siteDisplayName(item.site),
+        statusLabelForItem: (item: DownloadQueueItem): string => this.downloadItemStatusLabel(item),
+        statusColorForItem: (item: DownloadQueueItem): string => this.downloadItemStatusColor(item),
+        progressRatioForItem: (item: DownloadQueueItem): number => this.downloadProgressRatio(item),
+        progressTextForItem: (item: DownloadQueueItem): string => this.downloadProgressText(item),
+        speedTextForItem: (item: DownloadQueueItem): string => formatBytesPerSecond(item.speedBytesPerSecond),
+        remainingTextForItem: (item: DownloadQueueItem): string => formatRemainingSeconds(item.remainingSeconds),
+        isItemRunning: (item: DownloadQueueItem): boolean => this.isDownloadItemRunning(item),
+        onViewModeChange: (value: string): void => {
+          this.setDownloadViewMode(value);
+        },
+        onStartAll: (): void => {
+          this.startAllDownloads();
+        },
+        onPauseAll: (): void => {
+          this.pauseAllDownloads();
+        },
+        onStartItem: (item: DownloadQueueItem): void => {
+          this.startDownloadItem(item);
+        },
+        onPauseItem: (item: DownloadQueueItem): void => {
+          this.pauseDownloadItem(item);
+        },
+        onOpenItemDetail: (item: DownloadQueueItem): void => {
+          void this.openStoredGalleryInNative(item);
+        },
+        onRemoveItem: (item: DownloadQueueItem): void => {
+          this.removeDownloadItem(item);
+        }
+      });
+    }
   }
 
   @Builder
@@ -18617,41 +19028,61 @@ struct Index {
       .borderRadius(8);
   }
 
+  private historyRowsEstimatedHeight(): number {
+    if (this.historyItems.length <= 0) {
+      return 44;
+    }
+    return this.historyItems.length * 106 + Math.max(0, this.historyItems.length - 1) * 10;
+  }
+
   @Builder
   private HistorySection(): void {
-    List({ space: 10, scroller: this.libraryScroller }) {
-      if (this.historyItems.length === 0) {
-        ListItem() {
-          this.HistoryEmptyRow();
-        }
-      } else {
-        ForEach(this.historyItems, (item: HistoryItem) => {
-          ListItem() {
-            this.HistoryRecordRow(item);
-          }
-          .swipeAction({
-            end: {
-              builder: (): void => {
-                this.HistoryDeleteSwipeAction(item);
-              },
-              actionAreaDistance: 76,
-              onAction: (): void => {
-                this.removeHistoryItem(item);
+    Scroll(this.libraryScroller) {
+      Column() {
+        this.PageContentStartSpacer(0);
+        List({ space: 10 }) {
+          if (this.historyItems.length === 0) {
+            ListItem() {
+              this.HistoryEmptyRow();
+            }
+          } else {
+            ForEach(this.historyItems, (item: HistoryItem) => {
+              ListItem() {
+                this.HistoryRecordRow(item);
               }
-            },
-            edgeEffect: SwipeEdgeEffect.Spring
-          })
-          .selectable(false);
-        }, (item: HistoryItem) => this.historyKey(item));
+              .swipeAction({
+                end: {
+                  builder: (): void => {
+                    this.HistoryDeleteSwipeAction(item);
+                  },
+                  actionAreaDistance: 76,
+                  onAction: (): void => {
+                    this.removeHistoryItem(item);
+                  }
+                },
+                edgeEffect: SwipeEdgeEffect.Spring
+              })
+              .selectable(false);
+            }, (item: HistoryItem) => this.historyKey(item));
+          }
+        }
+        .width('100%')
+        .height(this.historyRowsEstimatedHeight())
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.None)
+        .enableScrollInteraction(false);
       }
+      .width('100%')
+      .constraintSize({ minHeight: this.pageContentBodyMinHeight() })
+      .justifyContent(FlexAlign.Start)
+      .alignItems(HorizontalAlign.Start)
+      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
     }
     .layoutWeight(1)
     .width('100%')
     .height('100%')
-    .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER })
-    .contentStartOffset(this.pageContentTopPadding())
-    .contentEndOffset(this.pageContentBottomPadding())
-    .backgroundColor('#FFFFFF')
+    .contentStartOffset(this.pageContentContainerStartOffset())
+    .contentEndOffset(this.pageContentEndOffset())
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring);
   }
@@ -18825,26 +19256,31 @@ struct Index {
   @Builder
   private LibrarySection(): void {
     if (this.hasVisibleNativeSubPage()) {
-      Scroll(this.libraryScroller) {
+      Scroll(this.currentLibraryScroller()) {
         Column({ space: 12 }) {
+          this.PageContentStartSpacer(12);
           this.NativeGalleryListHost();
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
-        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
       .layoutWeight(1)
       .width('100%')
-      .height('100%');
+      .height('100%')
+      .contentStartOffset(this.pageContentContainerStartOffset())
+      .contentEndOffset(this.pageContentEndOffset())
+      .edgeEffect(EdgeEffect.Spring);
     } else if (this.libraryPanel === LIBRARY_FAVORITES) {
       Refresh({ refreshing: $$this.isFavoriteRefreshing, offset: 64 }) {
         Scroll(this.libraryScroller) {
           Column({ space: 12 }) {
+            this.PageContentStartSpacer(12);
             this.NativeGalleryListHost();
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)
-          .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+          .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
         }
         .onDidScroll((_xOffset: number, _yOffset: number, _scrollState: ScrollState) => {
           this.handleLibraryFavoritesScrollProgress();
@@ -18854,7 +19290,10 @@ struct Index {
         })
         .layoutWeight(1)
         .width('100%')
-        .height('100%');
+        .height('100%')
+        .contentStartOffset(this.pageContentContainerStartOffset())
+        .contentEndOffset(this.pageContentEndOffset())
+        .edgeEffect(EdgeEffect.Spring);
       }
       .onRefreshing(() => {
         void this.refreshFavoriteWaterfall();
@@ -18867,17 +19306,20 @@ struct Index {
     } else {
       Scroll(this.libraryScroller) {
         Column({ space: 12 }) {
+          this.PageContentStartSpacer(12);
           this.DownloadQueueSection();
         }
         .width('100%')
         .constraintSize({ minHeight: this.downloadScrollContentMinHeight() })
         .justifyContent(FlexAlign.Start)
         .alignItems(HorizontalAlign.Start)
-        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+        .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
       .layoutWeight(1)
       .width('100%')
       .height('100%')
+      .contentStartOffset(this.pageContentContainerStartOffset())
+      .contentEndOffset(this.pageContentEndOffset())
       .scrollBar(BarState.Off)
       .edgeEffect(EdgeEffect.Spring);
     }
@@ -18892,6 +19334,7 @@ struct Index {
   private SettingsSectionForPage(page: string): void {
     Scroll(this.settingsScroller) {
       Column({ space: 10 }) {
+        this.PageContentStartSpacer(10);
         if (page === MY_PAGE_MY_TAGS) {
           this.MyTagsSection();
         } else if (page === MY_PAGE_IMAGE_SEARCH) {
@@ -18925,11 +19368,14 @@ struct Index {
       }
       .width('100%')
       .alignItems(HorizontalAlign.Start)
-      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
     }
     .layoutWeight(1)
     .width('100%')
-    .height('100%');
+    .height('100%')
+    .contentStartOffset(this.pageContentContainerStartOffset())
+    .contentEndOffset(this.pageContentEndOffset())
+    .edgeEffect(EdgeEffect.Spring);
   }
 
   @Builder
@@ -20021,16 +20467,20 @@ struct Index {
   private MySection(): void {
     Scroll(this.myScroller) {
       Column({ space: 12 }) {
+        this.PageContentStartSpacer(12);
         this.MyBrandHeader();
         this.MyDrawerCard();
       }
       .width('100%')
       .alignItems(HorizontalAlign.Start)
-      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: this.pageContentTopPadding(), bottom: this.pageContentBottomPadding() });
+      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
     }
     .layoutWeight(1)
     .width('100%')
-    .height('100%');
+    .height('100%')
+    .contentStartOffset(this.pageContentContainerStartOffset())
+    .contentEndOffset(this.pageContentEndOffset())
+    .edgeEffect(EdgeEffect.Spring);
   }
 
   private BottomTabBar(title: string, symbol: Resource): BottomTabBarStyle {
@@ -20202,7 +20652,7 @@ struct Index {
             .mode(NavigationMode.Stack)
             .titleBar(this.currentTitleBarOptions())
             .hideBackButton(!this.shouldShowNativeTitleBarBack())
-            .titleMode(HdsNavigationTitleMode.MINI)
+            .titleMode(this.currentTitleMode())
             .bindToScrollable(this.activeNavigationScrollers());
           }
         }

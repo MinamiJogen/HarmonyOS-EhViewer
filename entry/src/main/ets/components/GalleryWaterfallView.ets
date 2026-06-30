@@ -251,6 +251,7 @@ export struct GalleryWaterfallView {
       .onAreaChange((_oldValue: Area, newValue: Area) => {
         this.updateContainerWidth(newValue.width);
       })
+      .edgeEffect(EdgeEffect.Spring)
       .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST });
     }
   }
