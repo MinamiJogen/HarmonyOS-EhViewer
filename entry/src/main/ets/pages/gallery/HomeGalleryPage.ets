@@ -3,6 +3,7 @@ import {
   GalleryCategoryColorResolver,
   GalleryImageResolver,
   GalleryOpenHandler,
+  GalleryRankLabelResolver,
   GalleryRatingFormatter,
   GalleryTransitionIdResolver,
   GalleryWaterfallView
@@ -23,12 +24,15 @@ export struct HomeGalleryPage {
   @Prop nextEnabled: boolean = false;
   @Prop lastEnabled: boolean = false;
   @Prop imageVersion: number = 0;
+  @Prop loadingMinHeight: number = 112;
+  @Prop contentWidth: number = 0;
   imageUrlForItem: GalleryImageResolver = (item: NativeGallerySummary): string => item.thumb;
   categoryColorForItem: GalleryCategoryColorResolver = (_category: string): string => '#607D8B';
   formatRatingValue: GalleryRatingFormatter = (rating: number): string => {
     return rating > 0 ? rating.toFixed(1) : '暂无';
   };
   transitionIdForItem: GalleryTransitionIdResolver = (_item: NativeGallerySummary): string => '';
+  rankLabelForItem: GalleryRankLabelResolver = (_item: NativeGallerySummary, _index: number): string => '';
   onOpenItem: GalleryOpenHandler = (_item: NativeGallerySummary): void => {};
   onFirst: PagerAction = (): void => {};
   onPrev: PagerAction = (): void => {};
@@ -39,7 +43,7 @@ export struct HomeGalleryPage {
   private LoadingBlock(): void {
     SystemLoadingBlock({
       message: this.loadingMessage,
-      minHeight: 112
+      minHeight: this.loadingMinHeight
     });
   }
 
@@ -67,13 +71,15 @@ export struct HomeGalleryPage {
           emptyText: this.emptyText,
           itemKeyPrefix: this.itemKeyPrefix,
           imageVersion: this.imageVersion,
+          contentWidth: this.contentWidth,
           imageUrlForItem: this.imageUrlForItem,
           categoryColorForItem: this.categoryColorForItem,
           formatRatingValue: this.formatRatingValue,
           transitionIdForItem: this.transitionIdForItem,
+          rankLabelForItem: this.rankLabelForItem,
           onOpenItem: this.onOpenItem
         });
-        if (this.loading) {
+        if (this.loading && this.loadingMessage.indexOf('下一页') >= 0) {
           this.LoadingBlock();
         }
         GalleryPagerBar({

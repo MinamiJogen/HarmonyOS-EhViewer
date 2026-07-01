@@ -56,6 +56,7 @@ import {
   NativeVoteCommentResult,
   NativeTopListDetail,
   NativeTopListEntry,
+  NativeTopListEntryPageResult,
   NativeTopListGroup,
   NativeTopListPeriod,
   NativeTagGroup,
@@ -416,6 +417,9 @@ const DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT: number = 54;
 const SEARCH_INPUT_BAR_HEIGHT: number = 44;
 const SEARCH_TITLE_BAR_BOTTOM_HEIGHT: number = 60;
 const SEARCH_SUGGESTION_OVERLAY_GAP: number = 8;
+const TOP_LIST_TITLE_BAR_CLEARANCE: number = 36;
+const TOP_LIST_ENTRY_ROW_ESTIMATED_HEIGHT: number = 78;
+const TOP_LIST_ENTRY_STATIC_HEIGHT: number = 104;
 const TITLE_BAR_GRADIENT_MASK_EXTRA_HEIGHT: number = 32;
 const TITLE_BAR_GRADIENT_BLUR_RADIUS: number = 20;
 const TITLE_BAR_DIVIDER_COLOR: string = 'rgba(43,32,39,0.08)';
@@ -424,6 +428,7 @@ const TITLE_BAR_DIVIDER_COLOR: string = 'rgba(43,32,39,0.08)';
 @Component
 struct Index {
   private readonly controller: webview.WebviewController = new webview.WebviewController('ehviewer-main-web');
+  private readonly watchedProbeController: webview.WebviewController = new webview.WebviewController('ehviewer-watched-probe');
   private settingsStore?: preferences.Preferences = undefined;
   private readerWindow?: window.Window = undefined;
   private routeNativeSummary?: NativeGallerySummary = undefined;
@@ -498,12 +503,18 @@ struct Index {
   private searchRawResults: NativeGallerySummary[] = [];
   private favoriteRawResults: NativeGallerySummary[] = [];
   private nativeRawResults: NativeGallerySummary[] = [];
+  private topListGalleryRawResults: NativeGallerySummary[] = [];
+  private topListEntryRawResults: NativeTopListEntry[] = [];
   private homeListLoadSerial: number = 0;
   private favoriteListLoadSerial: number = 0;
   private searchListLoadSerial: number = 0;
+  private topListGalleryListLoadSerial: number = 0;
+  private topListEntryListLoadSerial: number = 0;
   private homeEndToastKey: string = '';
   private searchEndToastKey: string = '';
   private favoriteEndToastKey: string = '';
+  private topListGalleryEndToastKey: string = '';
+  private topListEntryEndToastKey: string = '';
   private readonly readerSwiperController: SwiperController = new SwiperController();
   private readonly readerPageDataSource: ReaderPageDataSource = new ReaderPageDataSource();
   private readonly readerPreviewPageInFlight: Map<number, Promise<void>> = new Map();
@@ -550,6 +561,7 @@ struct Index {
   @State private searchFilteredCount: number = 0;
   @State private favoriteFilteredCount: number = 0;
   @State private nativeFilteredCount: number = 0;
+  @State private topListGalleryFilteredCount: number = 0;
   @State private downloadItems: DownloadQueueItem[] = [];
   @State private downloadLabels: DownloadLabelItem[] = [];
   @State private activeDownloadLabel: string = DOWNLOAD_LABEL_ALL;
@@ -586,6 +598,7 @@ struct Index {
   @State private hasExCookie: boolean = false;
   @State private loginGateVisible: boolean = false;
   @State private loginGateMessage: string = LOGIN_GATE_DEFAULT_MESSAGE;
+  private loginGateKeepSiteOnDismiss: boolean = false;
   @State private cookieStatusSummary: string = '未检测到登录 Cookie';
   @State private nativeQuery: string = '';
   @State private tagSearchTransitionQuery: string = '';
@@ -794,22 +807,55 @@ struct Index {
   @State private topListError: string = '';
   @State private topListGroupIndex: number = 0;
   @State private topListPeriodSelectedIndexes: number[] = [0];
+  @State private topListGalleryLoading: boolean = false;
+  @State private topListGalleryLoadingMessage: string = '正在加载排行榜...';
+  @State private topListGalleryError: string = '';
+  @State private topListGalleryResults: NativeGallerySummary[] = [];
+  @State private topListGalleryListUrl: string = '';
+  @State private topListGalleryResultCount: string = '';
+  @State private topListGalleryFirstUrl: string = '';
+  @State private topListGalleryPrevUrl: string = '';
+  @State private topListGalleryNextUrl: string = '';
+  @State private topListGalleryLastUrl: string = '';
+  @State private topListGalleryActiveKey: string = '';
+  @State private topListGallerySupported: boolean = false;
+  @State private topListGalleryUnsupported: boolean = false;
+  @State private topListEntryLoading: boolean = false;
+  @State private topListEntryLoadingMessage: string = '正在加载排行榜...';
+  @State private topListEntryError: string = '';
+  @State private topListEntryResults: NativeTopListEntry[] = [];
+  @State private topListEntryListUrl: string = '';
+  @State private topListEntryFirstUrl: string = '';
+  @State private topListEntryPrevUrl: string = '';
+  @State private topListEntryNextUrl: string = '';
+  @State private topListEntryLastUrl: string = '';
+  @State private topListEntryActiveKey: string = '';
+  @State private topListEntrySupported: boolean = false;
   @State private topListPeriodSegmentOptions: SegmentButtonOptions = SegmentButtonOptions.capsule({
     buttons: TOP_LIST_PERIOD_SEGMENT_BUTTONS,
     multiply: false,
     fontColor: '#2B2027',
-    selectedFontColor: '#FFFFFF',
-    fontSize: 13,
-    selectedFontSize: 13,
+    selectedFontColor: '#2B2027',
+    fontSize: 14,
+    selectedFontSize: 14,
     fontWeight: FontWeight.Regular,
     selectedFontWeight: FontWeight.Medium,
-    backgroundColor: '#F3E3EA',
-    selectedBackgroundColor: '#C86B8C',
-    textPadding: { left: 6, right: 6, top: 6, bottom: 6 }
+    backgroundColor: 'rgba(0,0,0,0.05)',
+    selectedBackgroundColor: 'rgba(255,255,255,0.70)',
+    textPadding: { left: 12, right: 12, top: 7, bottom: 7 }
   });
   @State private myTags: NativeUserTag[] = [];
   @State private myTagsLoading: boolean = false;
+  @State private myTagsLoaded: boolean = false;
   @State private myTagsError: string = '';
+  @State private watchedTagSheetVisible: boolean = false;
+  @State private watchedTagSearchText: string = '';
+  @State private watchedTagSuggestions: TagTranslationSuggestion[] = [];
+  @State private watchedTagPendingAdds: string[] = [];
+  @State private watchedTagPendingDeletes: string[] = [];
+  @State private watchedTagCurrentNames: string[] = [];
+  @State private watchedTagSubmitting: boolean = false;
+  @State private watchedTagStatus: string = '';
   @State private imageSearchPath: string = '';
   @State private imageSearchSimilar: boolean = true;
   @State private imageSearchCovers: boolean = true;
@@ -820,6 +866,7 @@ struct Index {
   @State private fullScreenWebTitle: string = '';
   @State private fullScreenWebMode: string = '';
   @State private fullScreenWebProgress: number = 0;
+  @State private watchedProbeUrl: string = '';
   @State private systemSafeTop: number = 0;
   @State private systemSafeBottom: number = BOTTOM_NAV_SAFE_FALLBACK;
   @State private pageViewportWidth: number = 1;
@@ -827,6 +874,11 @@ struct Index {
   @State private customMaterialLevel: hdsMaterial.MaterialLevel = hdsMaterial.MaterialLevel.EXQUISITE;
   @State private titleBarMaterialType: hdsMaterial.MaterialType = hdsMaterial.MaterialType.ADAPTIVE;
   private signInSyncSerial: number = 0;
+  private watchedProbeSerial: number = 0;
+  private watchedProbeTargetUrl: string = '';
+  private watchedProbeTimerId: number = -1;
+  private watchedProbeResolve?: () => void = undefined;
+  private watchedProbeReject?: (error: Error) => void = undefined;
   private signInForumProbeStarted: boolean = false;
   private signInExProbeStarted: boolean = false;
   private signInExPendingNotified: boolean = false;
@@ -4623,6 +4675,67 @@ struct Index {
     }
   }
 
+  private clearWatchedProbeTimer(): void {
+    if (this.watchedProbeTimerId >= 0) {
+      clearTimeout(this.watchedProbeTimerId);
+      this.watchedProbeTimerId = -1;
+    }
+  }
+
+  private finishWatchedProbe(): void {
+    this.clearWatchedProbeTimer();
+    const resolve = this.watchedProbeResolve;
+    this.watchedProbeResolve = undefined;
+    this.watchedProbeReject = undefined;
+    this.watchedProbeTargetUrl = '';
+    this.watchedProbeUrl = '';
+    this.saveWebCookies();
+    this.refreshSiteCookieState();
+    if (resolve) {
+      resolve();
+    }
+  }
+
+  private failWatchedProbe(error: Error): void {
+    this.clearWatchedProbeTimer();
+    const reject = this.watchedProbeReject;
+    this.watchedProbeResolve = undefined;
+    this.watchedProbeReject = undefined;
+    this.watchedProbeTargetUrl = '';
+    this.watchedProbeUrl = '';
+    if (reject) {
+      reject(error);
+    }
+  }
+
+  private primeWatchedSessionViaWebView(site: string, targetUrl: string): Promise<void> {
+    return new Promise<void>((resolve: () => void, reject: (error: Error) => void) => {
+      this.clearWatchedProbeTimer();
+      this.watchedProbeSerial++;
+      const serial = this.watchedProbeSerial;
+      this.watchedProbeResolve = resolve;
+      this.watchedProbeReject = reject;
+      this.watchedProbeTargetUrl = targetUrl;
+      this.watchedProbeUrl = EhUrl.myTags(site);
+      this.watchedProbeTimerId = Number(setTimeout(() => {
+        if (serial === this.watchedProbeSerial && this.watchedProbeTargetUrl === targetUrl) {
+          this.failWatchedProbe(new Error('WebView watched fetch timeout'));
+        }
+      }, GALLERY_LIST_TIMEOUT_MS));
+      try {
+        this.watchedProbeController.loadUrl(this.watchedProbeUrl);
+      } catch (error) {
+      }
+    });
+  }
+
+  private onWatchedProbePageEnd(_url: string): void {
+    if (this.watchedProbeTargetUrl.length === 0 || !this.watchedProbeResolve) {
+      return;
+    }
+    this.finishWatchedProbe();
+  }
+
   private delay(ms: number): Promise<void> {
     return new Promise<void>((resolve: () => void) => {
       setTimeout(() => {
@@ -4749,6 +4862,21 @@ struct Index {
     this.toast('登录后才能使用云端收藏夹');
   }
 
+  private showWatchedLoginPrompt(): void {
+    this.showLoginPrompt('登录后才能使用关注页。请先使用网页登录或导入 Cookie。', true);
+  }
+
+  private canUseWatchedPage(showPrompt: boolean = true): boolean {
+    this.refreshSiteCookieState();
+    if (this.hasCurrentSiteCredential()) {
+      return true;
+    }
+    if (showPrompt) {
+      this.showWatchedLoginPrompt();
+    }
+    return false;
+  }
+
   private canUseCloudFavoriteSlot(slot: number, showPrompt: boolean = true): boolean {
     if (!this.isCloudFavoriteSlot(slot) || this.hasCurrentSiteCredential()) {
       return true;
@@ -4800,6 +4928,7 @@ struct Index {
 
     if (this.hasCurrentSiteCredential()) {
       this.loginGateVisible = false;
+      this.loginGateKeepSiteOnDismiss = false;
       this.loginGateMessage = LOGIN_GATE_DEFAULT_MESSAGE;
     } else {
       this.ensureFavoriteListFilterAllowedForAccount();
@@ -5198,14 +5327,14 @@ struct Index {
     return this.myPageTitle;
   }
 
-  private configureWebControllerForEh(): void {
+  private configureWebControllerForEh(targetController: webview.WebviewController = this.controller): void {
     try {
-      this.controller.setCustomUserAgent(NativeEhClient.USER_AGENT);
+      targetController.setCustomUserAgent(NativeEhClient.USER_AGENT);
     } catch (error) {
       try {
-        const controllerUserAgent = this.controller.getUserAgent();
+        const controllerUserAgent = targetController.getUserAgent();
         if (controllerUserAgent.length > 0) {
-          this.controller.setCustomUserAgent(controllerUserAgent);
+          targetController.setCustomUserAgent(controllerUserAgent);
         }
       } catch (fallbackError) {
       }
@@ -5218,19 +5347,24 @@ struct Index {
 
   private openWebSignInFromGate(): void {
     this.markLoginGateSeen();
+    this.loginGateKeepSiteOnDismiss = false;
     this.loginGateVisible = false;
     this.openWebSignIn();
   }
 
   private openCookieSignInFromGate(): void {
     this.markLoginGateSeen();
+    this.loginGateKeepSiteOnDismiss = false;
     this.loginGateVisible = false;
     this.openMyPage(MY_PAGE_SETTINGS, '设置');
   }
 
   private dismissLoginGateFromGate(): void {
-    const shouldSwitchToPublicSite = this.siteMode === GallerySite.EX && !this.hasCurrentSiteCredential();
+    const shouldSwitchToPublicSite = !this.loginGateKeepSiteOnDismiss &&
+      this.siteMode === GallerySite.EX &&
+      !this.hasCurrentSiteCredential();
     this.markLoginGateSeen();
+    this.loginGateKeepSiteOnDismiss = false;
     this.loginGateVisible = false;
     this.loginGateMessage = LOGIN_GATE_DEFAULT_MESSAGE;
     if (shouldSwitchToPublicSite) {
@@ -5537,8 +5671,9 @@ struct Index {
     return this.hasSignInCookie;
   }
 
-  private showLoginPrompt(message: string = LOGIN_GATE_DEFAULT_MESSAGE): void {
+  private showLoginPrompt(message: string = LOGIN_GATE_DEFAULT_MESSAGE, keepSiteOnDismiss: boolean = false): void {
     this.loginGateMessage = message;
+    this.loginGateKeepSiteOnDismiss = keepSiteOnDismiss;
     this.loginGateVisible = true;
   }
 
@@ -5593,7 +5728,7 @@ struct Index {
   private confirmClearLocalAccountCache(): void {
     const options: promptAction.ShowDialogOptions = {
       title: '删除本地账号缓存',
-      message: '确定要删除本地保存的登录 Cookie 和账号状态吗？下载、历史、书签和本地收藏不会被删除。',
+      message: '确定要删除本地保存的登录 Cookie 和账号状态吗？',
       buttons: [
         { text: '取消', color: '#6F5964' },
         { text: '删除', color: '#B42318' }
@@ -5859,9 +5994,43 @@ struct Index {
     this.topListLoading = false;
     this.topListGroupIndex = 0;
     this.topListPeriodSelectedIndexes = [0];
+    this.topListGalleryListLoadSerial++;
+    this.topListGalleryLoading = false;
+    this.topListGalleryLoadingMessage = '正在加载排行榜...';
+    this.topListGalleryError = '';
+    this.topListGalleryRawResults = [];
+    this.topListGalleryResults = [];
+    this.topListGalleryListUrl = '';
+    this.topListGalleryResultCount = '';
+    this.topListGalleryFirstUrl = '';
+    this.topListGalleryPrevUrl = '';
+    this.topListGalleryNextUrl = '';
+    this.topListGalleryLastUrl = '';
+    this.topListGalleryFilteredCount = 0;
+    this.topListGalleryActiveKey = '';
+    this.topListGallerySupported = false;
+    this.topListGalleryUnsupported = false;
+    this.topListGalleryEndToastKey = '';
+    this.topListEntryListLoadSerial++;
+    this.topListEntryLoading = false;
+    this.topListEntryLoadingMessage = '正在加载排行榜...';
+    this.topListEntryError = '';
+    this.topListEntryRawResults = [];
+    this.topListEntryResults = [];
+    this.topListEntryListUrl = '';
+    this.topListEntryFirstUrl = '';
+    this.topListEntryPrevUrl = '';
+    this.topListEntryNextUrl = '';
+    this.topListEntryLastUrl = '';
+    this.topListEntryActiveKey = '';
+    this.topListEntrySupported = false;
+    this.topListEntryEndToastKey = '';
     this.myTags = [];
     this.myTagsError = '';
     this.myTagsLoading = false;
+    this.myTagsLoaded = false;
+    this.clearWatchedTagDrafts();
+    this.watchedTagSheetVisible = false;
     this.imageSearchError = '';
     this.imageSearchLoading = false;
   }
@@ -5877,6 +6046,8 @@ struct Index {
   private async loadTopList(): Promise<void> {
     if (!this.ensureNativeSiteReady()) {
       this.topListError = this.nativeError;
+      this.clearTopListGalleryList('');
+      this.clearTopListEntryList('');
       return;
     }
     this.topListLoading = true;
@@ -5886,11 +6057,14 @@ struct Index {
       this.topListGroupIndex = 0;
       this.topListPeriodSelectedIndexes = [0];
       this.prefetchTopListImages(this.topListDetail);
+      this.loadCurrentTopListGalleryPeriod();
     } catch (error) {
       this.topListDetail = {
         title: '',
         groups: []
       };
+      this.clearTopListGalleryList('');
+      this.clearTopListEntryList('');
       const detail = `${error}`.replace('Error: ', '');
       this.topListError = detail.length > 0 ? detail : '排行榜加载失败';
     } finally {
@@ -5898,24 +6072,736 @@ struct Index {
     }
   }
 
-  private async loadMyTags(): Promise<void> {
+  private async loadMyTags(clearBeforeLoad: boolean = false): Promise<void> {
+    this.refreshSiteCookieState();
     if (!this.ensureNativeSiteReady()) {
       this.myTagsError = this.nativeError;
       return;
+    }
+    if (clearBeforeLoad) {
+      this.myTags = [];
+      this.myTagsLoaded = false;
+      this.watchedTagCurrentNames = [];
     }
     this.myTagsLoading = true;
     this.myTagsError = '';
     try {
       this.myTags = await NativeEhClient.fetchUserTags(this.siteMode);
-      if (this.myTags.length === 0) {
-        this.myTagsError = '没有解析到我的标签。若未登录，请先使用网页登录或导入 Cookie。';
-      }
+      this.myTagsLoaded = true;
+      this.refreshWatchedTagCurrentNames();
     } catch (error) {
       this.myTags = [];
+      this.myTagsLoaded = false;
+      this.watchedTagCurrentNames = [];
       const detail = `${error}`.replace('Error: ', '');
       this.myTagsError = detail.length > 0 ? detail : '我的标签加载失败';
     } finally {
       this.myTagsLoading = false;
+    }
+  }
+
+  private watchedTagParts(tagName: string): Array<string> {
+    const normalized = tagName.trim();
+    const separatorIndex = normalized.indexOf(':');
+    if (separatorIndex < 0) {
+      return ['misc', normalized];
+    }
+    const namespace = normalized.substring(0, separatorIndex).trim();
+    const tag = normalized.substring(separatorIndex + 1).trim();
+    return [this.normalizeWatchedTagNamespace(namespace), tag];
+  }
+
+  private normalizeWatchedTagNamespace(namespace: string): string {
+    const normalized = namespace.trim().toLowerCase();
+    if (normalized.length === 0) {
+      return 'misc';
+    }
+    switch (normalized) {
+      case 'a':
+        return 'artist';
+      case 'c':
+        return 'character';
+      case 'cos':
+        return 'cosplayer';
+      case 'f':
+        return 'female';
+      case 'g':
+        return 'group';
+      case 'l':
+        return 'language';
+      case 'm':
+        return 'male';
+      case 'o':
+        return 'other';
+      case 'p':
+        return 'parody';
+      case 'r':
+        return 'reclass';
+      case 'x':
+        return 'mixed';
+      default:
+        return normalized;
+    }
+  }
+
+  private watchedTagKey(tagName: string): string {
+    const parts = this.watchedTagParts(tagName);
+    return `${parts[0].toLowerCase()}:${parts[1].toLowerCase()}`;
+  }
+
+  private watchedTagName(namespace: string, tag: string): string {
+    const normalizedNamespace = namespace.trim();
+    const normalizedTag = tag.trim();
+    if (normalizedTag.length === 0) {
+      return '';
+    }
+    return `${normalizedNamespace.length > 0 ? normalizedNamespace : 'misc'}:${normalizedTag}`;
+  }
+
+  private watchedTagNameFromSuggestion(item: TagTranslationSuggestion): string {
+    return this.watchedTagName(item.namespace, item.tag);
+  }
+
+  private watchedTagSubmitName(tagName: string): string {
+    const parts = this.watchedTagParts(tagName);
+    return this.watchedTagName(parts[0], parts[1]);
+  }
+
+  private normalizeWatchedTagInput(value: string): string {
+    let normalized = value.trim()
+      .replace(/^[-"'`]+/g, '')
+      .replace(/[\$"'`]+$/g, '')
+      .trim();
+    if (normalized.length === 0) {
+      return '';
+    }
+    if (normalized.indexOf(':') < 0) {
+      return `misc:${normalized}`;
+    }
+    const parts = this.watchedTagParts(normalized);
+    return this.watchedTagName(parts[0], parts[1]);
+  }
+
+  private watchedTagDisplayName(tagName: string): string {
+    const parts = this.watchedTagParts(tagName);
+    if (parts[1].length === 0) {
+      return tagName;
+    }
+    return EhTagTranslator.translateTag(parts[0].toLowerCase(), parts[1]);
+  }
+
+  private watchedTagNamespaceLabel(namespace: string): string {
+    return EhTagTranslator.translateNamespace(namespace);
+  }
+
+  private watchedTagExists(tagName: string, list: string[]): boolean {
+    const key = this.watchedTagKey(tagName);
+    return list.some((item: string): boolean => this.watchedTagKey(item) === key);
+  }
+
+  private findUserTagByName(tagName: string): NativeUserTag | undefined {
+    const key = this.watchedTagKey(tagName);
+    for (const item of this.myTags) {
+      if (this.watchedTagKey(item.tagName) === key) {
+        return item;
+      }
+    }
+    return undefined;
+  }
+
+  private watchedCurrentTagNames(): string[] {
+    const names: string[] = [];
+    for (const item of this.myTags) {
+      if (item.watched && !this.watchedTagExists(item.tagName, this.watchedTagPendingDeletes)) {
+        names.push(item.tagName);
+      }
+    }
+    return names;
+  }
+
+  private refreshWatchedTagCurrentNames(): void {
+    this.watchedTagCurrentNames = this.watchedCurrentTagNames();
+  }
+
+  private watchedStoredTagNames(): string[] {
+    const names: string[] = [];
+    for (const item of this.myTags) {
+      if (item.watched) {
+        names.push(item.tagName);
+      }
+    }
+    return names;
+  }
+
+  private watchedTagGroupsForNames(names: string[]): NativeTagGroup[] {
+    const groups: NativeTagGroup[] = [];
+    for (const name of names) {
+      const parts = this.watchedTagParts(name);
+      const namespace = parts[0].toLowerCase();
+      const tag = parts[1];
+      if (tag.length === 0) {
+        continue;
+      }
+      let groupIndex = -1;
+      for (let index = 0; index < groups.length; index++) {
+        if (groups[index].name === namespace) {
+          groupIndex = index;
+          break;
+        }
+      }
+      if (groupIndex < 0) {
+        groups.push({ name: namespace, tags: [tag] });
+      } else if (groups[groupIndex].tags.indexOf(tag) < 0) {
+        groups[groupIndex].tags.push(tag);
+      }
+    }
+    return groups;
+  }
+
+  private clearWatchedTagDrafts(): void {
+    this.watchedTagSearchText = '';
+    this.watchedTagSuggestions = [];
+    this.watchedTagPendingAdds = [];
+    this.watchedTagPendingDeletes = [];
+    this.watchedTagSubmitting = false;
+    this.watchedTagStatus = '';
+    this.refreshWatchedTagCurrentNames();
+  }
+
+  private updateWatchedTagSuggestions(): void {
+    const keyword = this.cleanTagSuggestionKeyword(this.watchedTagSearchText);
+    this.watchedTagSuggestions = EhTagTranslator.suggest(keyword, TAG_SUGGEST_LIMIT);
+  }
+
+  private setWatchedTagSearchText(value: string): void {
+    this.watchedTagSearchText = value;
+    this.updateWatchedTagSuggestions();
+  }
+
+  private hasWatchedTagChanges(): boolean {
+    return this.watchedTagPendingAdds.length > 0 || this.watchedTagPendingDeletes.length > 0;
+  }
+
+  private canApplyWatchedTagChanges(): boolean {
+    return this.hasWatchedTagChanges() && !this.watchedTagSubmitting;
+  }
+
+  private openWatchedTagSheet(): void {
+    if (!this.hasCurrentSiteCredential()) {
+      this.showLoginPrompt('登录后才能管理关注标签。请先使用网页登录或导入 Cookie。', true);
+      this.toast('登录后才能管理关注标签');
+      return;
+    }
+    this.clearWatchedTagDrafts();
+    this.watchedTagSheetVisible = true;
+    void this.loadMyTags(true);
+  }
+
+  private closeWatchedTagSheet(): void {
+    if (this.watchedTagSubmitting) {
+      return;
+    }
+    this.watchedTagSheetVisible = false;
+  }
+
+  private addWatchedTagDraft(rawName: string): void {
+    const tagName = this.normalizeWatchedTagInput(rawName);
+    if (tagName.length === 0) {
+      return;
+    }
+    const existing = this.findUserTagByName(tagName);
+    if (existing && existing.watched) {
+      if (this.watchedTagExists(tagName, this.watchedTagPendingDeletes)) {
+        this.restoreWatchedTagDraft(tagName);
+      } else {
+        this.toast('这个标签已经在关注中');
+      }
+      this.setWatchedTagSearchText('');
+      return;
+    }
+    if (this.watchedTagExists(tagName, this.watchedTagPendingAdds)) {
+      this.toast('这个标签已加入本次添加');
+      this.setWatchedTagSearchText('');
+      return;
+    }
+    this.animateSearchCategoryChange(() => {
+      this.watchedTagPendingAdds = [...this.watchedTagPendingAdds, tagName];
+      this.setWatchedTagSearchText('');
+    });
+  }
+
+  private addWatchedTagSuggestion(item: TagTranslationSuggestion): void {
+    this.addWatchedTagDraft(this.watchedTagNameFromSuggestion(item));
+  }
+
+  private removePendingAddedWatchedTag(tagName: string): void {
+    const key = this.watchedTagKey(tagName);
+    this.animateSearchCategoryChange(() => {
+      this.watchedTagPendingAdds = this.watchedTagPendingAdds.filter((item: string): boolean =>
+        this.watchedTagKey(item) !== key);
+    });
+  }
+
+  private markWatchedTagDeleted(tagName: string): void {
+    const key = this.watchedTagKey(tagName);
+    if (this.watchedTagExists(tagName, this.watchedTagPendingAdds)) {
+      this.removePendingAddedWatchedTag(tagName);
+      return;
+    }
+    if (this.watchedTagPendingDeletes.some((item: string): boolean => this.watchedTagKey(item) === key)) {
+      return;
+    }
+    this.animateSearchCategoryChange(() => {
+      this.watchedTagPendingDeletes = [...this.watchedTagPendingDeletes, tagName];
+      this.refreshWatchedTagCurrentNames();
+    });
+  }
+
+  private restoreWatchedTagDraft(tagName: string): void {
+    const key = this.watchedTagKey(tagName);
+    this.animateSearchCategoryChange(() => {
+      this.watchedTagPendingDeletes = this.watchedTagPendingDeletes.filter((item: string): boolean =>
+        this.watchedTagKey(item) !== key);
+      this.refreshWatchedTagCurrentNames();
+    });
+  }
+
+  private pendingDeleteUserTags(): NativeUserTag[] {
+    const result: NativeUserTag[] = [];
+    for (const tagName of this.watchedTagPendingDeletes) {
+      const item = this.findUserTagByName(tagName);
+      if (item) {
+        result.push(item);
+      }
+    }
+    return result;
+  }
+
+  private failedPendingWatchedAdds(pendingAdds: string[]): string[] {
+    return pendingAdds.filter((item: string): boolean => {
+      const found = this.findUserTagByName(item);
+      return !found || !found.watched;
+    });
+  }
+
+  private failedPendingWatchedDeletes(pendingDeletes: string[]): string[] {
+    return pendingDeletes.filter((item: string): boolean => {
+      const found = this.findUserTagByName(item);
+      return !!found && found.watched;
+    });
+  }
+
+  private async submitWatchedTagDraft(): Promise<void> {
+    if (!this.canApplyWatchedTagChanges()) {
+      return;
+    }
+    const pendingAdds = this.watchedTagPendingAdds.slice();
+    const pendingDeletes = this.watchedTagPendingDeletes.slice();
+    this.watchedTagSubmitting = true;
+    this.watchedTagStatus = '正在更新关注标签...';
+    try {
+      this.myTags = await NativeEhClient.submitWatchedTagChanges(
+        this.siteMode,
+        pendingAdds.map((item: string): string => this.watchedTagSubmitName(item)),
+        this.pendingDeleteUserTags()
+      );
+      this.myTagsLoaded = true;
+      this.refreshWatchedTagCurrentNames();
+      const failedAdds = this.failedPendingWatchedAdds(pendingAdds);
+      const failedDeletes = this.failedPendingWatchedDeletes(pendingDeletes);
+      if (failedAdds.length > 0 || failedDeletes.length > 0) {
+        const failedParts: string[] = [];
+        if (failedAdds.length > 0) {
+          failedParts.push(`添加未生效：${failedAdds.join('、')}`);
+        }
+        if (failedDeletes.length > 0) {
+          failedParts.push(`删除未生效：${failedDeletes.join('、')}`);
+        }
+        this.watchedTagStatus = failedParts.join('；');
+        this.toast('关注标签未完全生效');
+        return;
+      }
+      this.clearWatchedTagDrafts();
+      this.watchedTagSheetVisible = false;
+      this.toast('关注标签已更新');
+      if (this.activeSection === NAV_HOME && this.homePage === HOME_PAGE_WATCHED && !this.hasVisibleNativeSubPage()) {
+        void this.loadHomeGalleryList(EhUrl.watched(this.siteMode));
+      }
+    } catch (error) {
+      const detail = `${error}`.replace('Error: ', '');
+      this.watchedTagStatus = detail.length > 0 ? detail : '关注标签更新失败';
+      this.toast(this.watchedTagStatus);
+    } finally {
+      this.watchedTagSubmitting = false;
+    }
+  }
+
+  private topListGalleryPeriodKey(period: NativeTopListPeriod): string {
+    return `${period.follow}|${period.url}`;
+  }
+
+  private topListGalleryUrlForPeriod(period: NativeTopListPeriod): string {
+    if (period.follow.length > 0) {
+      return `${EhUrl.topList()}?${period.follow}`;
+    }
+    return period.url;
+  }
+
+  private currentTopListGalleryKeyPrefix(): string {
+    const key = this.topListGalleryActiveKey.length > 0 ?
+      this.topListGalleryActiveKey : this.topListGalleryPeriodKey(this.currentTopListPeriod());
+    return `top-gallery:${key}`;
+  }
+
+  private currentTopListGalleryActiveKey(): string {
+    return this.topListGalleryPeriodKey(this.currentTopListPeriod());
+  }
+
+  private currentTopListPeriodUsesGalleryList(): boolean {
+    const period = this.currentTopListPeriod();
+    for (let index = 0; index < period.entries.length; index++) {
+      if (period.entries[index].gid > 0 && period.entries[index].token.length > 0) {
+        return true;
+      }
+    }
+    return this.currentTopListGroup().title.toLowerCase().indexOf('gallery') >= 0;
+  }
+
+  private isTopListGalleryUnsupportedError(error: Object | string | undefined): boolean {
+    const message = this.readableErrorMessage(error, '').toLowerCase();
+    return message.indexOf('no gallery entries were parsed') >= 0 ||
+      message.indexOf('account home is not a gallery list') >= 0 ||
+      message.indexOf('gallery list was not found') >= 0;
+  }
+
+  private shouldShowCurrentTopListGalleryWaterfall(): boolean {
+    return this.topListGalleryActiveKey === this.currentTopListGalleryActiveKey() &&
+      !this.topListGalleryUnsupported &&
+      (this.topListGalleryLoading || this.topListGallerySupported ||
+        this.topListGalleryResults.length > 0 || this.topListGalleryError.length > 0);
+  }
+
+  private shouldShowCurrentTopListEntryList(): boolean {
+    return this.topListEntryActiveKey === this.currentTopListGalleryActiveKey() &&
+      (this.topListEntrySupported || this.topListEntryResults.length > 0 || this.topListEntryError.length > 0);
+  }
+
+  private clearTopListGalleryList(url: string): void {
+    this.topListGalleryListLoadSerial++;
+    this.topListGalleryLoading = false;
+    this.topListGalleryLoadingMessage = '正在加载排行榜...';
+    this.topListGalleryError = '';
+    this.topListGalleryRawResults = [];
+    this.topListGalleryResults = [];
+    this.topListGalleryListUrl = url;
+    this.topListGalleryResultCount = '';
+    this.topListGalleryFirstUrl = '';
+    this.topListGalleryPrevUrl = '';
+    this.topListGalleryNextUrl = '';
+    this.topListGalleryLastUrl = '';
+    this.topListGalleryFilteredCount = 0;
+    this.topListGalleryEndToastKey = '';
+    this.topListGalleryActiveKey = '';
+    this.topListGallerySupported = false;
+    this.topListGalleryUnsupported = false;
+  }
+
+  private clearTopListEntryList(url: string): void {
+    this.topListEntryListLoadSerial++;
+    this.topListEntryLoading = false;
+    this.topListEntryLoadingMessage = '正在加载排行榜...';
+    this.topListEntryError = '';
+    this.topListEntryRawResults = [];
+    this.topListEntryResults = [];
+    this.topListEntryListUrl = url;
+    this.topListEntryFirstUrl = '';
+    this.topListEntryPrevUrl = '';
+    this.topListEntryNextUrl = '';
+    this.topListEntryLastUrl = '';
+    this.topListEntryActiveKey = '';
+    this.topListEntrySupported = false;
+    this.topListEntryEndToastKey = '';
+  }
+
+  private prepareTopListGalleryReload(url: string, activeKey: string): void {
+    this.topListGalleryRawResults = [];
+    this.topListGalleryResults = [];
+    this.topListGalleryListUrl = url;
+    this.topListGalleryResultCount = '';
+    this.topListGalleryFirstUrl = '';
+    this.topListGalleryPrevUrl = '';
+    this.topListGalleryNextUrl = '';
+    this.topListGalleryLastUrl = '';
+    this.topListGalleryFilteredCount = 0;
+    this.topListGalleryEndToastKey = '';
+    this.topListGalleryActiveKey = activeKey;
+    this.topListGallerySupported = false;
+    this.topListGalleryUnsupported = false;
+  }
+
+  private prepareTopListEntryReload(url: string, activeKey: string): void {
+    this.topListEntryRawResults = [];
+    this.topListEntryResults = [];
+    this.topListEntryListUrl = url;
+    this.topListEntryFirstUrl = '';
+    this.topListEntryPrevUrl = '';
+    this.topListEntryNextUrl = '';
+    this.topListEntryLastUrl = '';
+    this.topListEntryEndToastKey = '';
+    this.topListEntryActiveKey = activeKey;
+    this.topListEntrySupported = false;
+  }
+
+  private applyTopListGalleryList(result: NativeGalleryListResult): void {
+    this.topListGallerySupported = true;
+    this.topListGalleryUnsupported = false;
+    this.topListGalleryRawResults = result.items;
+    this.topListGalleryResults = this.applyLocalGalleryFilters(this.topListGalleryRawResults);
+    this.topListGalleryFilteredCount = this.filterHiddenCount(this.topListGalleryRawResults, this.topListGalleryResults);
+    this.topListGalleryListUrl = result.requestUrl;
+    this.topListGalleryResultCount = result.resultCount;
+    this.topListGalleryFirstUrl = result.firstUrl;
+    this.topListGalleryPrevUrl = result.prevUrl;
+    this.topListGalleryNextUrl = result.nextUrl;
+    this.topListGalleryLastUrl = result.lastUrl;
+    this.topListGalleryEndToastKey = '';
+  }
+
+  private topListEntryKey(entry: NativeTopListEntry): string {
+    return `${entry.rank}|${entry.url}|${entry.title}`;
+  }
+
+  private appendTopListEntryItems(current: NativeTopListEntry[], next: NativeTopListEntry[]): NativeTopListEntry[] {
+    const seen: Set<string> = new Set();
+    const merged: NativeTopListEntry[] = [];
+    for (const entry of current) {
+      const key = this.topListEntryKey(entry);
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(entry);
+      }
+    }
+    for (const entry of next) {
+      const key = this.topListEntryKey(entry);
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(entry);
+      }
+    }
+    merged.sort((left: NativeTopListEntry, right: NativeTopListEntry): number =>
+      this.topListRankNumber(left.rank) - this.topListRankNumber(right.rank));
+    return merged;
+  }
+
+  private applyTopListEntryPage(result: NativeTopListEntryPageResult): void {
+    this.topListEntrySupported = true;
+    this.topListEntryRawResults = result.items;
+    this.topListEntryResults = result.items;
+    this.topListEntryListUrl = result.requestUrl;
+    this.topListEntryFirstUrl = result.firstUrl;
+    this.topListEntryPrevUrl = result.prevUrl;
+    this.topListEntryNextUrl = result.nextUrl;
+    this.topListEntryLastUrl = result.lastUrl;
+    this.topListEntryEndToastKey = '';
+  }
+
+  private appendTopListEntryPage(result: NativeTopListEntryPageResult): void {
+    this.topListEntrySupported = true;
+    this.topListEntryRawResults = this.appendTopListEntryItems(this.topListEntryRawResults, result.items);
+    this.topListEntryResults = this.topListEntryRawResults;
+    this.topListEntryListUrl = result.requestUrl;
+    this.topListEntryNextUrl = result.nextUrl;
+    this.topListEntryLastUrl = result.lastUrl;
+    this.topListEntryEndToastKey = '';
+  }
+
+  private appendTopListGalleryList(result: NativeGalleryListResult): void {
+    this.topListGallerySupported = true;
+    this.topListGalleryUnsupported = false;
+    this.topListGalleryRawResults = this.appendGalleryItems(this.topListGalleryRawResults, result.items);
+    this.topListGalleryResults = this.applyLocalGalleryFilters(this.topListGalleryRawResults);
+    this.topListGalleryFilteredCount = this.filterHiddenCount(this.topListGalleryRawResults, this.topListGalleryResults);
+    this.topListGalleryListUrl = result.requestUrl;
+    if (result.resultCount.length > 0) {
+      this.topListGalleryResultCount = result.resultCount;
+    }
+    this.topListGalleryNextUrl = result.nextUrl;
+    this.topListGalleryLastUrl = result.lastUrl;
+    this.topListGalleryEndToastKey = '';
+  }
+
+  private loadCurrentTopListGalleryPeriod(): void {
+    const period = this.currentTopListPeriod();
+    const url = this.topListGalleryUrlForPeriod(period);
+    const activeKey = this.topListGalleryPeriodKey(period);
+    if (url.length === 0) {
+      this.clearTopListGalleryList('');
+      this.clearTopListEntryList('');
+      return;
+    }
+    if (this.currentTopListPeriodUsesGalleryList()) {
+      this.clearTopListEntryList('');
+      if (this.topListGalleryActiveKey === activeKey &&
+        (this.topListGalleryLoading || this.topListGallerySupported || this.topListGalleryUnsupported ||
+          this.topListGalleryError.length > 0)) {
+        return;
+      }
+      void this.loadTopListGalleryList(url, activeKey);
+      return;
+    }
+    this.clearTopListGalleryList('');
+    if (this.topListEntryActiveKey === activeKey &&
+      (this.topListEntryLoading || this.topListEntrySupported || this.topListEntryError.length > 0)) {
+      return;
+    }
+    void this.loadTopListEntryList(url, activeKey);
+  }
+
+  private async loadTopListGalleryList(url: string, activeKey: string): Promise<void> {
+    const loadSerial = ++this.topListGalleryListLoadSerial;
+    this.prepareTopListGalleryReload(url, activeKey);
+    this.topListGalleryLoading = true;
+    this.topListGalleryLoadingMessage = '正在加载排行榜...';
+    this.topListGalleryError = '';
+    this.nativeViewMode = 'list';
+    try {
+      await this.loadGalleryListBatch(url, (result: NativeGalleryListResult, pageIndex: number): void => {
+        if (pageIndex === 0) {
+          this.applyTopListGalleryList(result);
+        } else {
+          this.appendTopListGalleryList(result);
+        }
+        this.prefetchGalleryImages(result.items, result.requestUrl);
+      }, (): boolean => loadSerial === this.topListGalleryListLoadSerial, GallerySite.E);
+    } catch (error) {
+      if (loadSerial !== this.topListGalleryListLoadSerial) {
+        return;
+      }
+      if (this.isTopListGalleryUnsupportedError(error)) {
+        this.clearTopListGalleryList(url);
+        this.topListGalleryActiveKey = activeKey;
+        this.topListGalleryUnsupported = true;
+        this.topListGalleryError = '';
+        return;
+      }
+      this.topListGalleryActiveKey = activeKey;
+      this.topListGallerySupported = true;
+      this.topListGalleryUnsupported = false;
+      this.topListGalleryError = this.readableErrorMessage(error, '排行榜加载失败');
+    } finally {
+      if (loadSerial === this.topListGalleryListLoadSerial) {
+        this.topListGalleryLoading = false;
+        this.topListGalleryLoadingMessage = '正在加载排行榜...';
+      }
+    }
+  }
+
+  private async loadMoreTopListGalleryList(): Promise<void> {
+    if (!this.topListGallerySupported || this.topListGalleryUnsupported) {
+      return;
+    }
+    if (this.topListGalleryLoading) {
+      return;
+    }
+    const nextUrl = this.topListGalleryNextUrl;
+    if (nextUrl.length === 0 || nextUrl === this.topListGalleryListUrl) {
+      this.showEndOfWaterfallToast('topList');
+      return;
+    }
+    const loadSerial = ++this.topListGalleryListLoadSerial;
+    this.topListGalleryLoading = true;
+    this.topListGalleryLoadingMessage = '正在加载下一页...';
+    this.topListGalleryError = '';
+    this.nativeViewMode = 'list';
+    try {
+      await this.loadGalleryListBatch(nextUrl, (result: NativeGalleryListResult, _pageIndex: number): void => {
+        this.appendTopListGalleryList(result);
+        this.prefetchGalleryImages(result.items, result.requestUrl);
+      }, (): boolean => loadSerial === this.topListGalleryListLoadSerial, GallerySite.E);
+    } catch (error) {
+      if (loadSerial !== this.topListGalleryListLoadSerial) {
+        return;
+      }
+      this.topListGalleryError = this.readableErrorMessage(error, '排行榜下一页加载失败');
+      this.toast(this.topListGalleryError);
+    } finally {
+      if (loadSerial === this.topListGalleryListLoadSerial) {
+        this.topListGalleryLoading = false;
+        this.topListGalleryLoadingMessage = '正在加载排行榜...';
+      }
+    }
+  }
+
+  private async fetchTopListEntryPageWithTimeout(url: string): Promise<NativeTopListEntryPageResult> {
+    const result = await Promise.race<NativeTopListEntryPageResult | undefined>([
+      NativeEhClient.fetchTopListEntryPage(url),
+      this.delay(GALLERY_LIST_TIMEOUT_MS).then((): undefined => undefined)
+    ]);
+    if (result === undefined) {
+      throw new Error('排行榜请求超时，请检查网络或 Cookie 状态。');
+    }
+    return result;
+  }
+
+  private async loadTopListEntryList(url: string, activeKey: string): Promise<void> {
+    const loadSerial = ++this.topListEntryListLoadSerial;
+    this.prepareTopListEntryReload(url, activeKey);
+    this.topListEntryLoading = true;
+    this.topListEntryLoadingMessage = '正在加载排行榜...';
+    this.topListEntryError = '';
+    this.nativeViewMode = 'list';
+    try {
+      const result = await this.fetchTopListEntryPageWithTimeout(url);
+      if (loadSerial !== this.topListEntryListLoadSerial) {
+        return;
+      }
+      this.applyTopListEntryPage(result);
+    } catch (error) {
+      if (loadSerial !== this.topListEntryListLoadSerial) {
+        return;
+      }
+      this.topListEntryActiveKey = activeKey;
+      this.topListEntrySupported = true;
+      this.topListEntryError = this.readableErrorMessage(error, '排行榜加载失败');
+    } finally {
+      if (loadSerial === this.topListEntryListLoadSerial) {
+        this.topListEntryLoading = false;
+        this.topListEntryLoadingMessage = '正在加载排行榜...';
+      }
+    }
+  }
+
+  private async loadMoreTopListEntryList(): Promise<void> {
+    if (!this.topListEntrySupported || this.topListEntryLoading) {
+      return;
+    }
+    const nextUrl = this.topListEntryNextUrl;
+    if (nextUrl.length === 0 || nextUrl === this.topListEntryListUrl) {
+      this.showEndOfWaterfallToast('topListEntry');
+      return;
+    }
+    const loadSerial = ++this.topListEntryListLoadSerial;
+    this.topListEntryLoading = true;
+    this.topListEntryLoadingMessage = '正在加载下一页...';
+    this.topListEntryError = '';
+    this.nativeViewMode = 'list';
+    try {
+      const result = await this.fetchTopListEntryPageWithTimeout(nextUrl);
+      if (loadSerial !== this.topListEntryListLoadSerial) {
+        return;
+      }
+      this.appendTopListEntryPage(result);
+    } catch (error) {
+      if (loadSerial !== this.topListEntryListLoadSerial) {
+        return;
+      }
+      this.topListEntryError = this.readableErrorMessage(error, '排行榜下一页加载失败');
+      this.toast(this.topListEntryError);
+    } finally {
+      if (loadSerial === this.topListEntryListLoadSerial) {
+        this.topListEntryLoading = false;
+        this.topListEntryLoadingMessage = '正在加载排行榜...';
+      }
     }
   }
 
@@ -6015,6 +6901,7 @@ struct Index {
       if (this.topListDetail.groups[index].title === title) {
         this.topListGroupIndex = index;
         this.syncTopListPeriodSelectedIndex();
+        this.loadCurrentTopListGalleryPeriod();
         return;
       }
     }
@@ -6026,6 +6913,7 @@ struct Index {
     }
     this.topListGroupIndex = index;
     this.syncTopListPeriodSelectedIndex();
+    this.loadCurrentTopListGalleryPeriod();
   }
 
   private topListPeriodSelectedIndex(): number {
@@ -6094,9 +6982,36 @@ struct Index {
   }
 
   private topListRankLabel(entry: NativeTopListEntry, fallbackIndex: number): string {
-    const digits = entry.rank.replace(/[^0-9]/g, '');
+    const digits = this.topListRankDigits(entry.rank);
     const rank = digits.length > 0 ? digits : `${fallbackIndex + 1}`;
     return `${rank}#`;
+  }
+
+  private topListRankDigits(value: string): string {
+    return value.replace(/[^0-9]/g, '');
+  }
+
+  private topListRankNumber(value: string): number {
+    const parsed = Number(this.topListRankDigits(value));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private topListRankBadgeLabel(item: NativeGallerySummary, fallbackIndex: number): string {
+    const period = this.currentTopListPeriod();
+    for (let index = 0; index < period.entries.length; index++) {
+      const entry = period.entries[index];
+      if (entry.gid === item.gid && entry.token === item.token) {
+        const digits = this.topListRankDigits(entry.rank);
+        return `#${digits.length > 0 ? digits : fallbackIndex + 1}`;
+      }
+    }
+    for (let index = 0; index < this.topListGalleryRawResults.length; index++) {
+      const result = this.topListGalleryRawResults[index];
+      if (result.gid === item.gid && result.token === item.token) {
+        return `#${index + 1}`;
+      }
+    }
+    return `#${fallbackIndex + 1}`;
   }
 
   private openTopListEntry(entry: NativeTopListEntry): void {
@@ -6114,7 +7029,7 @@ struct Index {
         pages: 0,
         simpleTags: [],
         simpleLanguage: '',
-        detailUrl: EhUrl.galleryDetail(this.siteMode, entry.gid, entry.token)
+        detailUrl: entry.url.length > 0 ? entry.url : EhUrl.galleryDetail(GallerySite.E, entry.gid, entry.token)
       };
       void this.openNativeDetail(item);
       return;
@@ -6850,6 +7765,12 @@ struct Index {
     return url.toLowerCase().indexOf('favorites.php') >= 0;
   }
 
+  private isWatchedGalleryUrl(url: string): boolean {
+    const normalized = this.normalizeUrl(url).toLowerCase();
+    const host = EhUrl.host(this.siteMode).toLowerCase();
+    return normalized.startsWith(`${host}watched`);
+  }
+
   private currentHomeTargetUrl(): string {
     switch (this.homePage) {
       case HOME_PAGE_POPULAR:
@@ -6865,6 +7786,8 @@ struct Index {
     if (this.homePage === HOME_PAGE_TOP) {
       if (!this.topListLoading && this.topListDetail.groups.length === 0 && this.topListError.length === 0) {
         void this.loadTopList();
+      } else {
+        this.loadCurrentTopListGalleryPeriod();
       }
       return;
     }
@@ -7059,12 +7982,16 @@ struct Index {
     this.searchEndToastKey = '';
   }
 
-  private showEndOfWaterfallToast(scope: 'home' | 'search' | 'favorite'): void {
+  private showEndOfWaterfallToast(scope: 'home' | 'search' | 'favorite' | 'topList' | 'topListEntry'): void {
     let toastKey = '';
     if (scope === 'home') {
       toastKey = `${this.homeListUrl}|${this.homeResults.length}`;
     } else if (scope === 'favorite') {
       toastKey = `${this.favoriteListUrl}|${this.favoriteResults.length}`;
+    } else if (scope === 'topList') {
+      toastKey = `${this.topListGalleryListUrl}|${this.topListGalleryResults.length}`;
+    } else if (scope === 'topListEntry') {
+      toastKey = `${this.topListEntryListUrl}|${this.topListEntryResults.length}`;
     } else {
       toastKey = `${this.searchListUrl}|${this.searchResults.length}`;
     }
@@ -7081,6 +8008,16 @@ struct Index {
         return;
       }
       this.favoriteEndToastKey = toastKey;
+    } else if (scope === 'topList') {
+      if (this.topListGalleryEndToastKey === toastKey) {
+        return;
+      }
+      this.topListGalleryEndToastKey = toastKey;
+    } else if (scope === 'topListEntry') {
+      if (this.topListEntryEndToastKey === toastKey) {
+        return;
+      }
+      this.topListEntryEndToastKey = toastKey;
     } else {
       if (this.searchEndToastKey === toastKey) {
         return;
@@ -7090,18 +8027,35 @@ struct Index {
     this.toast('已经到底，没有更多内容了');
   }
 
-  private async fetchGalleryListWithTimeout(url: string): Promise<NativeGalleryListResult> {
-    hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list start. Site=%{public}s Url=%{public}s', this.siteMode, url);
+  private async fetchGalleryListWithTimeout(url: string, site: string = this.siteMode): Promise<NativeGalleryListResult> {
+    hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list start. Site=%{public}s Url=%{public}s', site, url);
     const result = await Promise.race<NativeGalleryListResult | undefined>([
-      NativeEhClient.fetchGalleryList(this.siteMode, url),
+      NativeEhClient.fetchGalleryList(site, url),
       this.delay(GALLERY_LIST_TIMEOUT_MS).then((): undefined => undefined)
     ]);
     if (result === undefined) {
       hilog.error(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list timeout. Site=%{public}s Url=%{public}s TimeoutMs=%{public}d',
-        this.siteMode, url, GALLERY_LIST_TIMEOUT_MS);
+        site, url, GALLERY_LIST_TIMEOUT_MS);
       throw new Error('列表请求超时，请检查网络或 Cookie 状态。');
     }
-    hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list success. Site=%{public}s Url=%{public}s', this.siteMode, url);
+    hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Fetch gallery list success. Site=%{public}s Url=%{public}s', site, url);
+    return result;
+  }
+
+  private async fetchGalleryListForUrl(url: string, site: string = this.siteMode): Promise<NativeGalleryListResult> {
+    const result = await this.fetchGalleryListWithTimeout(url, site);
+    if (site === this.siteMode && this.isWatchedGalleryUrl(url) && result.items.length === 0 &&
+      this.watchedStoredTagNames().length > 0) {
+      try {
+        await this.primeWatchedSessionViaWebView(site, url);
+        const retryResult = await this.fetchGalleryListWithTimeout(url, site);
+        return retryResult.items.length > 0 ? retryResult : result;
+      } catch (error) {
+        const detail = this.readableErrorMessage(error, 'WebView watched fetch failed');
+        hilog.warn(DIAG_DOMAIN, DIAG_TAG,
+          'Watched session prime failed. Url=%{public}s Cause=%{public}s', url, detail);
+      }
+    }
     return result;
   }
 
@@ -7116,13 +8070,14 @@ struct Index {
   private async loadGalleryListBatch(
     startUrl: string,
     onResult: (result: NativeGalleryListResult, pageIndex: number) => void,
-    shouldContinue: () => boolean
+    shouldContinue: () => boolean,
+    site: string = this.siteMode
   ): Promise<void> {
     const previousUrls: string[] = [];
     let nextUrl = startUrl;
     for (let pageIndex = 0; pageIndex < WATERFALL_BATCH_PAGE_COUNT && nextUrl.length > 0; pageIndex++) {
       try {
-        const result = await this.fetchGalleryListWithTimeout(nextUrl);
+        const result = await this.fetchGalleryListForUrl(nextUrl, site);
         if (!shouldContinue()) {
           return;
         }
@@ -7146,6 +8101,13 @@ struct Index {
   }
 
   private async loadHomeGalleryList(url: string): Promise<void> {
+    const watchedUrl = this.isWatchedGalleryUrl(url);
+    if (watchedUrl) {
+      this.refreshSiteCookieState();
+    }
+    if (watchedUrl && !this.canUseWatchedPage()) {
+      return;
+    }
     if (!this.ensureNativeSiteReady()) {
       this.homeError = this.nativeError;
       return;
@@ -7157,8 +8119,23 @@ struct Index {
     this.homeError = '';
     this.nativeViewMode = 'list';
     try {
+      if (watchedUrl) {
+        await this.loadMyTags();
+        if (loadSerial !== this.homeListLoadSerial) {
+          return;
+        }
+        if (!this.myTagsLoaded) {
+          this.homeError = this.myTagsError.length > 0 ? this.myTagsError : '登录后才能使用关注页。';
+          this.showWatchedLoginPrompt();
+          return;
+        }
+      }
+      let watchedFirstPageEmpty = false;
       await this.loadGalleryListBatch(url, (result: NativeGalleryListResult, pageIndex: number): void => {
         this.applyFavoriteCategoryMetaFromListResult(result);
+        if (watchedUrl && pageIndex === 0 && result.items.length === 0) {
+          watchedFirstPageEmpty = true;
+        }
         if (pageIndex === 0) {
           this.applyHomeGalleryList(result);
         } else {
@@ -7166,6 +8143,20 @@ struct Index {
         }
         this.prefetchGalleryImages(result.items, result.requestUrl);
       }, (): boolean => loadSerial === this.homeListLoadSerial);
+      if (loadSerial === this.homeListLoadSerial && watchedFirstPageEmpty && this.watchedStoredTagNames().length > 0) {
+        await this.loadMyTags(true);
+        if (loadSerial === this.homeListLoadSerial && this.watchedStoredTagNames().length > 0 &&
+          this.homeResults.length === 0 && this.homeError.length === 0) {
+          try {
+            const retryResult = await this.fetchGalleryListForUrl(url);
+            if (loadSerial === this.homeListLoadSerial && retryResult.items.length > 0) {
+              this.applyHomeGalleryList(retryResult);
+              this.prefetchGalleryImages(retryResult.items, retryResult.requestUrl);
+            }
+          } catch (error) {
+          }
+        }
+      }
     } catch (error) {
       if (loadSerial !== this.homeListLoadSerial) {
         return;
@@ -7382,7 +8373,13 @@ struct Index {
   }
 
   private async loadNativeList(url: string): Promise<void> {
+    if (this.isWatchedGalleryUrl(url)) {
+      this.refreshSiteCookieState();
+    }
     if (!this.ensureNativeSiteReady()) {
+      return;
+    }
+    if (this.isWatchedGalleryUrl(url) && !this.canUseWatchedPage()) {
       return;
     }
     this.nativeLoading = true;
@@ -8163,6 +9160,8 @@ struct Index {
     this.searchFilteredCount = this.filterHiddenCount(this.searchRawResults, this.searchResults);
     this.nativeResults = this.applyLocalGalleryFilters(this.nativeRawResults);
     this.nativeFilteredCount = this.filterHiddenCount(this.nativeRawResults, this.nativeResults);
+    this.topListGalleryResults = this.applyLocalGalleryFilters(this.topListGalleryRawResults);
+    this.topListGalleryFilteredCount = this.filterHiddenCount(this.topListGalleryRawResults, this.topListGalleryResults);
   }
 
   private filterStatusText(hiddenCount: number): string {
@@ -10520,6 +11519,9 @@ struct Index {
   }
 
   private openHomePrimaryPage(page: string): void {
+    if (page === HOME_PAGE_WATCHED && !this.canUseWatchedPage()) {
+      return;
+    }
     this.clearMyNavigationPath();
     this.homePage = page;
     this.activeSection = NAV_HOME;
@@ -10529,6 +11531,8 @@ struct Index {
     if (page === HOME_PAGE_TOP) {
       if (!this.topListLoading && this.topListDetail.groups.length === 0 && this.topListError.length === 0) {
         void this.loadTopList();
+      } else {
+        this.loadCurrentTopListGalleryPeriod();
       }
       return;
     }
@@ -10538,8 +11542,12 @@ struct Index {
   }
 
   private openHomeRoute(url: string): void {
+    const targetHomePage = this.resolveHomePageFromUrl(url);
+    if (targetHomePage === HOME_PAGE_WATCHED && !this.canUseWatchedPage()) {
+      return;
+    }
     this.clearMyNavigationPath();
-    this.homePage = this.resolveHomePageFromUrl(url);
+    this.homePage = targetHomePage;
     this.activeSection = NAV_HOME;
     this.myPage = MY_PAGE_MAIN;
     this.myPageTitle = '';
@@ -13185,11 +14193,63 @@ struct Index {
   }
 
   private homeNavigationMenuContent(): HdsNavigationMenuContentOptions {
+    if (this.homePage === HOME_PAGE_WATCHED && !this.hasVisibleNativeSubPage()) {
+      return {
+        value: [
+          {
+            content: {
+              label: '管理关注',
+              icon: this.homeMenuSymbol($r('sys.symbol.plus')),
+              action: (): void => {
+                this.openWatchedTagSheet();
+              }
+            }
+          },
+          {
+            content: {
+              label: '首页',
+              icon: this.homeMenuSymbol($r('sys.symbol.house_fill')),
+              action: () => {
+                this.openHomePrimaryPage(HOME_PAGE_DEFAULT);
+              }
+            }
+          },
+          {
+            content: {
+              label: '热门',
+              icon: this.homeMenuSymbol($r('sys.symbol.flame_fill')),
+              action: () => {
+                this.openHomePrimaryPage(HOME_PAGE_POPULAR);
+              }
+            }
+          },
+          {
+            content: {
+              label: '关注',
+              icon: this.homeMenuSymbol($r('sys.symbol.eye')),
+              action: () => {
+                this.openHomePrimaryPage(HOME_PAGE_WATCHED);
+              }
+            }
+          },
+          {
+            content: {
+              label: '排行榜',
+              icon: this.homeMenuSymbol($r('sys.symbol.star_fill')),
+              action: () => {
+                this.openHomePrimaryPage(HOME_PAGE_TOP);
+              }
+            }
+          }
+        ],
+        maxCount: 2
+      };
+    }
     return {
       value: [
         {
           content: {
-            label: '默认首页',
+            label: '首页',
             icon: this.homeMenuSymbol($r('sys.symbol.house_fill')),
             action: () => {
               this.openHomePrimaryPage(HOME_PAGE_DEFAULT);
@@ -13869,6 +14929,13 @@ struct Index {
     return Math.max(1, this.pageViewportHeight - this.pageContentContainerStartOffset() - this.pageContentEndOffset());
   }
 
+  private watchedTagSheetBodyMinHeight(): number {
+    if (this.pageViewportHeight <= 1) {
+      return 360;
+    }
+    return Math.max(240, Math.floor(this.pageViewportHeight * 0.78) - 84);
+  }
+
   @Builder
   private PageContentStartSpacer(followingGap: number): void {
     if (this.shouldUsePageContentStartSpacer()) {
@@ -13876,6 +14943,13 @@ struct Index {
         .width('100%')
         .height(this.pageContentStartSpacerHeight(followingGap));
     }
+  }
+
+  @Builder
+  private TopListContentStartSpacer(): void {
+    Blank()
+      .width('100%')
+      .height(this.pageContentStartOffset() + TOP_LIST_TITLE_BAR_CLEARANCE);
   }
 
   private pageContentEndOffset(): number {
@@ -13997,6 +15071,28 @@ struct Index {
     }
     const contentHeight = this.waterfallEstimatedContentHeight(items);
     const visibleBottom = this.currentScrollerOffsetY(scroller) + Math.max(1, this.pageViewportHeight);
+    const remaining = Math.max(0, contentHeight - visibleBottom);
+    const remainingRatio = remaining / Math.max(1, contentHeight);
+    return remainingRatio <= WATERFALL_LOAD_REMAINING_RATIO;
+  }
+
+  private topListEntryEstimatedContentHeight(): number {
+    return this.pageContentStartOffset() +
+      TOP_LIST_TITLE_BAR_CLEARANCE +
+      TOP_LIST_ENTRY_STATIC_HEIGHT +
+      this.topListEntryResults.length * TOP_LIST_ENTRY_ROW_ESTIMATED_HEIGHT +
+      this.pageContentEndOffset();
+  }
+
+  private shouldLoadTopListEntryByRemainingContent(): boolean {
+    if (!this.shouldAutoLoadTopListEntryList() ||
+      this.topListEntryLoading ||
+      this.topListEntryNextUrl.length === 0 ||
+      this.topListEntryNextUrl === this.topListEntryListUrl) {
+      return false;
+    }
+    const contentHeight = this.topListEntryEstimatedContentHeight();
+    const visibleBottom = this.currentScrollerOffsetY(this.homeScroller) + Math.max(1, this.pageViewportHeight);
     const remaining = Math.max(0, contentHeight - visibleBottom);
     const remainingRatio = remaining / Math.max(1, contentHeight);
     return remainingRatio <= WATERFALL_LOAD_REMAINING_RATIO;
@@ -14184,8 +15280,33 @@ struct Index {
   private shouldAutoLoadHomeWaterfall(): boolean {
     return this.activeSection === NAV_HOME &&
       this.myPage === MY_PAGE_MAIN &&
+      this.homePage !== HOME_PAGE_TOP &&
       this.nativeViewMode === 'list' &&
       !this.shouldShowNativeRouteLoading() &&
+      this.canUseNativeSite(this.siteMode);
+  }
+
+  private shouldAutoLoadTopListWaterfall(): boolean {
+    return this.activeSection === NAV_HOME &&
+      this.myPage === MY_PAGE_MAIN &&
+      this.homePage === HOME_PAGE_TOP &&
+      this.nativeViewMode === 'list' &&
+      !this.shouldShowNativeRouteLoading() &&
+      this.shouldShowCurrentTopListGalleryWaterfall() &&
+      this.topListGallerySupported &&
+      this.topListGalleryResults.length > 0 &&
+      this.canUseNativeSite(this.siteMode);
+  }
+
+  private shouldAutoLoadTopListEntryList(): boolean {
+    return this.activeSection === NAV_HOME &&
+      this.myPage === MY_PAGE_MAIN &&
+      this.homePage === HOME_PAGE_TOP &&
+      this.nativeViewMode === 'list' &&
+      !this.shouldShowNativeRouteLoading() &&
+      this.shouldShowCurrentTopListEntryList() &&
+      this.topListEntrySupported &&
+      this.topListEntryResults.length > 0 &&
       this.canUseNativeSite(this.siteMode);
   }
 
@@ -14217,6 +15338,23 @@ struct Index {
       this.shouldAutoLoadHomeWaterfall()
     )) {
       void this.loadMoreHomeGalleryList();
+    }
+  }
+
+  private handleTopListScrollProgress(): void {
+    if (this.shouldLoadWaterfallByRemainingContent(
+      this.homeScroller,
+      this.topListGalleryResults,
+      this.topListGalleryLoading,
+      this.topListGalleryListUrl,
+      this.topListGalleryNextUrl,
+      this.shouldAutoLoadTopListWaterfall()
+    )) {
+      void this.loadMoreTopListGalleryList();
+      return;
+    }
+    if (this.shouldLoadTopListEntryByRemainingContent()) {
+      void this.loadMoreTopListEntryList();
     }
   }
 
@@ -14252,6 +15390,19 @@ struct Index {
       return;
     }
     void this.loadMoreHomeGalleryList();
+  }
+
+  private handleTopListScrollEdge(side: Edge): void {
+    if (side !== Edge.Bottom) {
+      return;
+    }
+    if (this.shouldAutoLoadTopListWaterfall()) {
+      void this.loadMoreTopListGalleryList();
+      return;
+    }
+    if (this.shouldAutoLoadTopListEntryList()) {
+      void this.loadMoreTopListEntryList();
+    }
   }
 
   private handleSearchScrollEdge(side: Edge): void {
@@ -14940,6 +16091,7 @@ struct Index {
         nextEnabled: this.homeNextUrl.length > 0 && !this.homeLoading,
         lastEnabled: this.homeLastUrl.length > 0 && !this.homeLoading,
         imageVersion: this.galleryImageCacheVersion,
+        contentWidth: this.waterfallContentWidth(),
         imageUrlForItem: (item: NativeGallerySummary): string => this.galleryImageDisplayUrl(item.thumb),
         categoryColorForItem: (category: string): string => categoryColor(category),
         formatRatingValue: (rating: number): string => formatRating(rating),
@@ -15016,6 +16168,12 @@ struct Index {
   private homeGalleryEmptyText(): string {
     if (this.homeFilteredCount > 0) {
       return '当前页面的画廊已被本地过滤规则隐藏。';
+    }
+    if (this.homePage === HOME_PAGE_WATCHED) {
+      if (this.watchedStoredTagNames().length > 0) {
+        return '服务端关注流暂时没有匹配画廊。点右上角加号管理关注标签。';
+      }
+      return '还没有关注标签。点右上角加号添加关注标签。';
     }
     return HOME_CONTENT_UNAVAILABLE_MESSAGE;
   }
@@ -15160,8 +16318,8 @@ struct Index {
   private HomeSection(): void {
     if (this.homePage === HOME_PAGE_TOP) {
       Scroll(this.currentHomeScroller()) {
-        Column({ space: 12 }) {
-          this.PageContentStartSpacer(12);
+        Column({ space: 0 }) {
+          this.TopListContentStartSpacer();
           if (!this.canUseNativeSite(this.siteMode)) {
             this.NativeGateCard();
           } else if (this.shouldShowNativeRouteLoading()) {
@@ -15177,13 +16335,21 @@ struct Index {
           }
         }
         .width('100%')
+        .constraintSize({ minHeight: this.pageContentBodyMinHeight() })
         .alignItems(HorizontalAlign.Start)
+        .justifyContent(FlexAlign.Start)
         .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
       .layoutWeight(1)
       .width('100%')
       .height('100%')
-      .contentStartOffset(this.pageContentContainerStartOffset())
+      .onDidScroll((_xOffset: number, _yOffset: number, _scrollState: ScrollState) => {
+        this.handleTopListScrollProgress();
+      })
+      .onScrollEdge((side: Edge) => {
+        this.handleTopListScrollEdge(side);
+      })
+      .contentStartOffset(0)
       .contentEndOffset(this.pageContentEndOffset())
       .edgeEffect(EdgeEffect.Spring);
     } else if (this.hasVisibleNativeSubPage()) {
@@ -15881,6 +17047,272 @@ struct Index {
   }
 
   @Builder
+  private WatchedTagSheetTitle(): void {
+    Row({ space: 12 }) {
+      Text('管理关注')
+        .layoutWeight(1)
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#2B2027')
+        .maxLines(1);
+
+      Button('应用')
+        .height(32)
+        .padding({ left: 16, right: 16 })
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.canApplyWatchedTagChanges() ? '#FFFFFF' : '#9A7D8A')
+        .backgroundColor(this.canApplyWatchedTagChanges() ? '#A85474' : '#EEEEEE')
+        .borderRadius(16)
+        .enabled(this.canApplyWatchedTagChanges())
+        .onClick(() => {
+          void this.submitWatchedTagDraft();
+        });
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .alignItems(VerticalAlign.Center);
+  }
+
+  @Builder
+  private WatchedTagSuggestionRow(item: TagTranslationSuggestion): void {
+    Row({ space: 10 }) {
+      Column({ space: 3 }) {
+        Text(item.key)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#2B2027')
+          .maxLines(1);
+        if (item.translation.length > 0) {
+          Text(item.translation)
+            .fontSize(11)
+            .fontColor('#7C6470')
+            .maxLines(1);
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start);
+
+      Text('添加')
+        .fontSize(11)
+        .fontWeight(FontWeight.Medium)
+        .fontColor('#A85474')
+        .padding({ left: 9, right: 9, top: 5, bottom: 5 })
+        .backgroundColor('#F8E4ED')
+        .borderRadius(6);
+    }
+    .width('100%')
+    .padding(10)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(8)
+    .onClick(() => {
+      this.addWatchedTagSuggestion(item);
+    });
+  }
+
+  @Builder
+  private WatchedTagPill(tagName: string, mode: string): void {
+    Row({ space: 6 }) {
+      Text(this.watchedTagDisplayName(tagName))
+        .fontSize(11)
+        .fontColor('#4E3A45')
+        .maxLines(1);
+      if (mode === 'restore') {
+        Text('恢复')
+          .fontSize(10)
+          .fontColor('#A85474')
+          .maxLines(1);
+      } else {
+        Button() {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(12)
+            .fontColor(['#6F5964']);
+        }
+        .width(20)
+        .height(20)
+        .backgroundColor('rgba(43,32,39,0.08)')
+        .borderRadius(10)
+        .onClick(() => {
+          if (mode === 'cancel') {
+            this.removePendingAddedWatchedTag(tagName);
+          } else {
+            this.markWatchedTagDeleted(tagName);
+          }
+        });
+      }
+    }
+    .height(30)
+    .padding({ left: 8, right: mode === 'restore' ? 8 : 5 })
+    .margin({ right: 6, bottom: 6 })
+    .backgroundColor(mode === 'restore' ? '#FFF3F2' : '#F3E3EA')
+    .borderRadius(6)
+    .alignItems(VerticalAlign.Center)
+    .onClick(() => {
+      if (mode === 'restore') {
+        this.restoreWatchedTagDraft(tagName);
+      }
+    });
+  }
+
+  @Builder
+  private WatchedTagGroups(names: string[], mode: string): void {
+    ForEach(this.watchedTagGroupsForNames(names), (group: NativeTagGroup) => {
+      Row({ space: 8 }) {
+        Text(this.watchedTagNamespaceLabel(group.name))
+          .fontSize(12)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#FFFFFF')
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .backgroundColor('#A85474')
+          .borderRadius(6)
+          .maxLines(1);
+        Flex({ wrap: FlexWrap.Wrap }) {
+          ForEach(group.tags, (tag: string) => {
+            this.WatchedTagPill(this.watchedTagName(group.name, tag), mode);
+          }, (tag: string) => `${group.name}:${tag}:${mode}`);
+        }
+        .layoutWeight(1);
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top);
+    }, (group: NativeTagGroup) => `${mode}:${group.name}:${group.tags.join('|')}`);
+  }
+
+  @Builder
+  private WatchedTagSection(title: string, names: string[], mode: string): void {
+    if (names.length > 0) {
+      Column({ space: 8 }) {
+        Text(title)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#2B2027');
+        this.WatchedTagGroups(names, mode);
+      }
+      .width('100%')
+      .padding(12)
+      .backgroundColor('#FFFFFF')
+      .borderRadius(10)
+      .alignItems(HorizontalAlign.Start);
+    }
+  }
+
+  @Builder
+  private WatchedTagInlineSection(title: string, names: string[], mode: string): void {
+    if (names.length > 0) {
+      Column({ space: 8 }) {
+        Text(title)
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#2B2027');
+        this.WatchedTagGroups(names, mode);
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start);
+    }
+  }
+
+  @Builder
+  private WatchedPendingTagSections(): void {
+    ForEach([`${this.watchedTagPendingAdds.join('|')}::${this.watchedTagPendingDeletes.join('|')}`], (_key: string) => {
+      this.WatchedTagInlineSection('本次添加', this.watchedTagPendingAdds, 'cancel');
+      this.WatchedTagInlineSection('本次删除', this.watchedTagPendingDeletes, 'restore');
+    }, (key: string) => `watched-pending:${key}`);
+  }
+
+  @Builder
+  private WatchedTagSheetContent(): void {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column({ space: 10 }) {
+          Row({ space: 8 }) {
+            TextInput({ text: this.watchedTagSearchText, placeholder: '搜索标签，例如 sole female' })
+              .layoutWeight(1)
+              .height(40)
+              .backgroundColor('#F8F8F8')
+              .borderRadius(10)
+              .fontSize(14)
+              .caretColor('#A85474')
+              .onChange((value: string) => {
+                this.setWatchedTagSearchText(value);
+              });
+            Button() {
+              SymbolGlyph($r('sys.symbol.plus'))
+                .fontSize(18)
+                .fontColor(['#FFFFFF']);
+            }
+            .width(40)
+            .height(40)
+            .backgroundColor(this.watchedTagSearchText.trim().length > 0 ? '#A85474' : '#EEEEEE')
+            .borderRadius(20)
+            .enabled(this.watchedTagSearchText.trim().length > 0)
+            .onClick(() => {
+              this.addWatchedTagDraft(this.watchedTagSearchText);
+            });
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center);
+
+          this.WatchedPendingTagSections();
+
+          if (this.watchedTagSuggestions.length > 0) {
+            Column({ space: 4 }) {
+              this.SearchSectionCardHeader('标签联想', `${this.watchedTagSuggestions.length} 条`);
+              ForEach(this.watchedTagSuggestions, (item: TagTranslationSuggestion) => {
+                this.WatchedTagSuggestionRow(item);
+              }, (item: TagTranslationSuggestion) => `watch-suggest:${item.key}`);
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Start);
+          }
+        }
+        .width('100%')
+        .padding(12)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(10)
+        .alignItems(HorizontalAlign.Start);
+
+        if (this.myTagsLoading) {
+          SystemLoadingBlock({
+            message: '正在加载已关注标签...',
+            minHeight: 72
+          });
+        } else if (this.myTagsError.length > 0) {
+          Text(this.myTagsError)
+            .width('100%')
+            .fontSize(13)
+            .fontColor('#B42318')
+            .padding(12)
+            .backgroundColor('#FFF3F2')
+            .borderRadius(8);
+        }
+
+        ForEach([this.watchedCurrentTagNames().join('|')], (_key: string) => {
+          this.WatchedTagSection('已关注 Tag', this.watchedCurrentTagNames(), 'delete');
+        }, (key: string) => `watched-current:${key}`);
+
+        if (this.watchedTagStatus.length > 0) {
+          Text(this.watchedTagStatus)
+            .width('100%')
+            .fontSize(12)
+            .fontColor(this.watchedTagSubmitting ? '#6F5964' : '#B42318')
+            .padding(10)
+            .backgroundColor(this.watchedTagSubmitting ? '#F8F8F8' : '#FFF3F2')
+            .borderRadius(8);
+        }
+      }
+      .width('100%')
+      .constraintSize({ minHeight: this.watchedTagSheetBodyMinHeight() })
+      .padding({ left: 12, right: 12, top: 12, bottom: 24 })
+      .alignItems(HorizontalAlign.Start)
+      .justifyContent(FlexAlign.Start);
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Auto)
+    .edgeEffect(EdgeEffect.Spring);
+  }
+
+  @Builder
   private SearchFilterSheetTitle(): void {
     Row({ space: 12 }) {
       Text('高级筛选')
@@ -16215,14 +17647,6 @@ struct Index {
                 }
                 .width('100%');
 
-                Text(this.buildAdvancedSearchUrl())
-                  .fontSize(11)
-                  .fontColor('#7C6470')
-                  .maxLines(4)
-                  .width('100%')
-                  .padding(10)
-                  .backgroundColor('#FFFFFF')
-                  .borderRadius(10);
               }
               .width('100%')
               .padding(12)
@@ -19379,6 +20803,37 @@ struct Index {
   }
 
   @Builder
+  private TopListLoadingCard(message: string): void {
+    Row({ space: 10 }) {
+      LoadingProgress()
+        .width(22)
+        .height(22);
+      Text(message)
+        .fontSize(13)
+        .fontColor('#6F5964')
+        .maxLines(1)
+        .layoutWeight(1);
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(8)
+    .alignItems(VerticalAlign.Center);
+  }
+
+  @Builder
+  private TopListStatusCard(message: string, isError: boolean = false): void {
+    Text(message)
+      .fontSize(13)
+      .lineHeight(20)
+      .fontColor(isError ? '#B42318' : '#6F5964')
+      .width('100%')
+      .padding(12)
+      .backgroundColor(isError ? '#FFF3F2' : '#FFFFFF')
+      .borderRadius(8);
+  }
+
+  @Builder
   private TopListEntryRow(entry: NativeTopListEntry, index: number): void {
     Row({ space: 10 }) {
       Text(this.topListRankLabel(entry, index))
@@ -19394,7 +20849,7 @@ struct Index {
           .borderRadius(6)
           .clip(true)
           .objectFit(ImageFit.Cover);
-      } else {
+      } else if (entry.gid > 0) {
         Column() {
           Text('无封面')
             .fontSize(10)
@@ -19403,15 +20858,24 @@ struct Index {
         .width(52)
         .height(72)
         .justifyContent(FlexAlign.Center)
-        .backgroundColor('#F3E3EA')
-        .borderRadius(6);
+          .backgroundColor('#F3E3EA')
+          .borderRadius(6);
       }
-      Text(entry.title)
-        .fontSize(14)
-        .lineHeight(20)
-        .fontColor('#2B2027')
-        .maxLines(2)
-        .layoutWeight(1);
+      Column({ space: 4 }) {
+        Text(entry.title)
+          .fontSize(14)
+          .lineHeight(20)
+          .fontColor('#2B2027')
+          .maxLines(2);
+        if (entry.score.length > 0) {
+          Text(entry.score)
+            .fontSize(11)
+            .fontColor('#7C6470')
+            .maxLines(1);
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start);
     }
     .width('100%')
     .padding(10)
@@ -19424,13 +20888,29 @@ struct Index {
   }
 
   @Builder
+  private TopListEntryList(): void {
+    Column({ space: 10 }) {
+      ForEach(this.topListEntryResults, (entry: NativeTopListEntry, index: number) => {
+        this.TopListEntryRow(entry, index);
+      }, (entry: NativeTopListEntry) => `plain-${entry.rank}-${entry.url}-${entry.title}`);
+      if (this.topListEntryError.length > 0) {
+        this.TopListStatusCard(this.topListEntryError, true);
+      }
+      if (this.topListEntryLoading) {
+        this.TopListLoadingCard(this.topListEntryLoadingMessage);
+      } else if (this.topListEntryResults.length === 0 && this.topListEntryError.length === 0) {
+        this.TopListStatusCard('当前时间范围没有排行榜条目。');
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start);
+  }
+
+  @Builder
   private TopListSection(): void {
     Column({ space: 12 }) {
       if (this.topListLoading) {
-        SystemLoadingBlock({
-          message: '正在加载排行榜...',
-          minHeight: 88
-        });
+        this.TopListLoadingCard('正在加载排行榜...');
       } else if (this.topListError.length > 0) {
         Row({ space: 8 }) {
           Text('排行榜')
@@ -19442,7 +20922,7 @@ struct Index {
             .height(28)
             .fontSize(12)
             .fontColor('#2B2027')
-            .backgroundColor('#F8E4ED')
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
             .borderRadius(8)
             .onClick(() => {
               void this.loadTopList();
@@ -19458,9 +20938,7 @@ struct Index {
           .backgroundColor('#FFF3F2')
           .borderRadius(8);
       } else if (this.topListDetail.groups.length === 0) {
-        Text('还没有排行榜数据。')
-          .fontSize(13)
-          .fontColor('#6F5964');
+        this.TopListStatusCard('还没有排行榜数据。');
       } else {
         Row({ space: 8 }) {
           Select(this.topListGroupSelectOptions())
@@ -19469,23 +20947,30 @@ struct Index {
             .height(36)
             .layoutWeight(1)
             .font({ size: 13 })
-            .fontColor('#2B2027')
-            .selectedOptionBgColor('#C86B8C')
+            .fontColor($r('sys.color.font_primary'))
+            .controlSize(ControlSize.SMALL)
             .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-            .selectedOptionFontColor('#FFFFFF')
+            .selectedOptionFontColor($r('sys.color.font_primary'))
             .optionFont({ size: 13 })
-            .optionBgColor('#FFFFFF')
-            .optionFontColor('#2B2027')
-            .backgroundColor('#F8F8F8')
+            .optionFontColor($r('sys.color.font_primary'))
+            .menuBackgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THICK)
+            .menuAlign(MenuAlignType.START, { dx: 0, dy: 8 })
+            .optionWidth(OptionWidthMode.FIT_TRIGGER)
+            .showInSubWindow(true)
+            .showDefaultSelectedIcon(true)
             .borderRadius(8)
             .onSelect((index: number, _value: string) => {
               this.selectTopListGroupByIndex(index);
             });
-          Button('刷新')
+          Button() {
+            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+              .fontSize(18)
+              .fontColor([$r('sys.color.icon_primary')]);
+          }
+            .width(36)
             .height(36)
-            .fontSize(12)
-            .fontColor('#2B2027')
-            .backgroundColor('#F8E4ED')
+            .accessibilityText('刷新排行榜')
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
             .borderRadius(8)
             .onClick(() => {
               void this.loadTopList();
@@ -19493,19 +20978,70 @@ struct Index {
         }
         .width('100%');
 
-        SegmentButton({
-          options: this.topListPeriodSegmentOptions,
-          selectedIndexes: $topListPeriodSelectedIndexes
-        });
+        Column() {
+          SegmentButton({
+            options: this.topListPeriodSegmentOptions,
+            selectedIndexes: $topListPeriodSelectedIndexes,
+            onItemClicked: (index: number): void => {
+              this.topListPeriodSelectedIndexes = [index];
+              this.syncTopListPeriodSelectedIndex();
+              this.loadCurrentTopListGalleryPeriod();
+            }
+          })
+            .width('100%');
+        }
+        .width('100%')
+        .clip(true);
 
-        if (this.currentTopListPeriod().entries.length === 0) {
-          Text('当前时间范围没有排行榜条目。')
-            .fontSize(13)
-            .fontColor('#6F5964')
-            .width('100%')
-            .padding(12)
-            .backgroundColor('#FFFFFF')
-            .borderRadius(8);
+        if (this.shouldShowCurrentTopListGalleryWaterfall()) {
+          this.LocalFilterStatusCard(this.topListGalleryFilteredCount);
+          HomeGalleryPage({
+            items: this.topListGalleryResults,
+            loading: this.topListGalleryLoading,
+            loadingMessage: this.topListGalleryLoadingMessage,
+            error: this.topListGalleryError,
+            emptyText: this.topListGalleryFilteredCount > 0 ? '当前排行榜画廊已被本地过滤规则隐藏。' : '当前排行榜没有画廊。',
+            itemKeyPrefix: this.currentTopListGalleryKeyPrefix(),
+            loadingMinHeight: 48,
+            firstEnabled: this.topListGalleryFirstUrl.length > 0 &&
+              this.topListGalleryFirstUrl !== this.topListGalleryListUrl && !this.topListGalleryLoading,
+            prevEnabled: this.topListGalleryPrevUrl.length > 0 &&
+              this.topListGalleryPrevUrl !== this.topListGalleryListUrl && !this.topListGalleryLoading,
+            nextEnabled: this.topListGalleryNextUrl.length > 0 &&
+              this.topListGalleryNextUrl !== this.topListGalleryListUrl && !this.topListGalleryLoading,
+            lastEnabled: this.topListGalleryLastUrl.length > 0 &&
+              this.topListGalleryLastUrl !== this.topListGalleryListUrl && !this.topListGalleryLoading,
+            imageVersion: this.galleryImageCacheVersion,
+            contentWidth: this.waterfallContentWidth(),
+            imageUrlForItem: (item: NativeGallerySummary): string => this.galleryImageDisplayUrl(item.thumb),
+            categoryColorForItem: (category: string): string => categoryColor(category),
+            formatRatingValue: (rating: number): string => formatRating(rating),
+            transitionIdForItem: (item: NativeGallerySummary): string => this.galleryCoverTransitionIdForSummary(item),
+            rankLabelForItem: (item: NativeGallerySummary, index: number): string =>
+              this.topListRankBadgeLabel(item, index),
+            onOpenItem: (item: NativeGallerySummary): void => {
+              void this.openNativeDetail(item);
+            },
+            onFirst: (): void => {
+              void this.loadTopListGalleryList(this.topListGalleryFirstUrl, this.topListGalleryActiveKey);
+            },
+            onPrev: (): void => {
+              void this.loadTopListGalleryList(this.topListGalleryPrevUrl, this.topListGalleryActiveKey);
+            },
+            onNext: (): void => {
+              void this.loadMoreTopListGalleryList();
+            },
+            onLast: (): void => {
+              void this.loadTopListGalleryList(this.topListGalleryLastUrl, this.topListGalleryActiveKey);
+            }
+          });
+        } else if (this.shouldShowCurrentTopListEntryList()) {
+          this.TopListEntryList();
+        } else if ((this.topListGalleryLoading || this.topListEntryLoading) &&
+          this.currentTopListPeriod().entries.length === 0) {
+          this.TopListLoadingCard('正在加载排行榜...');
+        } else if (this.currentTopListPeriod().entries.length === 0) {
+          this.TopListStatusCard('当前时间范围没有排行榜条目。');
         } else {
           Column({ space: 10 }) {
             ForEach(this.currentTopListPeriod().entries, (entry: NativeTopListEntry, index: number) => {
@@ -19983,7 +21519,7 @@ struct Index {
               .fontSize(18)
               .fontWeight(FontWeight.Bold)
               .fontColor('#2B2027');
-            Text('按安卓版 EhFilter 规则隐藏本地列表：标题包含、上传者精确匹配、标签和标签命名空间。')
+            Text('在本地过滤画廊：标题包含、上传者精确匹配、标签和标签命名空间。')
               .fontSize(12)
               .lineHeight(18)
               .fontColor('#7C6470');
@@ -20555,6 +22091,29 @@ struct Index {
   }
 
   @Builder
+  private WatchedProbeWebSection(): void {
+    Web({
+      src: this.watchedProbeUrl,
+      controller: this.watchedProbeController,
+      incognitoMode: false
+    })
+      .width(1)
+      .height(1)
+      .opacity(0)
+      .hitTestBehavior(HitTestMode.None)
+      .javaScriptAccess(true)
+      .domStorageAccess(true)
+      .databaseAccess(true)
+      .cacheMode(CacheMode.Default)
+      .onControllerAttached(() => {
+        this.configureWebControllerForEh(this.watchedProbeController);
+      })
+      .onPageEnd((event: OnPageEndEvent) => {
+        this.onWatchedProbePageEnd(event.url);
+      });
+  }
+
+  @Builder
   private CurrentPrimarySection(): void {
     if (this.activeSection === NAV_HOME) {
       this.HomeSection();
@@ -20653,6 +22212,16 @@ struct Index {
             .titleBar(this.currentTitleBarOptions())
             .hideBackButton(!this.shouldShowNativeTitleBarBack())
             .titleMode(this.currentTitleMode())
+            .bindSheet($$this.watchedTagSheetVisible, this.WatchedTagSheetContent(), {
+              mode: SheetMode.OVERLAY,
+              height: '78%',
+              dragBar: true,
+              showClose: true,
+              preferType: SheetType.BOTTOM,
+              title: (): void => {
+                this.WatchedTagSheetTitle();
+              }
+            })
             .bindToScrollable(this.activeNavigationScrollers());
           }
         }
@@ -20661,6 +22230,10 @@ struct Index {
         .padding({ left: 0, right: 0, top: 0, bottom: 0 })
         .backgroundColor('#FFFFFF')
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]);
+      }
+
+      if (this.isReady && this.watchedProbeUrl.length > 0) {
+        this.WatchedProbeWebSection();
       }
 
       if (this.shouldShowLoginGate()) {

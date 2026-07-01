@@ -223,11 +223,21 @@ export interface NativeGalleryImagePage {
 
 export interface NativeTopListEntry {
   rank: string;
+  score: string;
   title: string;
   url: string;
   gid: number;
   token: string;
   thumb: string;
+}
+
+export interface NativeTopListEntryPageResult {
+  items: NativeTopListEntry[];
+  requestUrl: string;
+  firstUrl: string;
+  prevUrl: string;
+  nextUrl: string;
+  lastUrl: string;
 }
 
 export interface NativeTopListPeriod {
@@ -422,7 +432,15 @@ interface ParsedListShell {
   favoriteSlots: NativeFavoriteSlot[];
 }
 
+interface ParsedPagerLink {
+  label: string;
+  url: string;
+  selected: boolean;
+}
+
 const DETAIL_LINK_PATTERN: RegExp = /href=["']([^"']*\/(?:g|mpv)\/(\d+)\/([0-9a-f]{10})[^"']*)["']/gi;
+const GALLERY_QUERY_IDENTITY_PATTERN: RegExp =
+  /(?:[?&]|&amp;)gid=(\d+)(?:&amp;|&)t=([0-9a-f]{10})(?=[^0-9a-f]|$)/gi;
 const RESULT_COUNT_PATTERN: RegExp = /Found\s+(.+?)\s+results/i;
 const PREVIEW_LINK_PATTERN: RegExp =
   /<a[^>]+href=["']([^"']*\/s\/[0-9a-f]{10}\/\d+-\d+[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -788,6 +806,68 @@ function findAnchorById(html: string, id: string, site: string): string {
   return '';
 }
 
+function parsePagerLinks(html: string, site: string): ParsedPagerLink[] {
+  const tableMatch = /<table[^>]+class=["'][^"']*pt[bt][^"']*["'][^>]*>([\s\S]*?)<\/table>/i.exec(html);
+  if (!tableMatch || !tableMatch[1]) {
+    return [];
+  }
+  const links: ParsedPagerLink[] = [];
+  const cellPattern: RegExp = /<td([^>]*)>([\s\S]*?)<\/td>/gi;
+  let cellMatch: RegExpExecArray | null = cellPattern.exec(tableMatch[1]);
+  while (cellMatch !== null) {
+    const attributes = cellMatch[1] || '';
+    const body = cellMatch[2] || '';
+    const hrefMatch = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i.exec(body);
+    if (hrefMatch && hrefMatch[1]) {
+      links.push({
+        label: stripTags(hrefMatch[2] || ''),
+        url: EhUrl.normalize(site, hrefMatch[1]),
+        selected: attributes.indexOf('ptds') >= 0
+      });
+    }
+    cellMatch = cellPattern.exec(tableMatch[1]);
+  }
+  return links;
+}
+
+function numericPagerLabel(value: string): number {
+  const numeric = Number(value.replace(/[^0-9]/g, ''));
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function findPagerUrl(html: string, site: string, target: string): string {
+  const links = parsePagerLinks(html, site);
+  if (links.length === 0) {
+    return '';
+  }
+  if (target === 'next' || target === 'prev') {
+    const targetLabel = target === 'next' ? '>' : '<';
+    for (const link of links) {
+      if (link.label === targetLabel) {
+        return link.url;
+      }
+    }
+    const selectedIndex = links.findIndex((link: ParsedPagerLink): boolean => link.selected);
+    const adjacentIndex = target === 'next' ? selectedIndex + 1 : selectedIndex - 1;
+    if (selectedIndex >= 0 && adjacentIndex >= 0 && adjacentIndex < links.length) {
+      return links[adjacentIndex].url;
+    }
+    return '';
+  }
+
+  let selectedUrl = '';
+  for (const link of links) {
+    if (numericPagerLabel(link.label) <= 0) {
+      continue;
+    }
+    selectedUrl = link.url;
+    if (target === 'first') {
+      return selectedUrl;
+    }
+  }
+  return target === 'last' ? selectedUrl : '';
+}
+
 function hasClassToken(classValue: string, token: string): boolean {
   return classValue
     .split(/\s+/)
@@ -893,34 +973,56 @@ function parseFavoriteSlots(html: string): NativeFavoriteSlot[] {
   return slots;
 }
 
+function appendGalleryIdentity(
+  identities: NativeGalleryIdentity[],
+  seenKeys: string[],
+  site: string,
+  gidValue: string,
+  tokenValue: string,
+  detailUrl: string = ''
+): void {
+  const gid = Number(gidValue);
+  const token = tokenValue.toLowerCase();
+  const key = `${gid}:${token}`;
+  if (!Number.isFinite(gid) || gid <= 0 || token.length === 0 || seenKeys.indexOf(key) >= 0) {
+    return;
+  }
+  seenKeys.push(key);
+  identities.push({
+    gid,
+    token,
+    detailUrl: detailUrl.length > 0 ? EhUrl.normalize(site, detailUrl) : EhUrl.galleryDetail(site, gid, token)
+  });
+}
+
 function parseGalleryListShell(html: string, site: string): ParsedListShell {
   const identities: NativeGalleryIdentity[] = [];
   const seenKeys: string[] = [];
   DETAIL_LINK_PATTERN.lastIndex = 0;
   let match: RegExpExecArray | null = DETAIL_LINK_PATTERN.exec(html);
   while (match !== null) {
-    const gid = Number(match[2]);
-    const token = match[3];
-    const key = `${gid}:${token}`;
-    if (Number.isFinite(gid) && seenKeys.indexOf(key) < 0) {
-      seenKeys.push(key);
-      identities.push({
-        gid,
-        token,
-        detailUrl: EhUrl.normalize(site, match[1])
-      });
-    }
+    appendGalleryIdentity(identities, seenKeys, site, match[2] || '', match[3] || '', match[1] || '');
     match = DETAIL_LINK_PATTERN.exec(html);
+  }
+  GALLERY_QUERY_IDENTITY_PATTERN.lastIndex = 0;
+  let queryMatch: RegExpExecArray | null = GALLERY_QUERY_IDENTITY_PATTERN.exec(html);
+  while (queryMatch !== null) {
+    appendGalleryIdentity(identities, seenKeys, site, queryMatch[1] || '', queryMatch[2] || '');
+    queryMatch = GALLERY_QUERY_IDENTITY_PATTERN.exec(html);
   }
 
   const resultCountMatch = RESULT_COUNT_PATTERN.exec(html);
+  const firstUrl = findAnchorById(html, 'uFirst', site);
+  const prevUrl = findAnchorById(html, 'uprev', site);
+  const nextUrl = findAnchorById(html, 'unext', site);
+  const lastUrl = findAnchorById(html, 'ulast', site);
   return {
     identities,
     resultCount: resultCountMatch && resultCountMatch[1] ? stripTags(resultCountMatch[1]) : '',
-    firstUrl: findAnchorById(html, 'uFirst', site),
-    prevUrl: findAnchorById(html, 'uprev', site),
-    nextUrl: findAnchorById(html, 'unext', site),
-    lastUrl: findAnchorById(html, 'ulast', site),
+    firstUrl: firstUrl.length > 0 ? firstUrl : findPagerUrl(html, site, 'first'),
+    prevUrl: prevUrl.length > 0 ? prevUrl : findPagerUrl(html, site, 'prev'),
+    nextUrl: nextUrl.length > 0 ? nextUrl : findPagerUrl(html, site, 'next'),
+    lastUrl: lastUrl.length > 0 ? lastUrl : findPagerUrl(html, site, 'last'),
     favoriteSlots: html.indexOf('favorites.php') >= 0 ? parseFavoriteSlots(html) : []
   };
 }
@@ -975,6 +1077,191 @@ function createSummaryFromIdentity(site: string, identity: NativeGalleryIdentity
     simpleLanguage: '',
     detailUrl: identity.detailUrl.length > 0 ? identity.detailUrl : EhUrl.galleryDetail(site, identity.gid, identity.token)
   };
+}
+
+function gallerySummaryKey(gid: number, token: string): string {
+  return `${gid}:${token.toLowerCase()}`;
+}
+
+function findGalleryInlineSegment(html: string, identity: NativeGalleryIdentity): string {
+  const marker = `/${identity.gid}/${identity.token}`;
+  const lowerHtml = html.toLowerCase();
+  const index = lowerHtml.indexOf(marker.toLowerCase());
+  if (index < 0) {
+    return '';
+  }
+  const rowStart = html.lastIndexOf('<tr', index);
+  const rowEnd = html.indexOf('</tr>', index);
+  if (rowStart >= 0 && rowEnd > index) {
+    return html.substring(rowStart, rowEnd + 5);
+  }
+  const itemStart = Math.max(0, html.lastIndexOf('<div', index));
+  const itemEnd = Math.min(html.length, index + 5000);
+  return html.substring(itemStart, itemEnd);
+}
+
+function extractFirstGroup(segment: string, pattern: RegExp): string {
+  const match = pattern.exec(segment);
+  return match && match[1] ? decodeHtml(match[1]).trim() : '';
+}
+
+function extractInlineTitle(segment: string): string {
+  const glink = extractFirstGroup(segment, /<div[^>]+class=["'][^"']*\bglink\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+  if (glink.length > 0) {
+    return stripTags(glink);
+  }
+  const glname = extractFirstGroup(segment, /<div[^>]+class=["'][^"']*\bglname\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+  if (glname.length > 0) {
+    return stripTags(glname);
+  }
+  const anchor = extractFirstGroup(segment, /<a[^>]+href=["'][^"']*\/(?:g|mpv)\/\d+\/[0-9a-f]{10}[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+  return anchor.length > 0 ? stripTags(anchor) : '';
+}
+
+function extractInlineThumb(segment: string): string {
+  const dataSrc = extractFirstGroup(segment, /<img[^>]+data-src=["']([^"']+)["']/i);
+  if (dataSrc.length > 0) {
+    return dataSrc;
+  }
+  const src = extractFirstGroup(segment, /<img[^>]+src=["']([^"']+)["']/i);
+  if (src.length > 0 && src.indexOf('blank.gif') < 0) {
+    return src;
+  }
+  return extractFirstGroup(segment, /background(?:-image)?:\s*url\(["']?([^"')]+)["']?\)/i);
+}
+
+function extractInlineCategory(segment: string): string {
+  const category = extractFirstGroup(segment, /<div[^>]+class=["'][^"']*\bcn\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+  if (category.length > 0) {
+    return stripTags(category);
+  }
+  const knownCategories: string[] = [
+    'Doujinshi', 'Manga', 'Artist CG', 'Game CG', 'Western',
+    'Non-H', 'Image Set', 'Cosplay', 'Asian Porn', 'Misc'
+  ];
+  for (const item of knownCategories) {
+    if (segment.indexOf(`>${item}<`) >= 0 || segment.indexOf(`\t${item}`) >= 0) {
+      return item;
+    }
+  }
+  return '';
+}
+
+function extractInlinePosted(segment: string): string {
+  const match = /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/.exec(stripTags(segment));
+  return match && match[1] ? match[1] : '';
+}
+
+function extractInlineUploader(segment: string): string {
+  const uploader = extractFirstGroup(segment, /<a[^>]+href=["'][^"']*\/uploader\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/i);
+  if (uploader.length > 0) {
+    return stripTags(uploader);
+  }
+  const simple = /<\/a>\s*<\/td>\s*<td[^>]*>([^<]+)<\/td>/i.exec(segment);
+  return simple && simple[1] ? decodeHtml(simple[1]).trim() : '';
+}
+
+function extractInlinePages(segment: string): number {
+  const match = /(\d+)\s+pages?/i.exec(stripTags(segment));
+  if (!match || !match[1]) {
+    return 0;
+  }
+  const pages = Number(match[1]);
+  return Number.isFinite(pages) ? pages : 0;
+}
+
+function extractInlineTags(segment: string): string[] {
+  const tags: string[] = [];
+  const tagPattern: RegExp = /<div[^>]+class=["'][^"']*\bgt\w*\b[^"']*["'][^>]*title=["']([^"']+)["'][^>]*>/gi;
+  let match: RegExpExecArray | null = tagPattern.exec(segment);
+  while (match !== null) {
+    const tag = match[1] ? decodeHtml(match[1]).trim() : '';
+    if (tag.length > 0 && tags.indexOf(tag) < 0) {
+      tags.push(tag);
+    }
+    match = tagPattern.exec(segment);
+  }
+  if (tags.length > 0) {
+    return tags;
+  }
+  const text = stripTags(segment);
+  const textTagPattern: RegExp = /\b(?:f|m|a|c|g|p|l|o|r|x):[a-z0-9][a-z0-9 _-]*/gi;
+  let textMatch: RegExpExecArray | null = textTagPattern.exec(text);
+  while (textMatch !== null) {
+    const tag = textMatch[0] ? textMatch[0].trim() : '';
+    if (tag.length > 0 && tags.indexOf(tag) < 0) {
+      tags.push(tag);
+    }
+    textMatch = textTagPattern.exec(text);
+  }
+  return tags;
+}
+
+function createInlineSummary(site: string, identity: NativeGalleryIdentity, html: string): NativeGallerySummary {
+  const segment = findGalleryInlineSegment(html, identity);
+  if (segment.length === 0) {
+    return createSummaryFromIdentity(site, identity);
+  }
+  const tags = extractInlineTags(segment);
+  const title = extractInlineTitle(segment);
+  return {
+    gid: identity.gid,
+    token: identity.token,
+    title,
+    titleJpn: '',
+    thumb: extractInlineThumb(segment),
+    categoryLabel: extractInlineCategory(segment),
+    posted: extractInlinePosted(segment),
+    uploader: extractInlineUploader(segment),
+    rating: 0,
+    pages: extractInlinePages(segment),
+    simpleTags: tags,
+    simpleLanguage: inferLanguage(tags, title),
+    detailUrl: identity.detailUrl.length > 0 ? identity.detailUrl : EhUrl.galleryDetail(site, identity.gid, identity.token)
+  };
+}
+
+function mergeSummaryWithInline(summary: NativeGallerySummary, fallback: NativeGallerySummary): NativeGallerySummary {
+  return {
+    gid: summary.gid > 0 ? summary.gid : fallback.gid,
+    token: summary.token.length > 0 ? summary.token : fallback.token,
+    title: summary.title.length > 0 ? summary.title : fallback.title,
+    titleJpn: summary.titleJpn.length > 0 ? summary.titleJpn : fallback.titleJpn,
+    thumb: summary.thumb.length > 0 ? summary.thumb : fallback.thumb,
+    categoryLabel: summary.categoryLabel.length > 0 ? summary.categoryLabel : fallback.categoryLabel,
+    posted: summary.posted.length > 0 ? summary.posted : fallback.posted,
+    uploader: summary.uploader.length > 0 ? summary.uploader : fallback.uploader,
+    rating: summary.rating > 0 ? summary.rating : fallback.rating,
+    pages: summary.pages > 0 ? summary.pages : fallback.pages,
+    simpleTags: summary.simpleTags.length > 0 ? summary.simpleTags : fallback.simpleTags,
+    simpleLanguage: summary.simpleLanguage.length > 0 ? summary.simpleLanguage : fallback.simpleLanguage,
+    detailUrl: summary.detailUrl.length > 0 ? summary.detailUrl : fallback.detailUrl
+  };
+}
+
+function findSummaryByIdentity(items: NativeGallerySummary[], identity: NativeGalleryIdentity): NativeGallerySummary | undefined {
+  const key = gallerySummaryKey(identity.gid, identity.token);
+  for (const item of items) {
+    if (gallerySummaryKey(item.gid, item.token) === key) {
+      return item;
+    }
+  }
+  return undefined;
+}
+
+function mergeGalleryListSummaries(
+  site: string,
+  html: string,
+  identities: NativeGalleryIdentity[],
+  apiItems: NativeGallerySummary[]
+): NativeGallerySummary[] {
+  const merged: NativeGallerySummary[] = [];
+  for (const identity of identities) {
+    const inline = createInlineSummary(site, identity, html);
+    const apiItem = findSummaryByIdentity(apiItems, identity);
+    merged.push(apiItem ? mergeSummaryWithInline(apiItem, inline) : inline);
+  }
+  return merged;
 }
 
 function createDetailFromSummary(summary: NativeGallerySummary): NativeGalleryDetail {
@@ -1454,6 +1741,7 @@ function parseTopList(html: string, site: string): NativeTopListDetail {
         const detailMatch = /\/g\/(\d+)\/([0-9a-f]{10})/i.exec(entryUrl);
         entries.push({
           rank: stripTags(rowMatch[1] || ''),
+          score: '',
           title: stripTags(rowMatch[3] || ''),
           url: entryUrl,
           gid: detailMatch && detailMatch[1] ? Number(detailMatch[1]) : 0,
@@ -1484,27 +1772,129 @@ function parseTopList(html: string, site: string): NativeTopListDetail {
   };
 }
 
-function extractInputTag(segment: string, id: string): string {
-  const pattern = new RegExp(`<input[^>]+id=["']${escapeRegex(id)}["'][^>]*>`, 'i');
+function topListRankNumber(value: string): number {
+  const numeric = Number(value.replace(/[^0-9]/g, ''));
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function parseTopListEntryPage(html: string, site: string, requestUrl: string): NativeTopListEntryPageResult {
+  const items: NativeTopListEntry[] = [];
+  const tablePattern: RegExp = /<table([^>]*)>([\s\S]*?)<\/table>/gi;
+  let tableMatch: RegExpExecArray | null = tablePattern.exec(html);
+  while (tableMatch !== null) {
+    const attributes = tableMatch[1] || '';
+    const classMatch = /class=["']([^"']+)["']/i.exec(attributes);
+    const classValue = classMatch && classMatch[1] ? classMatch[1] : '';
+    if (hasClassToken(classValue, 'itg') && !hasClassToken(classValue, 'gltc')) {
+      const tableHtml = tableMatch[2] || '';
+      const entryPattern: RegExp =
+        /<td[^>]+class=["'][^"']*\bdr\b[^"']*["'][^>]*>([\s\S]*?)<\/td>\s*<td[^>]+class=["'][^"']*\bds\b[^"']*["'][^>]*>([\s\S]*?)<\/td>\s*<td[^>]+class=["'][^"']*\bdu\b[^"']*["'][^>]*>([\s\S]*?)<\/td>/gi;
+      let entryMatch: RegExpExecArray | null = entryPattern.exec(tableHtml);
+      while (entryMatch !== null) {
+        const nameHtml = entryMatch[3] || '';
+        const hrefMatch = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i.exec(nameHtml);
+        const entryUrl = hrefMatch && hrefMatch[1] ? EhUrl.normalize(site, hrefMatch[1]) : '';
+        const title = hrefMatch && hrefMatch[2] ? stripTags(hrefMatch[2]) : stripTags(nameHtml);
+        const detailMatch = /\/g\/(\d+)\/([0-9a-f]{10})/i.exec(entryUrl);
+        if (title.length > 0) {
+          items.push({
+            rank: stripTags(entryMatch[1] || ''),
+            score: stripTags(entryMatch[2] || ''),
+            title,
+            url: entryUrl,
+            gid: detailMatch && detailMatch[1] ? Number(detailMatch[1]) : 0,
+            token: detailMatch && detailMatch[2] ? detailMatch[2] : '',
+            thumb: ''
+          });
+        }
+        entryMatch = entryPattern.exec(tableHtml);
+      }
+      break;
+    }
+    tableMatch = tablePattern.exec(html);
+  }
+  items.sort((left: NativeTopListEntry, right: NativeTopListEntry): number =>
+    topListRankNumber(left.rank) - topListRankNumber(right.rank));
+  return {
+    items,
+    requestUrl,
+    firstUrl: findPagerUrl(html, site, 'first'),
+    prevUrl: findPagerUrl(html, site, 'prev'),
+    nextUrl: findPagerUrl(html, site, 'next'),
+    lastUrl: findPagerUrl(html, site, 'last')
+  };
+}
+
+function extractElementStartTagById(segment: string, id: string): string {
+  const pattern = new RegExp(`<[^>]+id\\s*=\\s*["']${escapeRegex(id)}["'][^>]*>`, 'i');
   const match = pattern.exec(segment);
   return match && match[0] ? match[0] : '';
 }
 
-function extractInputAttribute(segment: string, id: string, attribute: string): string {
-  const input = extractInputTag(segment, id);
-  if (input.length === 0) {
+function extractTagAttribute(tag: string, attribute: string): string {
+  if (tag.length === 0) {
     return '';
   }
-  const pattern = new RegExp(`${escapeRegex(attribute)}=["']([^"']*)["']`, 'i');
-  const match = pattern.exec(input);
-  return match && match[1] ? decodeHtml(match[1]) : '';
+  const pattern = new RegExp(`${escapeRegex(attribute)}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, 'i');
+  const match = pattern.exec(tag);
+  return match && match[2] ? decodeHtml(match[2]) : '';
+}
+
+function extractInputTag(segment: string, id: string): string {
+  const tag = extractElementStartTagById(segment, id);
+  return tag.toLowerCase().startsWith('<input') ? tag : '';
+}
+
+function extractInputAttribute(segment: string, id: string, attribute: string): string {
+  return extractTagAttribute(extractInputTag(segment, id), attribute);
+}
+
+function decodeTagHrefName(value: string): string {
+  const normalized = value.replace(/\+/g, ' ');
+  try {
+    return decodeURIComponent(normalized);
+  } catch (error) {
+    return normalized;
+  }
+}
+
+function extractUserTagName(segment: string, id: string): string {
+  const previewTag = extractElementStartTagById(segment, `tagpreview${id}`);
+  const title = extractTagAttribute(previewTag, 'title').trim();
+  if (title.length > 0) {
+    return title;
+  }
+  const hrefMatch = /href\s*=\s*["'][^"']*\/tag\/([^"'?#]+)[^"']*["']/i.exec(segment);
+  return hrefMatch && hrefMatch[1] ? decodeTagHrefName(hrefMatch[1]).trim() : '';
 }
 
 function parseUserTags(html: string): NativeUserTag[] {
+  const lowerHtml = html.toLowerCase();
+  if (lowerHtml.indexOf('bounce_login.php') >= 0 ||
+    lowerHtml.indexOf('name="username"') >= 0 ||
+    lowerHtml.indexOf("name='username'") >= 0 ||
+    lowerHtml.indexOf('name="password"') >= 0 ||
+    lowerHtml.indexOf("name='password'") >= 0 ||
+    lowerHtml.indexOf('ipb_login_form') >= 0 ||
+    lowerHtml.indexOf('ipb_login_submit') >= 0) {
+    throw new Error('登录状态失效，请重新登录或导入 Cookie。');
+  }
+  const errorMatch = /<div\s+class=["']d["'][^>]*>\s*<p>([^<]+)<\/p>/i.exec(html);
+  if (errorMatch && errorMatch[1]) {
+    throw new Error(decodeHtml(errorMatch[1]).trim());
+  }
   const list: NativeUserTag[] = [];
-  const outerMatch = /<div[^>]+id=["']usertags_outer["'][^>]*>([\s\S]*?)(?:<\/form>|<div id=["']footer["']|$)/i.exec(html);
+  const outerMatch = /<div[^>]+id\s*=\s*["']usertags_outer["'][^>]*>([\s\S]*?)(?:<\/form>|<div\s+id\s*=\s*["']footer["']|$)/i.exec(html);
+  if (!outerMatch || !outerMatch[1]) {
+    hilog.warn(DOMAIN, LOG_TAG,
+      'MyTags parse failed. Bytes=%{public}d Login=%{public}s UserTagsOuter=%{public}s',
+      html.length,
+      lowerHtml.indexOf('bounce_login.php') >= 0 || lowerHtml.indexOf('name="username"') >= 0 ? 'yes' : 'no',
+      lowerHtml.indexOf('usertags_outer') >= 0 ? 'yes' : 'no');
+    throw new Error('我的标签页面不可用，请确认已经登录。');
+  }
   const body = outerMatch && outerMatch[1] ? outerMatch[1] : html;
-  const idPattern: RegExp = /id=["']usertag(\d+)["']/gi;
+  const idPattern: RegExp = /id\s*=\s*["']usertag(_?\d+)["']/gi;
   const starts: Array<Array<number | string>> = [];
   let idMatch: RegExpExecArray | null = idPattern.exec(body);
   while (idMatch !== null) {
@@ -1516,11 +1906,16 @@ function parseUserTags(html: string): NativeUserTag[] {
   for (let index = 0; index < starts.length; index++) {
     const start = Number(starts[index][0]);
     const id = `${starts[index][1]}`;
+    const numericId = id.replace(/^_/, '');
+    if (numericId === '0') {
+      continue;
+    }
     const end = index + 1 < starts.length ? Number(starts[index + 1][0]) : body.length;
     const segment = body.substring(start, end);
-    const previewPattern = new RegExp(`id=["']tagpreview${escapeRegex(id)}["'][^>]*title=["']([^"']*)["']`, 'i');
-    const previewMatch = previewPattern.exec(segment);
-    const tagName = previewMatch && previewMatch[1] ? decodeHtml(previewMatch[1]) : stripTags(segment);
+    const tagName = extractUserTagName(segment, id);
+    if (tagName.length === 0) {
+      continue;
+    }
     const weightValue = Number(extractInputAttribute(segment, `tagweight${id}`, 'value'));
     list.push({
       id: `usertag${id}`,
@@ -1531,7 +1926,8 @@ function parseUserTags(html: string): NativeUserTag[] {
       hidden: extractInputTag(segment, `taghide${id}`).toLowerCase().indexOf('checked') >= 0
     });
   }
-  return list.filter((item: NativeUserTag) => item.tagName.length > 0);
+  const result = list.filter((item: NativeUserTag) => item.tagName.length > 0);
+  return result;
 }
 
 function parsePageIndexFromUrl(pageUrl: string): number {
@@ -2292,7 +2688,8 @@ export class NativeEhClient {
     'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36';
   private static readonly REQUEST_USER_AGENT: string =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
-  private static readonly REQUEST_ACCEPT: string = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
+  private static readonly REQUEST_ACCEPT: string =
+    'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
   private static readonly REQUEST_ACCEPT_LANGUAGE: string = 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7';
   private static stableCookieHeader: string = '';
 
@@ -2466,10 +2863,11 @@ export class NativeEhClient {
       const response = await request.request(url, options);
       NativeEhClient.captureResponseCookies(url, response);
       const code = Number(response.responseCode);
+      const text = typeof response.result === 'string' ? response.result : '';
       if (code < 200 || code >= 400) {
         throw new Error(`HTTP ${code}`);
       }
-      return typeof response.result === 'string' ? response.result : '';
+      return text;
     } catch (error) {
       const message = nativeRequestErrorMessage(error, 'Network request failed');
       hilog.error(DOMAIN, LOG_TAG, 'Native text request failed. Url=%{public}s Cause=%{public}s', url, message);
@@ -2484,6 +2882,15 @@ export class NativeEhClient {
     site: string,
     referer: string,
     values: NativeFormField[]
+  ): Promise<string> {
+    return NativeEhClient.requestRawFormUrlEncoded(url, site, referer, formUrlEncode(values));
+  }
+
+  private static async requestRawFormUrlEncoded(
+    url: string,
+    site: string,
+    referer: string,
+    body: string
   ): Promise<string> {
     const request = http.createHttp();
     const headers: Record<string, string> = {
@@ -2511,7 +2918,7 @@ export class NativeEhClient {
         readTimeout: 30000,
         connectTimeout: 12000,
         header: headers,
-        extraData: formUrlEncode(values)
+        extraData: body
       });
       NativeEhClient.captureResponseCookies(url, response);
       const code = Number(response.responseCode);
@@ -2727,7 +3134,9 @@ export class NativeEhClient {
     const shell = parseGalleryListShell(html, site);
     if (shell.identities.length === 0) {
       const lowerHtml = html.toLowerCase();
-      if (lowerHtml.indexOf('no hits found') >= 0 || lowerHtml.indexOf('no unfiltered results') >= 0) {
+      if (lowerHtml.indexOf('no hits found') >= 0 ||
+        lowerHtml.indexOf('no unfiltered results') >= 0 ||
+        lowerHtml.indexOf('you do not have any watched tags') >= 0) {
         return {
           items: [],
           requestUrl,
@@ -2753,12 +3162,9 @@ export class NativeEhClient {
       const chunk = shell.identities.slice(index, index + chunkSize);
       try {
         const partial = await NativeEhClient.requestApiBatch(site, chunk, requestUrl);
-        items.push(...partial);
+        items.push(...mergeGalleryListSummaries(site, html, chunk, partial));
       } catch (error) {
-        for (const identity of chunk) {
-          items.push(createSummaryFromIdentity(site, identity));
-        }
-        break;
+        items.push(...mergeGalleryListSummaries(site, html, chunk, []));
       }
     }
     return {
@@ -2802,6 +3208,20 @@ export class NativeEhClient {
     return detail;
   }
 
+  public static async fetchTopListEntryPage(requestUrl: string): Promise<NativeTopListEntryPageResult> {
+    const html = await NativeEhClient.requestText(
+      requestUrl,
+      GallerySite.E,
+      http.RequestMethod.GET,
+      EhUrl.topList()
+    );
+    const result = parseTopListEntryPage(html, GallerySite.E, requestUrl);
+    if (result.items.length === 0) {
+      throw new Error('No plain toplist entries were parsed from this page.');
+    }
+    return result;
+  }
+
   public static async fetchUserTags(site: string): Promise<NativeUserTag[]> {
     const requestUrl = EhUrl.myTags(site);
     const html = await NativeEhClient.requestText(
@@ -2812,6 +3232,68 @@ export class NativeEhClient {
     );
     const tags = parseUserTags(html);
     return tags;
+  }
+
+  private static userTagNumericId(item: NativeUserTag): string {
+    const match = /(\d+)$/.exec(item.id);
+    return match && match[1] ? match[1] : '';
+  }
+
+  public static async addWatchedTag(site: string, tagName: string): Promise<NativeUserTag[]> {
+    const requestUrl = EhUrl.myTags(site);
+    const body = `usertag_action=add&tagname_new=${tagName}` +
+      '&tagwatch_new=on&tagcolor_new=&tagweight_new=10&usertag_target=0';
+    const html = await NativeEhClient.requestRawFormUrlEncoded(
+      requestUrl,
+      site,
+      requestUrl,
+      body
+    );
+    return parseUserTags(html);
+  }
+
+  public static async deleteWatchedTag(site: string, item: NativeUserTag): Promise<NativeUserTag[]> {
+    const targetId = NativeEhClient.userTagNumericId(item);
+    if (targetId.length === 0) {
+      throw new Error('无法识别要删除的关注标签。');
+    }
+    const requestUrl = EhUrl.myTags(site);
+    const body = 'usertag_action=mass&tagname_new=&tagcolor_new=' +
+      `&tagweight_new=${item.tagWeight}&modify_usertags%5B%5D=${targetId}&usertag_target=0`;
+    const html = await NativeEhClient.requestRawFormUrlEncoded(
+      requestUrl,
+      site,
+      requestUrl,
+      body
+    );
+    return parseUserTags(html);
+  }
+
+  public static async submitWatchedTagChanges(
+    site: string,
+    addTagNames: string[],
+    deleteTags: NativeUserTag[]
+  ): Promise<NativeUserTag[]> {
+    const addedKeys: string[] = [];
+    for (const rawName of addTagNames) {
+      const tagName = rawName.trim();
+      const key = tagName.toLowerCase();
+      if (tagName.length === 0 || addedKeys.indexOf(key) >= 0) {
+        continue;
+      }
+      addedKeys.push(key);
+      await NativeEhClient.addWatchedTag(site, tagName);
+    }
+    const deletedKeys: string[] = [];
+    for (const item of deleteTags) {
+      const key = item.tagName.trim().toLowerCase();
+      if (key.length === 0 || deletedKeys.indexOf(key) >= 0) {
+        continue;
+      }
+      deletedKeys.push(key);
+      await NativeEhClient.deleteWatchedTag(site, item);
+    }
+    return NativeEhClient.fetchUserTags(site);
   }
 
   public static async searchByImage(

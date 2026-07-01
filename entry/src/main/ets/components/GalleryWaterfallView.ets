@@ -5,6 +5,7 @@ export type GalleryCategoryColorResolver = (category: string) => string;
 export type GalleryRatingFormatter = (rating: number) => string;
 export type GalleryOpenHandler = (item: NativeGallerySummary) => void;
 export type GalleryTransitionIdResolver = (item: NativeGallerySummary) => string;
+export type GalleryRankLabelResolver = (item: NativeGallerySummary, index: number) => string;
 
 const GALLERY_WATERFALL_MIN_COLUMNS: number = 2;
 const GALLERY_WATERFALL_COLUMN_GAP: number = 10;
@@ -17,6 +18,7 @@ export struct GalleryWaterfallView {
   @Prop emptyText: string = '';
   @Prop itemKeyPrefix: string = 'gallery';
   @Prop imageVersion: number = 0;
+  @Prop contentWidth: number = 0;
   @State private containerWidth: number = 0;
   imageUrlForItem: GalleryImageResolver = (item: NativeGallerySummary): string => item.thumb;
   categoryColorForItem: GalleryCategoryColorResolver = (_category: string): string => '#607D8B';
@@ -24,6 +26,7 @@ export struct GalleryWaterfallView {
     return rating > 0 ? rating.toFixed(1) : '暂无';
   };
   transitionIdForItem: GalleryTransitionIdResolver = (_item: NativeGallerySummary): string => '';
+  rankLabelForItem: GalleryRankLabelResolver = (_item: NativeGallerySummary, _index: number): string => '';
   onOpenItem: GalleryOpenHandler = (_item: NativeGallerySummary): void => {};
 
   private coverHeight(item: NativeGallerySummary): number {
@@ -68,20 +71,25 @@ export struct GalleryWaterfallView {
     return (width - GALLERY_WATERFALL_COLUMN_GAP * (columns - 1)) / columns;
   }
 
+  private effectiveContainerWidth(): number {
+    return this.contentWidth > 0 ? this.contentWidth : this.containerWidth;
+  }
+
   private columnCount(): number {
-    if (this.containerWidth <= 0) {
+    const width = this.effectiveContainerWidth();
+    if (width <= 0) {
       return GALLERY_WATERFALL_MIN_COLUMNS;
     }
     let bestColumns = GALLERY_WATERFALL_MIN_COLUMNS;
-    let bestDistance = Math.abs(this.itemWidthForColumns(this.containerWidth, bestColumns) -
+    let bestDistance = Math.abs(this.itemWidthForColumns(width, bestColumns) -
       GALLERY_WATERFALL_PREFERRED_ITEM_WIDTH);
     const widestUsefulColumns = Math.max(
       GALLERY_WATERFALL_MIN_COLUMNS,
-      Math.ceil((this.containerWidth + GALLERY_WATERFALL_COLUMN_GAP) /
+      Math.ceil((width + GALLERY_WATERFALL_COLUMN_GAP) /
         (GALLERY_WATERFALL_PREFERRED_ITEM_WIDTH + GALLERY_WATERFALL_COLUMN_GAP)) + 1
     );
     for (let columns = GALLERY_WATERFALL_MIN_COLUMNS + 1; columns <= widestUsefulColumns; columns++) {
-      const distance = Math.abs(this.itemWidthForColumns(this.containerWidth, columns) -
+      const distance = Math.abs(this.itemWidthForColumns(width, columns) -
         GALLERY_WATERFALL_PREFERRED_ITEM_WIDTH);
       if (distance < bestDistance) {
         bestColumns = columns;
@@ -160,66 +168,85 @@ export struct GalleryWaterfallView {
   }
 
   @Builder
-  private GalleryCard(item: NativeGallerySummary): void {
-    Column({ space: 8 }) {
-      this.GalleryCover(item);
+  private GalleryRankBadge(item: NativeGallerySummary, index: number): void {
+    if (this.rankLabelForItem(item, index).length > 0) {
+      Text(this.rankLabelForItem(item, index))
+        .fontSize(11)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#FFFFFF')
+        .padding({ left: 7, right: 7, top: 3, bottom: 3 })
+        .backgroundColor('rgba(43,32,39,0.72)')
+        .borderRadius(8)
+        .margin({ left: 8, top: 8 });
+    }
+  }
 
-      Text(item.title.length > 0 ? item.title : `${item.gid}`)
-        .fontSize(14)
-        .fontWeight(FontWeight.Medium)
-        .fontColor('#2B2027')
-        .maxLines(2);
-      if (item.titleJpn.length > 0 && item.titleJpn !== item.title) {
-        Text(item.titleJpn)
+  @Builder
+  private GalleryCard(item: NativeGallerySummary, index: number): void {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column({ space: 8 }) {
+        this.GalleryCover(item);
+
+        Text(item.title.length > 0 ? item.title : `${item.gid}`)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#2B2027')
+          .maxLines(2);
+        if (item.titleJpn.length > 0 && item.titleJpn !== item.title) {
+          Text(item.titleJpn)
+            .fontSize(11)
+            .fontColor('#7C6470')
+            .maxLines(1);
+        }
+
+        Row({ space: 6 }) {
+          Text(item.categoryLabel.toUpperCase())
+            .fontSize(10)
+            .fontColor('#FFFFFF')
+            .padding({ left: 7, right: 7, top: 3, bottom: 3 })
+            .backgroundColor(this.categoryColorForItem(item.categoryLabel))
+            .borderRadius(9);
+          Text(`${item.pages}P`)
+            .fontSize(11)
+            .fontColor('#7C6470');
+        }
+
+        Text(item.uploader.length > 0 ? item.uploader : '未知上传者')
           .fontSize(11)
           .fontColor('#7C6470')
           .maxLines(1);
-      }
 
-      Row({ space: 6 }) {
-        Text(item.categoryLabel.toUpperCase())
-          .fontSize(10)
-          .fontColor('#FFFFFF')
-          .padding({ left: 7, right: 7, top: 3, bottom: 3 })
-          .backgroundColor(this.categoryColorForItem(item.categoryLabel))
-          .borderRadius(9);
-        Text(`${item.pages}P`)
-          .fontSize(11)
-          .fontColor('#7C6470');
-      }
+        Row({ space: 6 }) {
+          Text(`评分 ${this.formatRatingValue(item.rating)}`)
+            .fontSize(10)
+            .fontColor('#7C6470');
+          Text(item.simpleLanguage.length > 0 ? item.simpleLanguage : '语言未知')
+            .fontSize(10)
+            .fontColor('#9A7D8A')
+            .maxLines(1);
+        }
 
-      Text(item.uploader.length > 0 ? item.uploader : '未知上传者')
-        .fontSize(11)
-        .fontColor('#7C6470')
-        .maxLines(1);
+        if (item.simpleTags.length > 0) {
+          Text(item.simpleTags.slice(0, 4).join('  '))
+            .fontSize(10)
+            .fontColor('#7C6470')
+            .maxLines(2);
+        }
 
-      Row({ space: 6 }) {
-        Text(`评分 ${this.formatRatingValue(item.rating)}`)
-          .fontSize(10)
-          .fontColor('#7C6470');
-        Text(item.simpleLanguage.length > 0 ? item.simpleLanguage : '语言未知')
+        Text(item.posted.length > 0 ? item.posted : '未知日期')
           .fontSize(10)
           .fontColor('#9A7D8A')
           .maxLines(1);
       }
+      .width('100%')
+      .padding(10)
+      .alignItems(HorizontalAlign.Start);
 
-      if (item.simpleTags.length > 0) {
-        Text(item.simpleTags.slice(0, 4).join('  '))
-          .fontSize(10)
-          .fontColor('#7C6470')
-          .maxLines(2);
-      }
-
-      Text(item.posted.length > 0 ? item.posted : '未知日期')
-        .fontSize(10)
-        .fontColor('#9A7D8A')
-        .maxLines(1);
+      this.GalleryRankBadge(item, index);
     }
     .width('100%')
-    .padding(10)
     .backgroundColor('#FFFFFF')
     .borderRadius(8)
-    .alignItems(HorizontalAlign.Start)
     .onClick(() => {
       this.onOpenItem(item);
     });
@@ -236,9 +263,9 @@ export struct GalleryWaterfallView {
         .borderRadius(8);
     } else {
       WaterFlow() {
-        ForEach(this.items, (item: NativeGallerySummary) => {
+        ForEach(this.items, (item: NativeGallerySummary, index: number) => {
           FlowItem() {
-            this.GalleryCard(item);
+            this.GalleryCard(item, index);
           }
           .width('100%');
         }, (item: NativeGallerySummary) => this.itemKey(item));
