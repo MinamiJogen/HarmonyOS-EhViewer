@@ -2,6 +2,9 @@
 
 HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+ 的非官方 E-Hentai / ExHentai 浏览器，使用 ArkTS、ArkUI 原生开发，界面简洁好用，适配多种设备和屏幕比例。
 
+原代码已开源：[HarmonyOS-EhViewer](https://github.com/MinamiJogen/HarmonyOS-EhViewer)
+未签名HAP安装包：[Releases](https://github.com/MinamiJogen/HarmonyOS-EhViewer/releases)
+
 > 项目完全免费，仅供学习交流使用，不提供任何 VPN、代理、网络加速、绕过访问限制或类似服务，请在遵守所在地法律法规与目标站点规则的前提下使用。有问题欢迎在 [Issues](../../issues) 留言。
 
 关键词：HarmonyOS EhViewer、鸿蒙 EhViewer、EhViewer on HamonyOS
