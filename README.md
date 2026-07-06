@@ -1,10 +1,10 @@
-# HarmonyOS-EhViewer / E-Harmony
+# HarmonyOS EhViewer / 鸿蒙 Ehviewer
 
-HarmonyOS-EhViewer（E-Harmony）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+ 的非官方 E-Hentai / ExHentai 浏览器，使用 ArkTS、ArkUI 和 DevEco Studio 原生开发。
+HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+ 的非官方 E-Hentai / ExHentai 浏览器，使用 ArkTS、ArkUI 原生开发，界面简洁好用，适配多种设备和屏幕比例。
 
 > 项目完全免费，仅供学习交流使用，不提供任何 VPN、代理、网络加速、绕过访问限制或类似服务，请在遵守所在地法律法规与目标站点规则的前提下使用。有问题欢迎在 [Issues](../../issues) 留言。
 
-关键词：HarmonyOS EhViewer、鸿蒙 EhViewer、HarmonyOS NEXT 漫画阅读器、ArkTS E-Hentai client、ExHentai viewer。
+关键词：HarmonyOS EhViewer、鸿蒙 EhViewer、EhViewer on HamonyOS
 
 ## 功能
 
@@ -15,7 +15,70 @@ HarmonyOS-EhViewer（E-Harmony）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+
 - 标签翻译、标签搜索与关键词联想
 - 阅读进度记录、继续阅读和重新阅读入口
 - App 锁定、面容/指纹/锁屏密码验证与后台预览保护
-- HarmonyOS 深浅色资源与基础备份配置
+- 深色模式还适配
+
+## 界面展示
+
+界面会根据窗口宽度与设备形态调整布局：手机竖屏优先保证单手浏览与双列信息流；双折叠屏会展开详情、预览、阅读和下载管理空间；三折叠屏与平板等宽屏比例会展示更多列内容，适合横向浏览和快速筛选。
+
+### 手机竖屏
+
+<p align="center">
+  <img src="docs/images/phone-search.jpg" alt="手机竖屏搜索瀑布流" width="30%">
+  <img src="docs/images/phone-filter.jpg" alt="手机竖屏筛选器" width="30%">
+  <img src="docs/images/phone-ranking.jpg" alt="手机竖屏排行榜切换" width="30%">
+</p>
+
+<p align="center">
+  <img src="docs/images/phone-watch-tags.jpg" alt="手机竖屏关注 Tag 管理" width="30%">
+  <img src="docs/images/phone-detail.jpg" alt="手机竖屏详情页" width="30%">
+  <img src="docs/images/phone-continue-reading.jpg" alt="手机竖屏继续阅读入口" width="30%">
+</p>
+
+<p align="center">
+  <img src="docs/images/phone-comments.jpg" alt="手机竖屏评论区" width="30%">
+  <img src="docs/images/phone-downloads.jpg" alt="手机竖屏后台下载" width="30%">
+  <img src="docs/images/phone-settings.jpg" alt="手机竖屏设置页面" width="30%">
+</p>
+
+<p align="center">
+  <sub>搜索、筛选、排行榜、关注 Tag、详情、评论、下载和设置入口会在竖屏宽度下保持紧凑排版。</sub>
+</p>
+
+### 双折叠屏
+
+<p align="center">
+  <img src="docs/images/fold-detail.jpg" alt="双折叠屏详情页" width="45%">
+  <img src="docs/images/fold-preview.jpg" alt="双折叠屏详情预览" width="45%">
+</p>
+
+<p align="center">
+  <img src="docs/images/fold-reader.jpg" alt="双折叠屏阅读器" width="30%">
+  <img src="docs/images/fold-comments.jpg" alt="双折叠屏评论区" width="30%">
+  <img src="docs/images/fold-downloads.jpg" alt="双折叠屏下载管理" width="30%">
+</p>
+
+<p align="center">
+  <sub>宽屏下详情信息、预览列表、阅读区域、评论和下载管理会展开。</sub>
+</p>
+
+### 三折叠屏 / 平板
+
+<p align="center">
+  <img src="docs/images/trifold-search.jpg" alt="三折叠屏和平板搜索瀑布流" width="90%">
+</p>
+
+<p align="center">
+  <img src="docs/images/trifold-detail.jpg" alt="三折叠屏和平板详情页" width="90%">
+</p>
+
+<p align="center">
+  <img src="docs/images/trifold-comments.jpg" alt="三折叠屏和平板评论区" width="90%">
+</p>
+
+<p align="center">
+  <sub>三折叠屏和平板等更宽比例会展示更多内容列，适合横向浏览与快速比较。</sub>
+</p>
 
 ## 更新记录
 
@@ -52,47 +115,6 @@ HarmonyOS-EhViewer（E-Harmony）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+
 - 修复从详情页返回瀑布流时回到顶部，而不是恢复到原位置的问题。
 - 修复详情页点击标签进入搜索后，标签格式与联想标签不一致、高级筛选项不生效的问题。
 - 优化瀑布流分页加载和底部导航区域的滚动留白表现。
-
-## 界面展示
-
-界面会根据窗口宽度与设备形态调整布局：手机竖屏优先保证单手浏览与双列信息流；双折叠屏会展开详情、预览和阅读空间；三折叠屏与平板等宽屏比例会展示更多列内容，适合横向浏览和快速筛选。
-
-### 手机竖屏
-
-<p align="center">
-  <img src="docs/images/phone-search.jpg" alt="手机竖屏搜索结果" width="30%">
-  <img src="docs/images/phone-filter.jpg" alt="手机竖屏高级筛选" width="30%">
-  <img src="docs/images/phone-detail.jpg" alt="手机竖屏详情页" width="30%">
-</p>
-
-<p align="center">
-  <sub>搜索瀑布流、高级筛选和详情操作会在竖屏宽度下保持紧凑排版。</sub>
-</p>
-
-### 双折叠屏
-
-<p align="center">
-  <img src="docs/images/fold-detail.jpg" alt="双折叠屏详情页" width="45%">
-  <img src="docs/images/fold-preview.jpg" alt="双折叠屏预览页" width="45%">
-</p>
-
-<p align="center">
-  <img src="docs/images/fold-reader.jpg" alt="双折叠屏阅读界面" width="45%">
-</p>
-
-<p align="center">
-  <sub>宽屏下详情信息、操作按钮、预览列表和阅读区域会展开，减少来回切换。</sub>
-</p>
-
-### 三折叠屏 / 平板
-
-<p align="center">
-  <img src="docs/images/trifold-search.jpg" alt="三折叠屏和平板搜索结果" width="90%">
-</p>
-
-<p align="center">
-  <sub>三折叠屏和平板等更宽比例会展示更多内容列，适合横向浏览与快速比较。</sub>
-</p>
 
 ## 安装与构建
 
