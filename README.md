@@ -24,21 +24,21 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 ### 手机竖屏
 
 <p align="center">
-  <img src="docs/images/phone-search.jpg" alt="手机竖屏搜索瀑布流" width="30%">
-  <img src="docs/images/phone-filter.jpg" alt="手机竖屏筛选器" width="30%">
-  <img src="docs/images/phone-ranking.jpg" alt="手机竖屏排行榜切换" width="30%">
+  <img src="docs/screenshots/single-search-waterfall.jpg" alt="手机竖屏搜索瀑布流" width="30%">
+  <img src="docs/screenshots/single-filter.jpg" alt="手机竖屏筛选器" width="30%">
+  <img src="docs/screenshots/single-ranking-switch.jpg" alt="手机竖屏排行榜切换" width="30%">
 </p>
 
 <p align="center">
-  <img src="docs/images/phone-watch-tags.jpg" alt="手机竖屏关注 Tag 管理" width="30%">
-  <img src="docs/images/phone-detail.jpg" alt="手机竖屏详情页" width="30%">
-  <img src="docs/images/phone-continue-reading.jpg" alt="手机竖屏继续阅读入口" width="30%">
+  <img src="docs/screenshots/single-watch-tag-manager.jpg" alt="手机竖屏关注 Tag 管理" width="30%">
+  <img src="docs/screenshots/single-detail.jpg" alt="手机竖屏详情页" width="30%">
+  <img src="docs/screenshots/single-detail-continue.jpg" alt="手机竖屏继续阅读入口" width="30%">
 </p>
 
 <p align="center">
-  <img src="docs/images/phone-comments.jpg" alt="手机竖屏评论区" width="30%">
-  <img src="docs/images/phone-downloads.jpg" alt="手机竖屏后台下载" width="30%">
-  <img src="docs/images/phone-settings.jpg" alt="手机竖屏设置页面" width="30%">
+  <img src="docs/screenshots/single-comments.jpg" alt="手机竖屏评论区" width="30%">
+  <img src="docs/screenshots/single-background-download.jpg" alt="手机竖屏后台下载" width="30%">
+  <img src="docs/screenshots/single-settings.jpg" alt="手机竖屏设置页面" width="30%">
 </p>
 
 <p align="center">
@@ -48,14 +48,14 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 ### 双折叠屏
 
 <p align="center">
-  <img src="docs/images/fold-detail.jpg" alt="双折叠屏详情页" width="45%">
-  <img src="docs/images/fold-preview.jpg" alt="双折叠屏详情预览" width="45%">
+  <img src="docs/screenshots/dual-detail.jpg" alt="双折叠屏详情页" width="45%">
+  <img src="docs/screenshots/dual-detail-preview.jpg" alt="双折叠屏详情预览" width="45%">
 </p>
 
 <p align="center">
-  <img src="docs/images/fold-reader.jpg" alt="双折叠屏阅读器" width="30%">
-  <img src="docs/images/fold-comments.jpg" alt="双折叠屏评论区" width="30%">
-  <img src="docs/images/fold-downloads.jpg" alt="双折叠屏下载管理" width="30%">
+  <img src="docs/screenshots/dual-reader.jpg" alt="双折叠屏阅读器" width="30%">
+  <img src="docs/screenshots/dual-comments.jpg" alt="双折叠屏评论区" width="30%">
+  <img src="docs/screenshots/dual-download-manager.jpg" alt="双折叠屏下载管理" width="30%">
 </p>
 
 <p align="center">
@@ -65,15 +65,15 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 ### 三折叠屏 / 平板
 
 <p align="center">
-  <img src="docs/images/trifold-search.jpg" alt="三折叠屏和平板搜索瀑布流" width="90%">
+  <img src="docs/screenshots/wide-search-waterfall.jpg" alt="三折叠屏和平板搜索瀑布流" width="90%">
 </p>
 
 <p align="center">
-  <img src="docs/images/trifold-detail.jpg" alt="三折叠屏和平板详情页" width="90%">
+  <img src="docs/screenshots/wide-detail.jpg" alt="三折叠屏和平板详情页" width="90%">
 </p>
 
 <p align="center">
-  <img src="docs/images/trifold-comments.jpg" alt="三折叠屏和平板评论区" width="90%">
+  <img src="docs/screenshots/wide-comments.jpg" alt="三折叠屏和平板评论区" width="90%">
 </p>
 
 <p align="center">
