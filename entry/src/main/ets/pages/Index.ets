@@ -24,12 +24,14 @@ import {
 import {
   BlurStrategy,
   HdsNavigation,
+  HdsNavigationAttribute,
   HdsNavigationBackButtonItemOptions,
   HdsNavigationIconItemStyle,
   HdsNavigationMenuContentOptions,
   HdsNavigationTitleBarOptions,
   HdsNavigationTitleMode,
   HdsTabs,
+  HdsTabsAttribute,
   IconStyleMode,
   ScrollEffectType,
   TitleBarStyleOptions,
@@ -508,6 +510,7 @@ struct Index {
   private homeListLoadSerial: number = 0;
   private favoriteListLoadSerial: number = 0;
   private searchListLoadSerial: number = 0;
+  private localFilterLoadSerial: number = 0;
   private topListGalleryListLoadSerial: number = 0;
   private topListEntryListLoadSerial: number = 0;
   private homeEndToastKey: string = '';
@@ -550,6 +553,7 @@ struct Index {
   @State private historyItems: HistoryItem[] = [];
   @State private localFavorites: LocalGalleryRecord[] = [];
   @State private filterRules: FilterRule[] = [];
+  @State private filterRulesSaving: boolean = false;
   @State private blacklistItems: BlacklistItem[] = [];
   @State private excludedLanguageTags: string[] = [];
   @State private filterModeDraft: number = FILTER_MODE_TITLE;
@@ -914,6 +918,9 @@ struct Index {
 
   onPageShow(): void {
     this.refreshPrivacySettingsFromStore();
+    if (this.localDao) {
+      void this.reloadLocalGalleryFilters();
+    }
     this.loadReaderProgressSettings();
     this.refreshPersistedCookieState();
     void this.applyReaderWindowState();
@@ -1324,11 +1331,30 @@ struct Index {
       return;
     }
     try {
-      this.filterRules = await this.localDao.loadFilters();
+      await this.reloadLocalGalleryFilters();
       this.blacklistItems = await this.localDao.loadBlacklist();
     } catch (error) {
-      this.filterRules = [];
       this.blacklistItems = [];
+    }
+  }
+
+  private async reloadLocalGalleryFilters(allowWhileSaving: boolean = false): Promise<void> {
+    if (this.filterRulesSaving && !allowWhileSaving) {
+      return;
+    }
+    const loadSerial = ++this.localFilterLoadSerial;
+    try {
+      const rules = this.localDao ? await this.localDao.loadFilters() : this.filterRules;
+      if (loadSerial !== this.localFilterLoadSerial) {
+        return;
+      }
+      // Each routed Index owns its own state. Read persisted rules again when
+      // returning to a page or refreshing, then rebuild from unfiltered items.
+      this.filterRules = rules;
+      this.excludedLanguageTags = parseExcludedLanguageTags(this.readString(EXCLUDED_LANGUAGE_KEY, '[]'));
+      this.refreshVisibleGalleryListsFromRaw();
+    } catch (error) {
+      // Keep the last usable rules if the database is temporarily unavailable.
     }
   }
 
@@ -1344,6 +1370,9 @@ struct Index {
   }
 
   private async addFilterRuleFromDraft(): Promise<void> {
+    if (this.filterRulesSaving) {
+      return;
+    }
     const text = this.filterTextDraft.trim();
     if (text.length === 0) {
       this.toast('过滤文本不能为空');
@@ -1358,6 +1387,8 @@ struct Index {
       this.toast('过滤规则已存在');
       return;
     }
+    this.filterRulesSaving = true;
+    this.localFilterLoadSerial++;
     try {
       await this.localDao.insertFilter({
         id: 0,
@@ -1366,29 +1397,37 @@ struct Index {
         enabled: true
       });
       this.setFilterTextDraft('');
-      await this.loadLocalFilterData();
-      this.refreshVisibleGalleryListsFromRaw();
+      await this.reloadLocalGalleryFilters(true);
       this.toast('过滤规则已添加');
     } catch (error) {
       this.toast('过滤规则保存失败');
+    } finally {
+      this.filterRulesSaving = false;
     }
   }
 
-  private async toggleFilterRule(rule: FilterRule): Promise<void> {
-    if (!this.localDao || rule.id <= 0) {
+  private async setFilterRuleEnabled(rule: FilterRule, enabled: boolean): Promise<void> {
+    if (!this.localDao || rule.id <= 0 || this.filterRulesSaving) {
       return;
     }
-    const targetEnabled = !rule.enabled;
-    this.updateFilterRuleEnabledInState(rule.id, targetEnabled);
+    const currentRule = this.filterRules.find((item: FilterRule) => item.id === rule.id);
+    if (!currentRule || currentRule.enabled === enabled) {
+      return;
+    }
+    const previousEnabled = currentRule.enabled;
+    this.filterRulesSaving = true;
+    // Discard an older in-flight read before optimistically changing the rule.
+    this.localFilterLoadSerial++;
+    this.updateFilterRuleEnabledInState(rule.id, enabled);
     this.refreshVisibleGalleryListsFromRaw();
     try {
-      await this.localDao.updateFilterEnabled(rule.id, targetEnabled);
-      await this.loadLocalFilterData();
-      this.refreshVisibleGalleryListsFromRaw();
+      await this.localDao.updateFilterEnabled(rule.id, enabled);
     } catch (error) {
-      this.updateFilterRuleEnabledInState(rule.id, rule.enabled);
+      this.updateFilterRuleEnabledInState(rule.id, previousEnabled);
       this.refreshVisibleGalleryListsFromRaw();
       this.toast('过滤规则更新失败');
+    } finally {
+      this.filterRulesSaving = false;
     }
   }
 
@@ -1407,16 +1446,20 @@ struct Index {
   }
 
   private async deleteFilterRule(rule: FilterRule): Promise<void> {
-    if (!this.localDao || rule.id <= 0) {
+    if (!this.localDao || rule.id <= 0 || this.filterRulesSaving) {
       return;
     }
+    this.filterRulesSaving = true;
+    this.localFilterLoadSerial++;
     try {
       await this.localDao.deleteFilter(rule.id);
-      await this.loadLocalFilterData();
+      this.filterRules = this.filterRules.filter((item: FilterRule) => item.id !== rule.id);
       this.refreshVisibleGalleryListsFromRaw();
       this.toast('过滤规则已删除');
     } catch (error) {
       this.toast('过滤规则删除失败');
+    } finally {
+      this.filterRulesSaving = false;
     }
   }
 
@@ -7094,6 +7137,7 @@ struct Index {
     this.imageSearchLoading = true;
     this.imageSearchError = '';
     try {
+      await this.reloadLocalGalleryFilters();
       const result = await NativeEhClient.searchByImage(
         this.siteMode,
         filePath,
@@ -7171,10 +7215,19 @@ struct Index {
     this.updateSearchSuggestions();
   }
 
-  private setNativeQueryFromSearchInput(value: string): void {
-    if (this.searchInputFocused) {
-      this.searchSuggestionsVisible = true;
+  private setNativeQueryFromSearchInput(value: string, previewText?: PreviewText): void {
+    // A bound value restored by navigation or a suggestion can be echoed by
+    // Search. Ignore that echo, but keep IME preview edits as user interaction.
+    const hasPreviewInput = previewText !== undefined && previewText.value.length > 0;
+    if (value === this.nativeQuery && !hasPreviewInput) {
+      return;
     }
+    // Text editing (including IME updates, paste and clear) is an explicit input
+    // interaction even when a previous blur/scroll cleared our overlay state.
+    // Invalidate the pending blur before it can dismiss this new edit session.
+    this.cancelSearchInputBlurTimer();
+    this.searchInputFocused = true;
+    this.searchSuggestionsVisible = true;
     this.setNativeQuery(value);
   }
 
@@ -8073,6 +8126,10 @@ struct Index {
     shouldContinue: () => boolean,
     site: string = this.siteMode
   ): Promise<void> {
+    await this.reloadLocalGalleryFilters();
+    if (!shouldContinue()) {
+      return;
+    }
     const previousUrls: string[] = [];
     let nextUrl = startUrl;
     for (let pageIndex = 0; pageIndex < WATERFALL_BATCH_PAGE_COUNT && nextUrl.length > 0; pageIndex++) {
@@ -8387,6 +8444,7 @@ struct Index {
     this.nativeError = '';
     this.nativeViewMode = 'list';
     try {
+      await this.reloadLocalGalleryFilters();
       const result = await NativeEhClient.fetchGalleryList(this.siteMode, url);
       this.nativeRawResults = result.items;
       this.nativeResults = this.applyLocalGalleryFilters(this.nativeRawResults);
@@ -8439,6 +8497,7 @@ struct Index {
     if (this.favoriteListFilter === FAVORITE_FILTER_LOCAL) {
       this.isFavoriteRefreshing = true;
       try {
+        await this.reloadLocalGalleryFilters();
         this.loadLocalFavoriteGalleryList();
       } finally {
         this.isFavoriteRefreshing = false;
@@ -8447,6 +8506,7 @@ struct Index {
     }
     if (!this.canUseFavoriteFilter(this.favoriteListFilter)) {
       this.favoriteListFilter = FAVORITE_FILTER_LOCAL;
+      await this.reloadLocalGalleryFilters();
       this.loadLocalFavoriteGalleryList();
       this.isFavoriteRefreshing = false;
       return;
@@ -15358,8 +15418,12 @@ struct Index {
     }
   }
 
-  private handleSearchScrollProgress(): void {
-    this.hideSearchSuggestionOverlay();
+  private handleSearchScrollProgress(yOffset: number, scrollState: ScrollState): void {
+    // Keyboard avoidance and layout corrections also report onDidScroll. Only
+    // a direct scroll gesture should dismiss an active input's suggestions.
+    if (yOffset !== 0 && scrollState === ScrollState.Scroll) {
+      this.hideSearchSuggestionOverlay();
+    }
     if (this.shouldLoadWaterfallByRemainingContent(
       this.searchScroller,
       this.searchResults,
@@ -16511,22 +16575,20 @@ struct Index {
     Row({ space: 10 }) {
       Column({ space: 3 }) {
         Text(item.key)
-          .fontSize(14)
+          .fontSize(15)
           .fontWeight(FontWeight.Medium)
-          .fontColor('#2B2027')
-          .maxLines(1);
+          .fontColor($r('sys.color.font_primary'));
         if (item.translation.length > 0) {
           Text(item.translation)
-            .fontSize(11)
-            .fontColor('#7C6470')
-            .maxLines(1);
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
         }
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start);
 
       Text('过滤')
-        .fontSize(11)
+        .fontSize(13)
         .fontWeight(FontWeight.Medium)
         .fontColor('#A85474')
         .padding({ left: 9, right: 9, top: 5, bottom: 5 })
@@ -16534,9 +16596,12 @@ struct Index {
         .borderRadius(6);
     }
     .width('100%')
-    .padding(10)
-    .backgroundColor('#FFFFFF')
+    .constraintSize({ minHeight: 56 })
+    .padding(12)
+    .backgroundColor($r('sys.color.comp_background_primary'))
     .borderRadius(8)
+    .focusable(true)
+    .accessibilityText(`过滤标签 ${item.key} ${item.translation}`)
     .onClick(() => {
       this.applyFilterTagSuggestion(item);
     });
@@ -16607,8 +16672,8 @@ struct Index {
         this.handleSearchInputUserInteraction();
       }
     })
-    .onChange((value: string) => {
-      this.setNativeQueryFromSearchInput(value);
+    .onChange((value: string, previewText?: PreviewText) => {
+      this.setNativeQueryFromSearchInput(value, previewText);
     })
     .onSubmit((value: string) => {
       this.setNativeQuery(value);
@@ -17722,8 +17787,8 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
         .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
       }
-      .onDidScroll((_xOffset: number, _yOffset: number, _scrollState: ScrollState) => {
-        this.handleSearchScrollProgress();
+      .onDidScroll((_xOffset: number, yOffset: number, scrollState: ScrollState) => {
+        this.handleSearchScrollProgress(yOffset, scrollState);
       })
       .onDisAppear(() => {
         this.searchFilterSheetVisible = false;
@@ -20295,7 +20360,7 @@ struct Index {
 
   @Builder
   private DownloadQueueSection(): void {
-    if (this.shouldShowDownloadStateLoading()) {
+    if (this.effectiveDownloadViewMode() !== DOWNLOAD_VIEW_ACTIVE && this.shouldShowDownloadStateLoading()) {
       SystemLoadingBlock({
         message: '正在加载下载历史...',
         minHeight: 160
@@ -20304,6 +20369,10 @@ struct Index {
       DownloadQueueView({
         items: this.downloadItemsSource(),
         viewMode: this.effectiveDownloadViewMode(),
+        activeScroller: this.libraryScroller,
+        activeContentStartOffset: this.pageContentStartOffset() + 12,
+        activeContentEndOffset: this.pageContentEndOffset() + 12,
+        activeLoading: this.shouldShowDownloadStateLoading(),
         managerStatus: this.effectiveDownloadManagerStatus(),
         downloadRootText: this.downloadRoot(),
         revision: this.downloadQueueRevision + this.downloadRuntimeRevision,
@@ -20512,109 +20581,156 @@ struct Index {
   }
 
   @Builder
+  private MyPageGroupHeader(title: string, subtitle: string = ''): void {
+    Column({ space: 4 }) {
+      Text(title)
+        .fontSize(14)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.ohos_id_color_text_secondary'));
+      if (subtitle.length > 0) {
+        Text(subtitle)
+          .fontSize(12)
+          .fontColor($r('sys.color.ohos_id_color_text_secondary'));
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: 16, right: 16, top: 8, bottom: 12 });
+  }
+
+  private openBookmarkDestination(url: string, title: string): void {
+    if (url === EhUrl.signIn()) {
+      this.openWebSignIn();
+    } else {
+      this.openEhRouteOrInternalWeb(url, title);
+    }
+  }
+
+  @Builder
   private BookmarkSection(): void {
-    Column({ space: 12 }) {
-      Column({ space: 8 }) {
-        Text('保存的书签')
-          .fontSize(17)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#2B2027');
-        if (this.bookmarks.length === 0) {
+    ListItemGroup({
+      header: this.MyPageGroupHeader('保存的书签', `${this.bookmarks.length} 个书签 · 左滑可移除`),
+      style: ListItemGroupStyle.CARD
+    }) {
+      if (this.bookmarks.length === 0) {
+        ListItem({ style: ListItemStyle.CARD }) {
           Text('还没有保存书签。打开页面后点书签即可保存。')
-            .fontSize(13)
-            .fontColor('#6F5964');
-        } else {
-          ForEach(this.bookmarks, (item: BookmarkItem) => {
+            .fontSize(14)
+            .fontColor($r('sys.color.ohos_id_color_text_secondary'))
+            .width('100%')
+            .padding(16);
+        }
+        .height(undefined);
+      } else {
+        ForEach(this.bookmarks, (item: BookmarkItem) => {
+          ListItem({ style: ListItemStyle.CARD }) {
             Row({ space: 12 }) {
-              Column({ space: 4 }) {
+              SymbolGlyph($r('sys.symbol.star_fill'))
+                .fontSize(22)
+                .fontColor(['#A85474']);
+              Column({ space: 5 }) {
                 Text(item.title)
-                  .fontSize(15)
+                  .fontSize(16)
                   .fontWeight(FontWeight.Medium)
-                  .fontColor('#2B2027')
-                  .maxLines(1);
+                  .fontColor($r('sys.color.ohos_id_color_text_primary'))
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis });
                 Text(item.url)
-                  .fontSize(11)
-                  .fontColor('#7C6470')
-                  .maxLines(1);
+                  .fontSize(12)
+                  .fontColor($r('sys.color.ohos_id_color_text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis });
               }
               .layoutWeight(1)
               .alignItems(HorizontalAlign.Start);
-              Button('打开')
-                .height(28)
-              .backgroundColor('#F8E4ED')
-                .borderRadius(8)
-                .onClick(() => {
-                  if (item.url === EhUrl.signIn()) {
-                    this.openWebSignIn();
-                  } else {
-                    this.openEhRouteOrInternalWeb(item.url, item.title);
-                  }
-                });
-              Button('移除')
-                .height(28)
-                .backgroundColor('#FFF3F2')
-                .fontColor('#B42318')
-                .borderRadius(8)
-                .onClick(() => {
-                  this.removeBookmark(item.url);
-                });
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(14)
+                .fontColor([$r('sys.color.ohos_id_color_text_secondary')]);
             }
             .width('100%')
-            .padding(12)
-            .backgroundColor('#FFFFFF')
-            .borderRadius(8);
-          }, (item: BookmarkItem) => item.url);
-        }
+            .constraintSize({ minHeight: 76 })
+            .padding(16);
+          }
+          .height(undefined)
+          .accessibilityText(`打开书签 ${item.title}`)
+          .onClick(() => {
+            this.openBookmarkDestination(item.url, item.title);
+          })
+          .swipeAction({
+            end: {
+              builder: (): void => {
+                this.BookmarkDeleteAction(item);
+              },
+              actionAreaDistance: 80,
+              onAction: (): void => {
+                this.removeBookmark(item.url);
+              }
+            },
+            edgeEffect: SwipeEdgeEffect.Spring
+          })
+          .bindContextMenu(this.BookmarkContextMenu(item), ResponseType.LongPress);
+        }, (item: BookmarkItem) => item.url);
       }
-      .width('100%')
-      .alignItems(HorizontalAlign.Start);
+    }
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.ohos_id_color_list_separator'), startMargin: 50, endMargin: 16 });
 
-      Column({ space: 8 }) {
-        Text('安卓路由映射')
-          .fontSize(17)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#2B2027');
-        ForEach(this.buildQuickLinks(), (item: QuickLink) => {
+    ListItemGroup({ header: this.MyPageGroupHeader('常用入口'), style: ListItemGroupStyle.CARD }) {
+      ForEach(this.buildQuickLinks(), (item: QuickLink) => {
+        ListItem({ style: ListItemStyle.CARD }) {
           Row({ space: 12 }) {
-            Column({ space: 4 }) {
+            Column({ space: 5 }) {
               Text(item.title)
-                .fontSize(15)
-                .fontWeight(FontWeight.Medium)
-                .fontColor('#2B2027');
+                .fontSize(16)
+                .fontColor($r('sys.color.ohos_id_color_text_primary'));
               Text(item.description)
-                .fontSize(12)
-                .lineHeight(18)
-                .fontColor('#6F5964');
+                .fontSize(13)
+                .fontColor($r('sys.color.ohos_id_color_text_secondary'));
             }
             .layoutWeight(1)
             .alignItems(HorizontalAlign.Start);
-            Button('打开')
-              .height(28)
-              .fontColor('#FFFFFF')
-              .backgroundColor('#C86B8C')
-              .borderRadius(8)
-              .onClick(() => {
-                if (item.url === EhUrl.signIn()) {
-                  this.openWebSignIn();
-                } else {
-                  this.openEhRouteOrInternalWeb(item.url, item.title);
-                }
-              });
+            SymbolGlyph($r('sys.symbol.chevron_right'))
+              .fontSize(14)
+              .fontColor([$r('sys.color.ohos_id_color_text_secondary')]);
           }
           .width('100%')
-          .padding(12)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8);
-        }, (item: QuickLink) => item.url);
-      }
-      .width('100%')
-      .alignItems(HorizontalAlign.Start);
+          .constraintSize({ minHeight: 72 })
+          .padding(16);
+        }
+        .height(undefined)
+        .onClick(() => {
+          this.openBookmarkDestination(item.url, item.title);
+        });
+      }, (item: QuickLink) => item.url);
     }
-    .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .alignItems(HorizontalAlign.Start);
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.ohos_id_color_list_separator'), startMargin: 16, endMargin: 16 });
+  }
+
+  @Builder
+  private BookmarkContextMenu(item: BookmarkItem): void {
+    Menu() {
+      MenuItem({ content: '打开书签' })
+        .onClick(() => {
+          this.openBookmarkDestination(item.url, item.title);
+        });
+      MenuItem({ content: '移除书签' })
+        .onClick(() => {
+          this.removeBookmark(item.url);
+        });
+    }
+  }
+
+  @Builder
+  private BookmarkDeleteAction(item: BookmarkItem): void {
+    Button('移除')
+      .width(80)
+      .constraintSize({ minHeight: 56 })
+      .fontSize(14)
+      .fontColor($r('sys.color.ohos_id_color_text_primary_contrary'))
+      .backgroundColor($r('sys.color.ohos_id_color_warning'))
+      .accessibilityText(`移除书签 ${item.title}`)
+      .onClick(() => {
+        this.removeBookmark(item.url);
+      });
   }
 
   @Builder
@@ -20639,11 +20755,7 @@ struct Index {
           .backgroundColor('#F8E4ED')
           .borderRadius(8)
           .onClick(() => {
-            if (this.favoriteListFilter === FAVORITE_FILTER_LOCAL) {
-              this.loadLocalFavoriteGalleryList();
-            } else {
-              this.loadCurrentLibraryFavoriteList(true);
-            }
+            void this.refreshFavoriteWaterfall();
           });
       }
       .width('100%');
@@ -20727,6 +20839,14 @@ struct Index {
       .height('100%');
     } else if (this.libraryPanel === LIBRARY_HISTORY) {
       this.HistorySection();
+    } else if (this.effectiveDownloadViewMode() === DOWNLOAD_VIEW_ACTIVE) {
+      Column() {
+        this.DownloadQueueSection();
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .height('100%')
+      .backgroundColor($r('sys.color.ohos_id_color_sub_background'));
     } else {
       Scroll(this.libraryScroller) {
         Column({ space: 12 }) {
@@ -20756,49 +20876,63 @@ struct Index {
 
   @Builder
   private SettingsSectionForPage(page: string): void {
-    Scroll(this.settingsScroller) {
-      Column({ space: 10 }) {
-        this.PageContentStartSpacer(10);
-        if (page === MY_PAGE_MY_TAGS) {
-          this.MyTagsSection();
-        } else if (page === MY_PAGE_IMAGE_SEARCH) {
-          this.ImageSearchSection();
-        } else if (page === MY_PAGE_BOOKMARKS) {
-          this.BookmarkSection();
-        } else if (page === MY_PAGE_ACCOUNT) {
-          this.MyAccountCard();
-        } else if (page === MY_PAGE_FILTERS) {
-          this.FilterManagementSection();
-        } else if (page === MY_PAGE_BLACKLIST) {
-          this.BlacklistManagementSection();
-        } else {
-          this.MyAccountCard();
-          PrivacySettingsCard({
-            appLockEnabled: this.currentAppLockEnabled(),
-            appLockAuthInProgress: this.appLockAuthInProgress,
-            appLockStatus: this.appLockStatus,
-            backgroundPreviewProtectionEnabled: this.currentBackgroundPreviewProtectionEnabled(),
-            onAppLockChange: (isOn: boolean): void => {
-              void this.setAppLockEnabled(isOn);
-            },
-            onBackgroundPreviewProtectionChange: (isOn: boolean): void => {
-              this.setBackgroundPreviewProtectionEnabled(isOn);
-            }
-          });
-          this.MyCacheSettingsCard();
-          this.MyDownloadSettingsCard();
-          this.MyLocalAccountCacheSettingsCard();
+    List({ space: 12, scroller: this.settingsScroller }) {
+      if (this.shouldUsePageContentStartSpacer()) {
+        ListItem() {
+          Column() {}
+            .height(this.pageContentStartSpacerHeight(12));
         }
+        .height(this.pageContentStartSpacerHeight(12));
       }
-      .width('100%')
-      .alignItems(HorizontalAlign.Start)
-      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
+      if (page === MY_PAGE_MY_TAGS) {
+        ListItem() {
+          this.MyTagsSection();
+        }
+      } else if (page === MY_PAGE_IMAGE_SEARCH) {
+        ListItem() {
+          this.ImageSearchSection();
+        }
+      } else if (page === MY_PAGE_BOOKMARKS) {
+        this.BookmarkSection();
+      } else if (page === MY_PAGE_ACCOUNT) {
+        this.MyAccountCard();
+      } else if (page === MY_PAGE_FILTERS) {
+        ListItem() {
+          this.FilterManagementSection();
+        }
+      } else if (page === MY_PAGE_BLACKLIST) {
+        ListItem() {
+          this.BlacklistManagementSection();
+        }
+      } else {
+        this.MyAccountCard();
+        PrivacySettingsCard({
+          appLockEnabled: this.currentAppLockEnabled(),
+          appLockAuthInProgress: this.appLockAuthInProgress,
+          appLockStatus: this.appLockStatus,
+          backgroundPreviewProtectionEnabled: this.currentBackgroundPreviewProtectionEnabled(),
+          onAppLockChange: (isOn: boolean): void => {
+            void this.setAppLockEnabled(isOn);
+          },
+          onBackgroundPreviewProtectionChange: (isOn: boolean): void => {
+            this.setBackgroundPreviewProtectionEnabled(isOn);
+          }
+        });
+        this.MyCacheSettingsCard();
+        this.MyDownloadSettingsCard();
+        this.MyLocalAccountCacheSettingsCard();
+      }
     }
     .layoutWeight(1)
     .width('100%')
+    .constraintSize({ maxWidth: 840 })
     .height('100%')
+    .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER })
+    .backgroundColor($r('sys.color.ohos_id_color_sub_background'))
     .contentStartOffset(this.pageContentContainerStartOffset())
     .contentEndOffset(this.pageContentEndOffset())
+    .scrollBar(BarState.Auto)
+    .listDirection(Axis.Vertical)
     .edgeEffect(EdgeEffect.Spring);
   }
 
@@ -21058,97 +21192,139 @@ struct Index {
   }
 
   @Builder
+  private ManagementFieldLabel(title: string): void {
+    Text(title)
+      .width('100%')
+      .fontSize(14)
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('sys.color.font_primary'));
+  }
+
+  @Builder
+  private ManagementSwitchSetting(
+    title: string,
+    description: string,
+    value: boolean,
+    onChange: (isOn: boolean) => void
+  ): void {
+    Row({ space: 16 }) {
+      Column({ space: 4 }) {
+        Text(title)
+          .fontSize(16)
+          .fontColor($r('sys.color.font_primary'));
+        Text(description)
+          .fontSize(13)
+          .lineHeight(19)
+          .fontColor($r('sys.color.font_secondary'));
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start);
+      Toggle({ type: ToggleType.Switch, isOn: value })
+        .height(48)
+        .selectedColor('#C86B8C')
+        .accessibilityText(title)
+        .onChange((isOn: boolean) => {
+          onChange(isOn);
+        });
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 64 })
+    .padding({ top: 8, bottom: 8 });
+  }
+
+  @Builder
   private MyTagsSection(): void {
-    Column({ space: 12 }) {
-      Column({ space: 8 }) {
-        Row({ space: 8 }) {
-          Column({ space: 3 }) {
-            Text('我的标签')
-              .fontSize(18)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#2B2027');
-            Text('读取账号标签状态，点标签直接进入原生标签搜索。')
-              .fontSize(12)
-              .lineHeight(18)
-              .fontColor('#7C6470');
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start);
-          Button('刷新')
-            .height(28)
-            .backgroundColor('#F8E4ED')
-            .borderRadius(8)
-            .onClick(() => {
-              void this.loadMyTags();
-            });
-        }
-        .width('100%');
-
-        if (this.myTagsLoading) {
-          SystemLoadingBlock({
-            message: '正在加载我的标签...',
-            minHeight: 88
-          });
-        } else if (this.myTagsError.length > 0) {
-          Text(this.myTagsError)
-            .fontSize(13)
+    Column({ space: 16 }) {
+      Row({ space: 16 }) {
+        Column({ space: 6 }) {
+          Text('我的标签')
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'));
+          Text('查看关注和隐藏状态，点按标签搜索相关画廊。')
+            .fontSize(14)
             .lineHeight(20)
-            .fontColor('#B42318')
-            .width('100%')
-            .padding(12)
-            .backgroundColor('#FFF3F2')
-            .borderRadius(8);
+            .fontColor($r('sys.color.font_secondary'));
         }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start);
+        Button('刷新')
+          .height(48)
+          .fontSize(14)
+          .fontColor('#A85474')
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .enabled(!this.myTagsLoading)
+          .onClick(() => {
+            void this.loadMyTags();
+          });
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .borderRadius(12);
 
-        ForEach(this.myTags, (item: NativeUserTag) => {
-          Row({ space: 10 }) {
-            Column({ space: 5 }) {
+      if (this.myTagsLoading) {
+        SystemLoadingBlock({
+          message: '正在加载我的标签...',
+          minHeight: 112
+        });
+      } else if (this.myTagsError.length > 0) {
+        Text(this.myTagsError)
+          .fontSize(14)
+          .lineHeight(21)
+          .fontColor('#B42318')
+          .width('100%')
+          .padding(16)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .borderRadius(12);
+      } else if (this.myTags.length === 0) {
+        Text('暂无标签。关注或隐藏标签后，可在这里查看。')
+          .width('100%')
+          .fontSize(14)
+          .lineHeight(22)
+          .fontColor($r('sys.color.font_secondary'))
+          .padding(24)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .borderRadius(12);
+      }
+
+      ForEach(this.myTags, (item: NativeUserTag) => {
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 16 }) {
+            Column({ space: 6 }) {
               Text(item.tagName)
-                .fontSize(15)
+                .fontSize(16)
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#2B2027')
-                .maxLines(1);
-              Row({ space: 6 }) {
-                Text(item.watched ? '已关注' : '未关注')
-                  .fontSize(11)
-                  .fontColor(item.watched ? '#FFFFFF' : '#6F5964')
-                  .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-                  .backgroundColor(item.watched ? '#C86B8C' : '#EEF2F1')
-                  .borderRadius(6);
-                Text(item.hidden ? '已隐藏' : '可见')
-                  .fontSize(11)
-                  .fontColor(item.hidden ? '#FFFFFF' : '#6F5964')
-                  .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-                  .backgroundColor(item.hidden ? '#B42318' : '#EEF2F1')
-                  .borderRadius(6);
-                Text(`权重 ${item.tagWeight}`)
-                  .fontSize(11)
-                  .fontColor('#6F5964');
+                .fontColor($r('sys.color.font_primary'));
+              Text(`${item.watched ? '已关注' : '未关注'} · ${item.hidden ? '已隐藏' : '可见'} · 权重 ${item.tagWeight}`)
+                .fontSize(13)
+                .lineHeight(20)
+                .fontColor($r('sys.color.font_secondary'));
+              if (item.color.length > 0) {
+                Text(`标签颜色 ${item.color}`)
+                  .fontSize(12)
+                  .fontColor($r('sys.color.font_secondary'))
+                  .maxLines(1);
               }
             }
             .layoutWeight(1)
             .alignItems(HorizontalAlign.Start);
-            if (item.color.length > 0) {
-              Text(item.color)
-                .fontSize(11)
-                .fontColor('#6F5964')
-                .maxLines(1);
-            }
+            SymbolGlyph($r('sys.symbol.chevron_right'))
+              .fontSize(16)
+              .fontColor([$r('sys.color.icon_secondary')]);
           }
           .width('100%')
-          .padding(12)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8)
-          .onClick(() => {
-            this.openUserTagSearch(item);
-          });
-        }, (item: NativeUserTag) => item.id);
-      }
-      .width('100%')
-      .padding(12)
-      .backgroundColor('#FFFFFF')
-      .borderRadius(8)
-      .alignItems(HorizontalAlign.Start);
+          .constraintSize({ minHeight: 48 });
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .borderRadius(12)
+        .accessibilityText(`搜索标签 ${item.tagName}`)
+        .onClick(() => {
+          this.openUserTagSearch(item);
+        });
+      }, (item: NativeUserTag) => item.id);
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start);
@@ -21156,102 +21332,106 @@ struct Index {
 
   @Builder
   private ImageSearchSection(): void {
-    Column({ space: 12 }) {
-      Column({ space: 10 }) {
-        Text('图片搜索')
-          .fontSize(18)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#2B2027');
-        Text('使用系统图片选择器选择本地图片，随后按安卓版 multipart 搜索流程返回原生结果列表。')
-          .fontSize(12)
-          .lineHeight(18)
-          .fontColor('#7C6470');
-
-        if (this.imageSearchPath.length > 0) {
-          Text(this.imageSearchPath)
-            .fontSize(11)
-            .lineHeight(16)
-            .fontColor('#6F5964')
-            .maxLines(2)
-            .width('100%')
-            .padding(10)
-            .backgroundColor('#FFFFFF')
-            .borderRadius(8);
-        } else {
-          Text('未选择图片')
-            .fontSize(13)
-            .fontColor('#6F5964');
-        }
-
-        Flex({ wrap: FlexWrap.Wrap }) {
-          Button(this.imageSearchSimilar ? '相似: 开' : '相似: 关')
-            .height(28)
-            .margin({ right: 8, bottom: 8 })
-            .fontColor(this.imageSearchSimilar ? '#FFFFFF' : '#2B2027')
-            .backgroundColor(this.imageSearchSimilar ? '#C86B8C' : '#F8E4ED')
-            .borderRadius(8)
-            .onClick(() => {
-              this.imageSearchSimilar = !this.imageSearchSimilar;
-            });
-          Button(this.imageSearchCovers ? '封面: 开' : '封面: 关')
-            .height(28)
-            .margin({ right: 8, bottom: 8 })
-            .fontColor(this.imageSearchCovers ? '#FFFFFF' : '#2B2027')
-            .backgroundColor(this.imageSearchCovers ? '#C86B8C' : '#F8E4ED')
-            .borderRadius(8)
-            .onClick(() => {
-              this.imageSearchCovers = !this.imageSearchCovers;
-            });
-          Button(this.imageSearchExpunged ? '隐藏: 开' : '隐藏: 关')
-            .height(28)
-            .margin({ right: 8, bottom: 8 })
-            .fontColor(this.imageSearchExpunged ? '#FFFFFF' : '#2B2027')
-            .backgroundColor(this.imageSearchExpunged ? '#37474F' : '#F8E4ED')
-            .borderRadius(8)
-            .onClick(() => {
-              this.imageSearchExpunged = !this.imageSearchExpunged;
-            });
-        }
-        .width('100%');
-
-        Row({ space: 8 }) {
-          Button('选择图片')
-            .layoutWeight(1)
-            .height(28)
-            .backgroundColor('#F8E4ED')
-            .borderRadius(8)
-            .onClick(() => {
-              void this.pickImageForSearch();
-            });
-          Button(this.imageSearchLoading ? '搜索中...' : '搜索')
-            .layoutWeight(1)
-            .height(28)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#C86B8C')
-            .borderRadius(8)
-            .enabled(!this.imageSearchLoading)
-            .onClick(() => {
-              void this.runImageSearch();
-            });
-        }
-        .width('100%');
-
-        if (this.imageSearchError.length > 0) {
-          Text(this.imageSearchError)
-            .fontSize(13)
+    Column({ space: 16 }) {
+      Column({ space: 16 }) {
+        Column({ space: 6 }) {
+          Text('图片搜索')
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'));
+          Text('选择本地图片，搜索相同或相似的画廊。')
+            .fontSize(14)
             .lineHeight(20)
-            .fontColor('#B42318')
-            .width('100%')
-            .padding(12)
-            .backgroundColor('#FFF3F2')
-            .borderRadius(8);
+            .fontColor($r('sys.color.font_secondary'));
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
+
+        this.ManagementFieldLabel('搜索图片');
+        Column({ space: 6 }) {
+          Text(this.imageSearchPath.length > 0 ? '已选择图片' : '尚未选择图片')
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'));
+          if (this.imageSearchPath.length > 0) {
+            Text(this.imageSearchPath)
+              .fontSize(12)
+              .lineHeight(18)
+              .fontColor($r('sys.color.font_secondary'))
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis });
+          } else {
+            Text('点按下方按钮，从系统图库选择一张图片。')
+              .fontSize(13)
+              .lineHeight(20)
+              .fontColor($r('sys.color.font_secondary'));
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor($r('sys.color.comp_background_tertiary'))
+        .borderRadius(12)
+        .alignItems(HorizontalAlign.Start);
+
+        Button(this.imageSearchPath.length > 0 ? '更换图片' : '选择图片')
+          .width('100%')
+          .height(48)
+          .fontSize(16)
+          .fontColor('#A85474')
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .enabled(!this.imageSearchLoading)
+          .onClick(() => {
+            void this.pickImageForSearch();
+          });
       }
       .width('100%')
-      .padding(12)
-      .backgroundColor('#FFFFFF')
-      .borderRadius(8)
+      .padding(16)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .borderRadius(12)
       .alignItems(HorizontalAlign.Start);
+
+      Column() {
+        this.ManagementSwitchSetting('相似图片', '同时查找与所选图片相似的内容。', this.imageSearchSimilar,
+          (isOn: boolean): void => {
+            this.imageSearchSimilar = isOn;
+          });
+        Divider().color($r('sys.color.comp_divider'));
+        this.ManagementSwitchSetting('仅搜索封面', '仅匹配画廊的封面图片。', this.imageSearchCovers,
+          (isOn: boolean): void => {
+            this.imageSearchCovers = isOn;
+          });
+        Divider().color($r('sys.color.comp_divider'));
+        this.ManagementSwitchSetting('包含隐藏画廊', '搜索结果包含已被隐藏的画廊。', this.imageSearchExpunged,
+          (isOn: boolean): void => {
+            this.imageSearchExpunged = isOn;
+          });
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 4, bottom: 4 })
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .borderRadius(12);
+
+      Button(this.imageSearchLoading ? '搜索中...' : '开始搜索')
+        .width('100%')
+        .height(48)
+        .fontSize(16)
+        .fontColor('#FFFFFF')
+        .backgroundColor('#C86B8C')
+        .enabled(!this.imageSearchLoading && this.imageSearchPath.length > 0)
+        .onClick(() => {
+          void this.runImageSearch();
+        });
+
+      if (this.imageSearchError.length > 0) {
+        Text(this.imageSearchError)
+          .fontSize(14)
+          .lineHeight(21)
+          .fontColor('#B42318')
+          .width('100%')
+          .padding(16)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .borderRadius(12);
+      }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start);
@@ -21259,21 +21439,26 @@ struct Index {
 
   @Builder
   private MyQuickEntry(title: string, symbol: Resource, action: string): void {
-    Column({ space: 8 }) {
-      SymbolGlyph(symbol)
-        .fontSize(24)
-        .fontColor(['#A85474']);
-      Text(title)
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontColor('#2B2027')
-        .maxLines(1);
+    Button({ type: ButtonType.Normal }) {
+      Column({ space: 10 }) {
+        SymbolGlyph(symbol)
+          .fontSize(26)
+          .fontColor(['#A85474']);
+        Text(title)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.ohos_id_color_text_primary'));
+      }
+      .width('100%')
+      .padding({ top: 16, bottom: 16 })
+      .justifyContent(FlexAlign.Center);
     }
     .layoutWeight(1)
-    .height(76)
-    .justifyContent(FlexAlign.Center)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
+    .constraintSize({ minHeight: 88 })
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .borderRadius(16)
+    .accessibilityText(title)
     .onClick(() => {
       this.runMyActionWhenSignedIn(action);
     });
@@ -21281,23 +21466,28 @@ struct Index {
 
   @Builder
   private MyBrandHeader(): void {
-    Column({ space: 10 }) {
+    Row({ space: 16 }) {
       Image($r('app.media.eh_logo'))
-        .width(132)
-        .height(132)
+        .width(64)
+        .height(64)
         .objectFit(ImageFit.Cover)
-        .borderRadius(26)
+        .borderRadius(16)
         .clip(true);
-      Text('E-Harmony')
-        .fontSize(22)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#2B2027')
-        .textAlign(TextAlign.Center)
-        .maxLines(1);
+      Column({ space: 6 }) {
+        Text('E-Harmony')
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('sys.color.ohos_id_color_text_primary'));
+        Text(this.sitePanelTitle())
+          .fontSize(14)
+          .fontColor($r('sys.color.ohos_id_color_text_secondary'));
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start);
     }
     .width('100%')
-    .padding({ top: 8, bottom: 10 })
-    .alignItems(HorizontalAlign.Center);
+    .padding({ left: 20, right: 20, top: 12, bottom: 16 })
+    .alignItems(VerticalAlign.Center);
   }
 
   @Builder
@@ -21308,28 +21498,33 @@ struct Index {
       this.MyQuickEntry('下载', $r('sys.symbol.waveform_folder_fill'), 'downloads');
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8);
+    .padding(4);
   }
 
   @Builder
   private MyControlRow(title: string, symbol: Resource, action: string, destructive: boolean = false): void {
-    Row({ space: 12 }) {
-      SymbolGlyph(symbol)
-        .fontSize(20)
-        .fontColor([destructive ? '#B42318' : '#A85474']);
-      Text(title)
-        .fontSize(15)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(destructive ? '#B42318' : '#2B2027')
-        .layoutWeight(1);
+    ListItem({ style: ListItemStyle.CARD }) {
+      Row({ space: 14 }) {
+        SymbolGlyph(symbol)
+          .fontSize(22)
+          .fontColor([destructive ? $r('sys.color.ohos_id_color_warning') : '#A85474']);
+        Text(title)
+          .fontSize(16)
+          .fontColor(destructive ? $r('sys.color.ohos_id_color_warning') :
+            $r('sys.color.ohos_id_color_text_primary'))
+          .layoutWeight(1);
+        if (!destructive) {
+          SymbolGlyph($r('sys.symbol.chevron_right'))
+            .fontSize(14)
+            .fontColor([$r('sys.color.ohos_id_color_text_secondary')]);
+        }
+      }
+      .width('100%')
+      .constraintSize({ minHeight: 56 })
+      .padding({ left: 16, right: 16, top: 14, bottom: 14 });
     }
-    .width('100%')
-    .height(52)
-    .padding({ left: 14, right: 14 })
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
+    .height(undefined)
+    .accessibilityText(title)
     .onClick(() => {
       this.runMyActionWhenSignedIn(action);
     });
@@ -21337,241 +21532,298 @@ struct Index {
 
   @Builder
   private MyDrawerCard(): void {
-    Column({ space: 12 }) {
-      this.MyQuickEntryCard();
-      Column({ space: 1 }) {
-        this.MyControlRow('屏蔽画廊', $r('sys.symbol.eye'), 'filters');
-        this.MyControlRow('设置', $r('sys.symbol.gearshape_fill'), 'settings');
+    ListItemGroup({ header: this.MyPageGroupHeader('我的资料库'), style: ListItemGroupStyle.CARD }) {
+      ListItem({ style: ListItemStyle.CARD }) {
+        this.MyQuickEntryCard();
+      }
+      .height(undefined);
+      this.MyControlRow('书签', $r('sys.symbol.star_fill'), 'bookmarks');
+    }
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.ohos_id_color_list_separator'), startMargin: 16, endMargin: 16 });
+    ListItemGroup({ header: this.MyPageGroupHeader('偏好与管理'), style: ListItemGroupStyle.CARD }) {
+      this.MyControlRow('屏蔽画廊', $r('sys.symbol.eye'), 'filters');
+      this.MyControlRow('评论黑名单', $r('sys.symbol.person_crop_circle_fill'), 'blacklist');
+      this.MyControlRow('设置', $r('sys.symbol.gearshape_fill'), 'settings');
+    }
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.ohos_id_color_list_separator'), startMargin: 52, endMargin: 16 });
+    if (this.hasCurrentSiteCredential()) {
+      ListItemGroup({ style: ListItemGroupStyle.CARD }) {
         this.MyControlRow('退出登录', $r('sys.symbol.trash'), 'logout', true);
       }
-      .width('100%');
+    }
+  }
+
+  @Builder
+  private SettingsGroupHeader(title: string, description: string = ''): void {
+    Column({ space: 6 }) {
+      Text(title)
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('sys.color.font_primary'));
+      if (description.length > 0) {
+        Text(description)
+          .fontSize(13)
+          .lineHeight(20)
+          .fontColor($r('sys.color.font_secondary'))
+          .width('100%');
+      }
     }
     .width('100%')
+    .padding({ left: 16, right: 16, top: 16, bottom: 12 })
     .alignItems(HorizontalAlign.Start);
+  }
+
+  @Builder
+  private SettingsActionItem(title: string, action: ReaderCommandHandler, destructive: boolean = false): void {
+    ListItem({ style: ListItemStyle.CARD }) {
+      Row({ space: 12 }) {
+        Text(title)
+          .layoutWeight(1)
+          .fontSize(16)
+          .fontColor(destructive ? '#B42318' : $r('sys.color.font_primary'));
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(16)
+          .fontColor([$r('sys.color.font_secondary')]);
+      }
+      .width('100%')
+      .constraintSize({ minHeight: 56 })
+      .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+      .alignItems(VerticalAlign.Center);
+    }
+    .height(undefined)
+    .focusable(true)
+    .accessibilityText(title)
+    .onClick(() => {
+      action();
+    });
+  }
+
+  @Builder
+  private SettingsSwitchItem(title: string, description: string, value: boolean,
+    onChange: ReaderToggleChangeHandler): void {
+    ListItem({ style: ListItemStyle.CARD }) {
+      Row({ space: 16 }) {
+        Column({ space: 4 }) {
+          Text(title)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          if (description.length > 0) {
+            Text(description)
+              .fontSize(13)
+              .lineHeight(18)
+              .fontColor($r('sys.color.font_secondary'));
+          }
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start);
+        Toggle({ type: ToggleType.Switch, isOn: value })
+          .selectedColor('#C86B8C')
+          .switchPointColor('#FFFFFF')
+          .responseRegion({ x: 0, y: -8, width: '100%', height: 48 })
+          .accessibilityText(title)
+          .onChange((isOn: boolean) => {
+            onChange(isOn);
+          });
+      }
+      .width('100%')
+      .constraintSize({ minHeight: 64 })
+      .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+      .alignItems(VerticalAlign.Center);
+    }
+    .height(undefined);
   }
 
   @Builder
   private MyAccountCard(): void {
-    Column({ space: 10 }) {
-      Row() {
-        Text('账户设置')
-          .fontSize(18)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#2B2027')
-          .layoutWeight(1);
-        Text(this.sitePanelTitle())
-          .fontSize(12)
-          .fontWeight(FontWeight.Medium)
-          .fontColor('#FFFFFF')
-          .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-          .backgroundColor(this.siteMode === GallerySite.EX ? '#37474F' : '#C86B8C')
-          .borderRadius(8)
-          .maxLines(1);
+    ListItemGroup({
+      style: ListItemGroupStyle.CARD,
+      header: (): void => {
+        this.SettingsGroupHeader('账户设置');
       }
-      .width('100%')
-      .alignItems(VerticalAlign.Center);
-
-      Text('目前的 Cookie')
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontColor('#2B2027');
-      TextArea({
-        text: this.currentCookieHeader(),
-        placeholder: '未检测到 Cookie'
-      })
+    }) {
+      ListItem({ style: ListItemStyle.CARD }) {
+        Row({ space: 12 }) {
+          Text('当前站点')
+            .layoutWeight(1)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          Select([{ value: '外站 E-Hentai' }, { value: '里站 ExHentai' }])
+            .selected(this.siteMode === GallerySite.EX ? 1 : 0)
+            .value(this.siteMode === GallerySite.EX ? '里站 ExHentai' : '外站 E-Hentai')
+            .height(48)
+            .font({ size: 14 })
+            .fontColor($r('sys.color.font_primary'))
+            .selectedOptionFontColor('#A85474')
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .accessibilityText('当前站点')
+            .onSelect((index: number, _value: string) => {
+              const site = index === 1 ? GallerySite.EX : GallerySite.E;
+              if (site !== this.siteMode) {
+                this.switchSiteAndRestart(site);
+              }
+            });
+        }
         .width('100%')
-        .height(104)
-        .maxLines(5)
-        .fontSize(12)
-        .lineHeight(18)
-        .fontColor(this.currentCookieHeader().length > 0 ? '#6F5964' : '#9A7D8A')
-        .padding(10)
-        .backgroundColor('#F8F8F8')
-        .borderRadius(8)
-        .onChange((value: string) => {
-          this.updateSettingsCookieDraft(value);
-        });
-
-      Row({ space: 8 }) {
-        Button(this.siteMode === GallerySite.EX ? '切换外站' : '切换里站')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F8E4ED')
-          .borderRadius(8)
-          .onClick(() => {
-            this.switchSiteAndRestart(this.siteMode === GallerySite.EX ? GallerySite.E : GallerySite.EX);
-          });
-        Button('我的标签')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F8E4ED')
-          .borderRadius(8)
-          .onClick(() => {
-            this.handleMyDrawerAction('mytags');
-          });
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 });
       }
-      .width('100%');
-      Row({ space: 8 }) {
-        Button('UConfig')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F8E4ED')
-          .borderRadius(8)
-          .onClick(() => {
-            this.handleMyDrawerAction('uconfig');
-          });
-        Button(this.privateBrowsing ? '私密浏览: 开' : '私密浏览: 关')
-          .layoutWeight(1)
-          .height(28)
-          .fontColor(this.privateBrowsing ? '#FFFFFF' : '#2B2027')
-          .backgroundColor(this.privateBrowsing ? '#C86B8C' : '#F8E4ED')
-          .borderRadius(8)
-          .onClick(() => {
+      .height(undefined);
+      this.SettingsSwitchItem('私密浏览', '', this.privateBrowsing,
+        (isOn: boolean): void => {
+          if (isOn !== this.privateBrowsing) {
             this.togglePrivateBrowsing();
-          });
+          }
+        });
+      this.SettingsActionItem('我的标签', (): void => {
+        this.handleMyDrawerAction('mytags');
+      });
+      this.SettingsActionItem('站点偏好（UConfig）', (): void => {
+        this.handleMyDrawerAction('uconfig');
+      });
+      ListItem({ style: ListItemStyle.CARD }) {
+        Column({ space: 10 }) {
+          Text('登录 Cookie')
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          TextArea({ text: this.currentCookieHeader(), placeholder: '未检测到 Cookie' })
+            .width('100%')
+            .height(112)
+            .maxLines(5)
+            .fontSize(14)
+            .lineHeight(20)
+            .fontColor($r('sys.color.font_primary'))
+            .padding(12)
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .accessibilityText('登录 Cookie')
+            .onChange((value: string) => {
+              this.updateSettingsCookieDraft(value);
+            });
+          Button('复制 Cookie')
+            .width('100%')
+            .height(48)
+            .fontSize(14)
+            .fontColor('#A85474')
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .onClick(() => {
+              this.copyCurrentCookie();
+            });
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+        .alignItems(HorizontalAlign.Start);
       }
-      .width('100%');
-      Row({ space: 8 }) {
-        Button('复制 Cookie')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.copyCurrentCookie();
-          });
-        Button('退出登录')
-          .layoutWeight(1)
-          .height(28)
-          .fontColor('#B42318')
-          .backgroundColor('#FFF3F2')
-          .borderRadius(8)
-          .onClick(() => {
-            this.confirmClearLocalAccountCache();
-          });
-      }
-      .width('100%');
+      .height(undefined);
+      this.SettingsActionItem('退出登录', (): void => {
+        this.confirmClearLocalAccountCache();
+      }, true);
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .alignItems(HorizontalAlign.Start);
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.comp_divider'), startMargin: 20, endMargin: 20 });
   }
 
   @Builder
   private FilterRuleRow(rule: FilterRule): void {
-    Row({ space: 8 }) {
-      Column({ space: 4 }) {
-        Row({ space: 6 }) {
-          Text(this.filterModeLabel(rule.mode))
-            .fontSize(11)
-            .fontColor('#FFFFFF')
-            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-            .backgroundColor(rule.enabled ? '#C86B8C' : '#9A7D8A')
-            .borderRadius(6);
-          Text(rule.enabled ? '启用' : '停用')
-            .fontSize(11)
-            .fontColor(rule.enabled ? '#A85474' : '#7C6470');
+    Column({ space: 8 }) {
+      Row({ space: 16 }) {
+        Column({ space: 6 }) {
+          Text(rule.text)
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'));
+          Text(rule.enabled ? '已启用' : '已停用')
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
         }
-        Text(rule.text)
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(rule.enabled ? '#2B2027' : '#9A7D8A')
-          .maxLines(2);
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start);
+        Toggle({ type: ToggleType.Switch, isOn: rule.enabled })
+          .height(48)
+          .selectedColor('#C86B8C')
+          .accessibilityText(`启用过滤规则 ${rule.text}`)
+          .enabled(!this.filterRulesSaving)
+          .onChange((isOn: boolean) => {
+            void this.setFilterRuleEnabled(rule, isOn);
+          });
       }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start);
+      .width('100%')
+      .constraintSize({ minHeight: 56 });
 
-      Button(rule.enabled ? '停用' : '启用')
-        .height(28)
-        .fontSize(12)
-        .backgroundColor(rule.enabled ? '#F3E3EA' : '#F8E4ED')
-        .fontColor('#2B2027')
-        .borderRadius(8)
-        .onClick(() => {
-          void this.toggleFilterRule(rule);
-        });
-
-      Button('删除')
-        .height(28)
-        .fontSize(12)
-        .backgroundColor('#FFF3F2')
+      Button('删除规则')
+        .height(44)
+        .fontSize(14)
+        .backgroundColor($r('sys.color.comp_background_tertiary'))
         .fontColor('#B42318')
-        .borderRadius(8)
+        .accessibilityText(`删除过滤规则 ${rule.text}`)
+        .enabled(!this.filterRulesSaving)
         .onClick(() => {
           void this.deleteFilterRule(rule);
         });
     }
     .width('100%')
-    .padding(10)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8);
+    .padding({ top: 12, bottom: 12 })
+    .alignItems(HorizontalAlign.Start);
   }
 
   @Builder
   private FilterManagementSection(): void {
-    Column({ space: 12 }) {
-      Column({ space: 10 }) {
-        Row() {
-          Column({ space: 4 }) {
-            Text('过滤规则')
-              .fontSize(18)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#2B2027');
-            Text('在本地过滤画廊：标题包含、上传者精确匹配、标签和标签命名空间。')
-              .fontSize(12)
-              .lineHeight(18)
-              .fontColor('#7C6470');
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start);
-          Text(`${this.activeGalleryFilters().length}/${this.filterRules.length}`)
-            .fontSize(12)
-            .fontColor('#6F5964');
+    Column({ space: 16 }) {
+      Column({ space: 16 }) {
+        Column({ space: 6 }) {
+          Text('过滤规则')
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'));
+          Text('按标题、上传者、标签或标签命名空间过滤画廊。')
+            .fontSize(14)
+            .lineHeight(20)
+            .fontColor($r('sys.color.font_secondary'));
+          Text(`已启用 ${this.activeGalleryFilters().length} 条，共 ${this.filterRules.length} 条`)
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
         }
-        .width('100%');
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
 
-        Select(this.filterModeSelectOptions())
-          .selected(this.filterModeSelectedIndex())
-          .value(this.filterModeLabel(this.filterModeDraft))
-          .height(36)
-          .width('100%')
-          .font({ size: 13 })
-          .fontColor('#2B2027')
-          .selectedOptionBgColor('#C86B8C')
-          .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-          .selectedOptionFontColor('#FFFFFF')
-          .optionFont({ size: 13 })
-          .optionBgColor('#FFFFFF')
-          .optionFontColor('#2B2027')
-          .backgroundColor('#F8F8F8')
-          .borderRadius(8)
-          .onSelect((index: number, _value: string) => {
-            this.applyFilterModeByIndex(index);
-          });
+        Column({ space: 8 }) {
+          this.ManagementFieldLabel('匹配方式');
+          Select(this.filterModeSelectOptions())
+            .selected(this.filterModeSelectedIndex())
+            .value(this.filterModeLabel(this.filterModeDraft))
+            .height(48)
+            .width('100%')
+            .font({ size: 16 })
+            .fontColor($r('sys.color.font_primary'))
+            .selectedOptionBgColor('#C86B8C')
+            .selectedOptionFontColor('#FFFFFF')
+            .optionFont({ size: 16 })
+            .optionFontColor($r('sys.color.font_primary'))
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .accessibilityText('过滤规则匹配方式')
+            .onSelect((index: number, _value: string) => {
+              this.applyFilterModeByIndex(index);
+            });
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
 
-        Row({ space: 8 }) {
+        Column({ space: 8 }) {
+          this.ManagementFieldLabel('过滤内容');
           TextInput({ text: this.filterTextDraft, placeholder: this.filterModePlaceholder(this.filterModeDraft) })
-            .layoutWeight(1)
-            .height(34)
-            .backgroundColor('#F8F8F8')
-            .borderRadius(8)
-            .fontSize(12)
+            .width('100%')
+            .height(48)
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'))
+            .accessibilityText('过滤内容')
             .onChange((value: string) => {
               this.setFilterTextDraft(value);
             });
-          Button('添加')
-            .height(34)
-            .fontSize(12)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#C86B8C')
-            .borderRadius(8)
-            .onClick(() => {
-              void this.addFilterRuleFromDraft();
-            });
         }
-        .width('100%');
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
 
         if (this.filterUsesTagSuggestions() && this.filterTagSuggestions.length > 0) {
           Column({ space: 0 }) {
@@ -21581,75 +21833,109 @@ struct Index {
             }, (item: TagTranslationSuggestion) => item.key);
           }
           .width('100%')
-          .backgroundColor('#FFFFFF')
-          .border({ width: 1, color: '#E8C8D6' })
-          .borderRadius(8);
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 1, color: $r('sys.color.comp_divider') })
+          .borderRadius(12);
         }
+
+        Button('添加规则')
+          .width('100%')
+          .height(48)
+          .fontSize(16)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#C86B8C')
+          .enabled(!this.filterRulesSaving && this.filterTextDraft.trim().length > 0)
+          .onClick(() => {
+            void this.addFilterRuleFromDraft();
+          });
       }
       .width('100%')
-      .padding(12)
-      .backgroundColor('#FFFFFF')
-      .borderRadius(8)
+      .padding(16)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .borderRadius(12)
       .alignItems(HorizontalAlign.Start);
 
       Column({ space: 8 }) {
         Row() {
           Text('排除语言')
-            .fontSize(15)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#2B2027')
+            .fontSize(17)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
             .layoutWeight(1);
-          Text(`${this.excludedLanguageTags.length}`)
-            .fontSize(12)
-            .fontColor('#6F5964');
+          Text(`已选 ${this.excludedLanguageTags.length} 项`)
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
         }
         .width('100%');
+        Text('隐藏包含所选语言标签的画廊。')
+          .fontSize(13)
+          .lineHeight(20)
+          .fontColor($r('sys.color.font_secondary'));
         Flex({ wrap: FlexWrap.Wrap }) {
           ForEach(EXCLUDED_LANGUAGE_OPTIONS, (option: LanguageFilterOption) => {
-            Button(option.label)
-              .height(28)
-              .margin({ right: 8, bottom: 8 })
-              .fontSize(12)
-              .fontColor(this.isExcludedLanguageSelected(option.tag) ? '#FFFFFF' : '#2B2027')
-              .backgroundColor(this.isExcludedLanguageSelected(option.tag) ? '#C86B8C' : '#F8E4ED')
-              .borderRadius(8)
-              .onClick(() => {
-                this.toggleExcludedLanguage(option.tag);
-              });
+            Row({ space: 8 }) {
+              Checkbox({ name: option.tag })
+                .select(this.isExcludedLanguageSelected(option.tag))
+                .selectedColor('#C86B8C')
+                .width(24)
+                .height(24)
+                .margin({ left: 10, right: 10 })
+                .responseRegion({ x: -10, y: -10, width: 44, height: 44 })
+                .accessibilityText(`排除${option.label}`)
+                .onChange((selected: boolean) => {
+                  if (selected !== this.isExcludedLanguageSelected(option.tag)) {
+                    this.toggleExcludedLanguage(option.tag);
+                  }
+                });
+              Text(option.label)
+                .layoutWeight(1)
+                .fontSize(15)
+                .fontColor($r('sys.color.font_primary'))
+                .constraintSize({ minHeight: 48 })
+                .onClick(() => {
+                  this.toggleExcludedLanguage(option.tag);
+                });
+            }
+            .width('50%')
+            .constraintSize({ minHeight: 48 });
           }, (option: LanguageFilterOption) => option.tag);
         }
         .width('100%');
       }
       .width('100%')
-      .padding(12)
-      .backgroundColor('#FFFFFF')
-      .borderRadius(8)
+      .padding(16)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .borderRadius(12)
       .alignItems(HorizontalAlign.Start);
 
       if (this.filterRules.length === 0) {
-        Text('还没有过滤规则。添加后会立即作用于首页、搜索、收藏和原生列表。')
+        Text('暂无过滤规则。修改规则后，返回或刷新列表即可生效。')
           .width('100%')
-          .fontSize(13)
-          .fontColor('#6F5964')
-          .padding(12)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8);
+          .fontSize(14)
+          .lineHeight(22)
+          .fontColor($r('sys.color.font_secondary'))
+          .padding(24)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .borderRadius(12);
       } else {
         ForEach(FILTER_MODE_OPTIONS, (option: FilterModeOption) => {
           if (this.filterRulesForMode(option.mode).length > 0) {
-            Column({ space: 8 }) {
+            Column({ space: 4 }) {
               Text(option.label)
-                .fontSize(15)
-                .fontWeight(FontWeight.Bold)
-                .fontColor('#2B2027');
-              ForEach(this.filterRulesForMode(option.mode), (rule: FilterRule) => {
+                .fontSize(17)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('sys.color.font_primary'));
+              ForEach(this.filterRulesForMode(option.mode), (rule: FilterRule, index: number) => {
+                if (index > 0) {
+                  Divider().color($r('sys.color.comp_divider'));
+                }
                 this.FilterRuleRow(rule);
               }, (rule: FilterRule) => `${rule.id}:${rule.enabled ? '1' : '0'}`);
             }
             .width('100%')
-            .padding(12)
-            .backgroundColor('#FFFFFF')
-            .borderRadius(8)
+            .padding(16)
+            .backgroundColor($r('sys.color.comp_background_primary'))
+            .borderRadius(12)
             .alignItems(HorizontalAlign.Start);
           }
         }, (option: FilterModeOption) => `${option.mode}`);
@@ -21661,119 +21947,132 @@ struct Index {
 
   @Builder
   private BlacklistRow(item: BlacklistItem): void {
-    Row({ space: 8 }) {
-      Column({ space: 4 }) {
+    Row({ space: 16 }) {
+      Column({ space: 6 }) {
         Text(item.name)
-          .fontSize(15)
+          .fontSize(16)
           .fontWeight(FontWeight.Medium)
-          .fontColor('#2B2027')
-          .maxLines(1);
+          .fontColor($r('sys.color.font_primary'));
         Text(item.reason.length > 0 ? item.reason : '无备注')
-          .fontSize(11)
-          .fontColor('#7C6470')
-          .maxLines(1);
+          .fontSize(13)
+          .lineHeight(20)
+          .fontColor($r('sys.color.font_secondary'));
         Text(item.addTime.length > 0 ? item.addTime : item.angryWith)
-          .fontSize(10)
-          .fontColor('#9A7D8A')
+          .fontSize(12)
+          .fontColor($r('sys.color.font_secondary'))
           .maxLines(1);
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start);
       Button('删除')
-        .height(28)
-        .fontSize(12)
-        .backgroundColor('#FFF3F2')
+        .height(48)
+        .fontSize(14)
+        .backgroundColor($r('sys.color.comp_background_tertiary'))
         .fontColor('#B42318')
-        .borderRadius(8)
+        .accessibilityText(`从黑名单删除 ${item.name}`)
         .onClick(() => {
           void this.deleteBlacklistItem(item);
         });
     }
     .width('100%')
-    .padding(10)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8);
+    .constraintSize({ minHeight: 72 })
+    .padding({ top: 12, bottom: 12 });
   }
 
   @Builder
   private BlacklistManagementSection(): void {
-    Column({ space: 12 }) {
-      Column({ space: 10 }) {
-        Row() {
-          Column({ space: 4 }) {
-            Text('评论黑名单')
-              .fontSize(18)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#2B2027');
-            Text('与安卓版 BlackList 对齐：命中用户名后详情页和评论页隐藏对应评论。')
-              .fontSize(12)
-              .lineHeight(18)
-              .fontColor('#7C6470');
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start);
-          Text(`${this.blacklistItems.length}`)
-            .fontSize(12)
-            .fontColor('#6F5964');
+    Column({ space: 16 }) {
+      Column({ space: 16 }) {
+        Column({ space: 6 }) {
+          Text('评论黑名单')
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'));
+          Text('隐藏黑名单用户在详情页和评论页发表的评论。')
+            .fontSize(14)
+            .lineHeight(20)
+            .fontColor($r('sys.color.font_secondary'));
         }
-        .width('100%');
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
 
-        TextInput({ text: this.blacklistNameDraft, placeholder: '用户名' })
-          .width('100%')
-          .height(34)
-          .backgroundColor('#F8F8F8')
-          .borderRadius(8)
-          .fontSize(12)
-          .onChange((value: string) => {
-            this.blacklistNameDraft = value;
-          });
+        Column({ space: 8 }) {
+          this.ManagementFieldLabel('用户名');
+          TextInput({ text: this.blacklistNameDraft, placeholder: '输入要屏蔽的用户名' })
+            .width('100%')
+            .height(48)
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'))
+            .accessibilityText('黑名单用户名')
+            .onChange((value: string) => {
+              this.blacklistNameDraft = value;
+            });
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
 
-        Row({ space: 8 }) {
-          TextInput({ text: this.blacklistReasonDraft, placeholder: '备注，可留空' })
-            .layoutWeight(1)
-            .height(34)
-            .backgroundColor('#F8F8F8')
-            .borderRadius(8)
-            .fontSize(12)
+        Column({ space: 8 }) {
+          this.ManagementFieldLabel('备注（可选）');
+          TextInput({ text: this.blacklistReasonDraft, placeholder: '记录屏蔽原因' })
+            .width('100%')
+            .height(48)
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'))
+            .accessibilityText('黑名单备注')
             .onChange((value: string) => {
               this.blacklistReasonDraft = value;
             });
-          Button('添加')
-            .height(34)
-            .fontSize(12)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#C86B8C')
-            .borderRadius(8)
-            .onClick(() => {
-              void this.addBlacklistFromDraft();
-            });
         }
-        .width('100%');
+        .width('100%')
+        .alignItems(HorizontalAlign.Start);
+
+        Button('添加到黑名单')
+          .width('100%')
+          .height(48)
+          .fontSize(16)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#C86B8C')
+          .enabled(this.blacklistNameDraft.trim().length > 0)
+          .onClick(() => {
+            void this.addBlacklistFromDraft();
+          });
       }
       .width('100%')
-      .padding(12)
-      .backgroundColor('#FFFFFF')
-      .borderRadius(8)
+      .padding(16)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .borderRadius(12)
       .alignItems(HorizontalAlign.Start);
 
       if (this.blacklistItems.length === 0) {
-        Text('还没有黑名单用户。也可以在评论页直接点“拉黑”。')
+        Text('暂无黑名单用户。也可以在评论页点按“拉黑”添加。')
           .width('100%')
-          .fontSize(13)
-          .fontColor('#6F5964')
-          .padding(12)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8);
+          .fontSize(14)
+          .lineHeight(22)
+          .fontColor($r('sys.color.font_secondary'))
+          .padding(24)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .borderRadius(12);
       } else {
-        Column({ space: 8 }) {
-          ForEach(this.blacklistItems, (item: BlacklistItem) => {
+        Column({ space: 4 }) {
+          Text(`已屏蔽 ${this.blacklistItems.length} 位用户`)
+            .fontSize(17)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'));
+          ForEach(this.blacklistItems, (item: BlacklistItem, index: number) => {
+            if (index > 0) {
+              Divider().color($r('sys.color.comp_divider'));
+            }
             this.BlacklistRow(item);
           }, (item: BlacklistItem) => `${item.id}`);
         }
         .width('100%')
-        .padding(12)
-        .backgroundColor('#FFFFFF')
-        .borderRadius(8)
+        .padding(16)
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .borderRadius(12)
         .alignItems(HorizontalAlign.Start);
       }
     }
@@ -21783,239 +22082,252 @@ struct Index {
 
   @Builder
   private MyCacheSettingsCard(): void {
-    Column({ space: 10 }) {
-      Text('缓存清理')
-        .fontSize(18)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#2B2027');
-      Text(this.cacheMaintenanceStatus)
+    ListItemGroup({
+      style: ListItemGroupStyle.CARD,
+      header: (): void => {
+        this.SettingsGroupHeader('缓存清理', this.cacheMaintenanceStatus);
+      }
+    }) {
+      ListItem({ style: ListItemStyle.CARD }) {
+        Row({ space: 12 }) {
+          Text('容量上限（MB）')
+            .layoutWeight(1)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          TextInput({ text: this.cacheMaxSizeInput, placeholder: '容量上限' })
+            .width(120)
+            .height(48)
+            .type(InputType.Number)
+            .textAlign(TextAlign.End)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'))
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .accessibilityText('缓存容量上限，单位 MB')
+            .onChange((value: string) => {
+              this.updateCacheMaxSizeInput(value);
+            });
+        }
         .width('100%')
-        .fontSize(12)
-        .fontColor('#7C6470')
-        .maxLines(2);
-      Row({ space: 8 }) {
-        TextInput({ text: this.cacheMaxSizeInput, placeholder: '容量上限 MB' })
-          .layoutWeight(1)
-          .height(34)
-          .backgroundColor('#F8F8F8')
-          .borderRadius(8)
-          .fontSize(12)
-          .onChange((value: string) => {
-            this.updateCacheMaxSizeInput(value);
-          });
-        TextInput({ text: this.cacheRetentionDaysInput, placeholder: '保留天数' })
-          .layoutWeight(1)
-          .height(34)
-          .backgroundColor('#F8F8F8')
-          .borderRadius(8)
-          .fontSize(12)
-          .onChange((value: string) => {
-            this.updateCacheRetentionDaysInput(value);
-          });
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 });
       }
-      .width('100%');
-      Row({ space: 8 }) {
-        Button('按策略清理')
-          .layoutWeight(1)
-          .height(28)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#C86B8C')
-          .borderRadius(8)
-          .onClick(() => {
-            this.runCachePolicyCleanup(true);
-          });
-        Button('全部清理')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#FFF3F2')
-          .fontColor('#B42318')
-          .borderRadius(8)
-          .onClick(() => {
-            this.clearAllCaches();
-          });
+      .height(undefined);
+      ListItem({ style: ListItemStyle.CARD }) {
+        Row({ space: 12 }) {
+          Text('保留天数')
+            .layoutWeight(1)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          TextInput({ text: this.cacheRetentionDaysInput, placeholder: '保留天数' })
+            .width(120)
+            .height(48)
+            .type(InputType.Number)
+            .textAlign(TextAlign.End)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'))
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .accessibilityText('缓存保留天数')
+            .onChange((value: string) => {
+              this.updateCacheRetentionDaysInput(value);
+            });
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 });
       }
-      .width('100%');
-      Row({ space: 8 }) {
-        Button('阅读器')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.clearReaderCaches();
-          });
-        Button('封面图')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.clearGalleryImageCaches();
-          });
-        Button('搜图临时')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.clearImageSearchCaches();
-          });
-      }
-      .width('100%');
+      .height(undefined);
+      this.SettingsActionItem('按策略清理缓存', (): void => {
+        this.runCachePolicyCleanup(true);
+      });
+      this.SettingsActionItem('清理阅读器缓存', (): void => {
+        this.clearReaderCaches();
+      });
+      this.SettingsActionItem('清理封面图缓存', (): void => {
+        this.clearGalleryImageCaches();
+      });
+      this.SettingsActionItem('清理搜图临时文件', (): void => {
+        this.clearImageSearchCaches();
+      });
+      this.SettingsActionItem('清理全部缓存', (): void => {
+        this.clearAllCaches();
+      }, true);
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .alignItems(HorizontalAlign.Start);
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.comp_divider'), startMargin: 20, endMargin: 20 });
+  }
+
+  private downloadConcurrencySelectOptions(): SelectOption[] {
+    const options: SelectOption[] = [];
+    for (let count = 1; count <= DOWNLOAD_MAX_CONCURRENCY; count += 1) {
+      options.push({ value: `${count} 个线程` });
+    }
+    return options;
   }
 
   @Builder
   private MyDownloadSettingsCard(): void {
-    Column({ space: 10 }) {
-      Text('下载')
-        .fontSize(18)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#2B2027');
-      Text(this.downloadManagerStatus)
-        .width('100%')
-        .fontSize(12)
-        .fontColor('#7C6470')
-        .maxLines(2);
-      TextInput({
-        text: this.downloadDirectoryPath,
-        placeholder: `默认应用目录：${this.abilityFilesDir()}/${READER_DOWNLOAD_DIR_NAME}`
-      })
-        .width('100%')
-        .height(34)
-        .backgroundColor('#F8F8F8')
-        .borderRadius(8)
-        .fontSize(12)
-        .onChange((value: string) => {
-          this.downloadDirectoryPath = value;
-          this.writeValue('download_directory_path', value);
-        });
-      Row({ space: 8 }) {
-        Button(`线程 ${this.downloadConcurrency}`)
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            const next = this.downloadConcurrency >= DOWNLOAD_MAX_CONCURRENCY ? 1 : this.downloadConcurrency + 1;
-            this.downloadConcurrency = next;
-            this.writeValue('download_concurrency', next);
-          });
-        Button(this.downloadUseOriginImage ? '原图: 开' : '原图: 关')
-          .layoutWeight(1)
-          .height(28)
-          .fontColor(this.downloadUseOriginImage ? '#FFFFFF' : '#2B2027')
-          .backgroundColor(this.downloadUseOriginImage ? '#C86B8C' : '#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.downloadUseOriginImage = !this.downloadUseOriginImage;
-            this.writeValue('download_origin_image', this.downloadUseOriginImage);
-          });
+    ListItemGroup({
+      style: ListItemGroupStyle.CARD,
+      header: (): void => {
+        this.SettingsGroupHeader('下载', this.downloadManagerStatus);
       }
-      .width('100%');
-      Row({ space: 8 }) {
-        Button('导入 CSV')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.importDownloadCsv();
-          });
-        Button('导出 CSV')
-          .layoutWeight(1)
-          .height(28)
-          .backgroundColor('#F3E3EA')
-          .borderRadius(8)
-          .onClick(() => {
-            this.exportDownloadCsv();
-          });
+    }) {
+      ListItem({ style: ListItemStyle.CARD }) {
+        Column({ space: 10 }) {
+          Text('下载目录')
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          TextInput({ text: this.downloadDirectoryPath, placeholder: '留空使用应用默认目录' })
+            .width('100%')
+            .height(48)
+            .fontSize(14)
+            .fontColor($r('sys.color.font_primary'))
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .accessibilityText('下载目录')
+            .onChange((value: string) => {
+              this.downloadDirectoryPath = value;
+              this.writeValue('download_directory_path', value);
+            });
+          Text(`默认：${this.abilityFilesDir()}/${READER_DOWNLOAD_DIR_NAME}`)
+            .width('100%')
+            .fontSize(12)
+            .lineHeight(18)
+            .fontColor($r('sys.color.font_secondary'));
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+        .alignItems(HorizontalAlign.Start);
       }
-      .width('100%');
-      TextArea({
-        text: this.downloadImportExportText,
-        placeholder: 'Android CSV，可粘贴导入或导出当前下载队列'
-      })
+      .height(undefined);
+      ListItem({ style: ListItemStyle.CARD }) {
+        Row({ space: 12 }) {
+          Text('并发下载')
+            .layoutWeight(1)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          Select(this.downloadConcurrencySelectOptions())
+            .selected(this.downloadConcurrency - 1)
+            .value(`${this.downloadConcurrency} 个线程`)
+            .height(48)
+            .font({ size: 14 })
+            .fontColor($r('sys.color.font_primary'))
+            .selectedOptionFontColor('#A85474')
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .accessibilityText('并发下载线程数')
+            .onSelect((index: number, _value: string) => {
+              const next = clampNumber(index + 1, 1, DOWNLOAD_MAX_CONCURRENCY);
+              if (next !== this.downloadConcurrency) {
+                this.downloadConcurrency = next;
+                this.writeValue('download_concurrency', next);
+              }
+            });
+        }
         .width('100%')
-        .height(86)
-        .maxLines(4)
-        .fontSize(12)
-        .lineHeight(18)
-        .fontColor('#6F5964')
-        .padding(10)
-        .backgroundColor('#F8F8F8')
-        .borderRadius(8)
-        .onChange((value: string) => {
-          this.downloadImportExportText = value;
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 });
+      }
+      .height(undefined);
+      this.SettingsSwitchItem('下载原图', '优先获取画廊的原始图片', this.downloadUseOriginImage,
+        (isOn: boolean): void => {
+          if (isOn !== this.downloadUseOriginImage) {
+            this.downloadUseOriginImage = isOn;
+            this.writeValue('download_origin_image', isOn);
+          }
         });
-      Button('清空下载内容')
+      ListItem({ style: ListItemStyle.CARD }) {
+        Column({ space: 10 }) {
+          Text('下载队列 CSV')
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          TextArea({
+            text: this.downloadImportExportText,
+            placeholder: '粘贴 Android CSV 导入，或导出当前下载队列'
+          })
+            .width('100%')
+            .height(112)
+            .maxLines(5)
+            .fontSize(14)
+            .lineHeight(20)
+            .fontColor($r('sys.color.font_primary'))
+            .padding(12)
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .borderRadius(12)
+            .accessibilityText('下载队列 CSV 内容')
+            .onChange((value: string) => {
+              this.downloadImportExportText = value;
+            });
+          Row({ space: 12 }) {
+            Button('导入 CSV')
+              .layoutWeight(1)
+              .height(48)
+              .fontSize(14)
+              .fontColor('#FFFFFF')
+              .backgroundColor('#C86B8C')
+              .borderRadius(12)
+              .onClick(() => {
+                this.importDownloadCsv();
+              });
+            Button('导出 CSV')
+              .layoutWeight(1)
+              .height(48)
+              .fontSize(14)
+              .fontColor('#A85474')
+              .backgroundColor($r('sys.color.comp_background_tertiary'))
+              .borderRadius(12)
+              .onClick(() => {
+                this.exportDownloadCsv();
+              });
+          }
+          .width('100%');
+        }
         .width('100%')
-        .height(30)
-        .fontColor('#B42318')
-        .backgroundColor('#FFF3F2')
-        .borderRadius(8)
-        .onClick(() => {
-          this.confirmClearAllDownloadContent();
-        });
+        .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+        .alignItems(HorizontalAlign.Start);
+      }
+      .height(undefined);
+      this.SettingsActionItem('清空下载内容', (): void => {
+        this.confirmClearAllDownloadContent();
+      }, true);
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .alignItems(HorizontalAlign.Start);
+    .divider({ strokeWidth: 0.5, color: $r('sys.color.comp_divider'), startMargin: 20, endMargin: 20 });
   }
 
   @Builder
   private MyLocalAccountCacheSettingsCard(): void {
-    Column({ space: 10 }) {
-      Text('本地账号缓存')
-        .fontSize(18)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#2B2027');
-      Text(this.cookieStatusSummary)
-        .width('100%')
-        .fontSize(12)
-        .fontColor('#7C6470')
-        .maxLines(2);
-      Button('删除本地账号缓存')
-        .width('100%')
-        .height(30)
-        .fontColor('#B42318')
-        .backgroundColor('#FFF3F2')
-        .borderRadius(8)
-        .onClick(() => {
-          this.confirmClearLocalAccountCache();
-        });
+    ListItemGroup({
+      style: ListItemGroupStyle.CARD,
+      header: (): void => {
+        this.SettingsGroupHeader('本地账号缓存', this.cookieStatusSummary);
+      }
+    }) {
+      this.SettingsActionItem('删除本地账号缓存', (): void => {
+        this.confirmClearLocalAccountCache();
+      }, true);
     }
-    .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .alignItems(HorizontalAlign.Start);
+    .width('100%');
   }
 
   @Builder
   private MySection(): void {
-    Scroll(this.myScroller) {
-      Column({ space: 12 }) {
-        this.PageContentStartSpacer(12);
-        this.MyBrandHeader();
-        this.MyDrawerCard();
+    List({ space: 16, scroller: this.myScroller }) {
+      if (this.shouldUsePageContentStartSpacer()) {
+        ListItem() {
+          Column() {}
+            .height(this.pageContentStartSpacerHeight(16));
+        }
       }
-      .width('100%')
-      .alignItems(HorizontalAlign.Start)
-      .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER });
+      ListItem() {
+        this.MyBrandHeader();
+      }
+      this.MyDrawerCard();
     }
     .layoutWeight(1)
     .width('100%')
+    .constraintSize({ maxWidth: 840 })
     .height('100%')
+    .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER })
+    .backgroundColor($r('sys.color.ohos_id_color_sub_background'))
     .contentStartOffset(this.pageContentContainerStartOffset())
     .contentEndOffset(this.pageContentEndOffset())
+    .scrollBar(BarState.Auto)
     .edgeEffect(EdgeEffect.Spring);
   }
 

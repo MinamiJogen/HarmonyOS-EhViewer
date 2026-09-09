@@ -1,6 +1,9 @@
 import {
   DOWNLOAD_STATUS_DELETED,
   DOWNLOAD_STATUS_DONE,
+  DOWNLOAD_STATUS_DOWNLOADING,
+  DOWNLOAD_STATUS_FAILED,
+  DOWNLOAD_STATUS_PAUSED,
   DOWNLOAD_STATUS_QUEUED,
   DownloadQueueItem
 } from './DownloadModels';
@@ -28,6 +31,10 @@ export struct DownloadQueueView {
   @Prop managerStatus: string = '下载器空闲';
   @Prop downloadRootText: string = '';
   @Prop revision: number = 0;
+  @Prop activeContentStartOffset: number = 0;
+  @Prop activeContentEndOffset: number = 0;
+  @Prop activeLoading: boolean = false;
+  activeScroller: Scroller = new Scroller();
   @State private containerWidth: number = 0;
 
   imageUrlForCover: DownloadQueueStringResolver = (value: string): string => value;
@@ -152,12 +159,36 @@ export struct DownloadQueueView {
     return this.refreshAwareText(text);
   }
 
-  private itemActionColorLive(item: DownloadQueueItem): string {
-    return this.refreshAwareText(item.error.length > 0 ? '#B42318' : '#7C6470');
+  private itemActionColorLive(item: DownloadQueueItem): ResourceColor {
+    return this.refreshAwareText(item.error).length > 0 ?
+      $r('sys.color.ohos_id_color_warning') : $r('sys.color.font_secondary');
   }
 
   private shouldPauseItem(item: DownloadQueueItem): boolean {
-    return this.isItemRunning(item) || item.status === DOWNLOAD_STATUS_QUEUED;
+    return this.refreshAwareNumber(this.isItemRunning(item) || item.status === DOWNLOAD_STATUS_QUEUED ? 1 : 0) === 1;
+  }
+
+  private itemCommandLabel(item: DownloadQueueItem): string {
+    if (this.shouldPauseItem(item)) {
+      return '暂停';
+    }
+    if (item.status === DOWNLOAD_STATUS_FAILED) {
+      return '重试';
+    }
+    if (item.status === DOWNLOAD_STATUS_PAUSED || item.status === DOWNLOAD_STATUS_DOWNLOADING ||
+      item.downloaded > 0) {
+      return '继续';
+    }
+    return '开始';
+  }
+
+  private canStartAll(): boolean {
+    return this.refreshAwareNumber(
+      this.activeItems().some((item: DownloadQueueItem) => !this.isItemRunning(item)) ? 1 : 0) === 1;
+  }
+
+  private canPauseAll(): boolean {
+    return this.activeItems().some((item: DownloadQueueItem) => this.shouldPauseItem(item));
   }
 
   private lengthToNumber(value: Length): number {
@@ -261,102 +292,84 @@ export struct DownloadQueueView {
   }
 
   @Builder
-  private IconButton(
-    symbol: Resource,
-    label: string,
-    backgroundColor: string,
-    fontColor: string,
-    action: DownloadQueueCommand,
-    enabled: boolean = true
-  ): void {
-    Button() {
-      SymbolGlyph(symbol)
-        .fontSize(18)
-        .fontColor([fontColor]);
-    }
-    .width(38)
-    .height(34)
-    .backgroundColor(backgroundColor)
-    .borderRadius(8)
-    .opacity(enabled ? 1 : 0.42)
-    .enabled(enabled)
-    .accessibilityText(label)
-    .accessibilityDescription(label)
-    .onClick(() => {
-      action();
-    });
+  private GroupHeader(title: string): void {
+    Text(title)
+      .width('100%')
+      .fontSize(14)
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('sys.color.font_secondary'))
+      .padding({ left: 16, right: 16, top: 12, bottom: 12 });
   }
 
   @Builder
-  private TextActionButton(symbol: Resource, label: string, primary: boolean, action: DownloadQueueCommand): void {
-    Button() {
-      Row({ space: 6 }) {
+  private TextActionButton(symbol: Resource, label: string, primary: boolean,
+    action: DownloadQueueCommand, enabled: boolean = true): void {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 8 }) {
         SymbolGlyph(symbol)
-          .fontSize(16)
-          .fontColor([primary ? '#FFFFFF' : '#2B2027']);
+          .fontSize(18)
+          .fontColor([primary ? '#FFFFFF' : $r('sys.color.font_primary')]);
         Text(label)
-          .fontSize(13)
+          .layoutWeight(1)
+          .fontSize(15)
           .fontWeight(FontWeight.Medium)
-          .fontColor(primary ? '#FFFFFF' : '#2B2027')
-          .maxLines(1);
+          .fontColor(primary ? '#FFFFFF' : $r('sys.color.font_primary'))
+          .textAlign(TextAlign.Center);
       }
+      .width('100%')
       .justifyContent(FlexAlign.Center);
     }
     .layoutWeight(1)
-    .height(34)
-    .backgroundColor(primary ? '#C86B8C' : '#F3E3EA')
-    .borderRadius(8)
+    .constraintSize({ minHeight: 48 })
+    .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+    .backgroundColor(primary ? '#C86B8C' : $r('sys.color.comp_background_tertiary'))
+    .borderRadius(12)
+    .enabled(enabled)
+    .accessibilityText(label)
     .onClick(() => {
       action();
     });
   }
 
   @Builder
-  private TotalProgressBlock(clickable: boolean): void {
-    Column({ space: 8 }) {
-      Row() {
-        Column({ space: 2 }) {
+  private TotalProgressBlock(): void {
+    Column({ space: 14 }) {
+      Row({ space: 12 }) {
+        Column({ space: 6 }) {
           Text('下载总进度')
-            .fontSize(15)
+            .fontSize(18)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#2B2027');
-          Text(`${this.activeProgressItems().length} 个任务 · ${this.totalCompletedPages()}/${this.totalProgressPages()} 页`)
-            .fontSize(11)
-            .fontColor('#7C6470')
-            .maxLines(1);
+            .fontColor($r('sys.color.font_primary'));
+          Text(this.refreshAwareText(
+            `${this.activeProgressItems().length} 个任务 · ${this.totalCompletedPages()}/${this.totalProgressPages()} 页`))
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start);
-        Text(`${this.totalProgressPercent()}%`)
-          .fontSize(18)
+        Text(this.refreshAwareText(`${this.totalProgressPercent()}%`))
+          .fontSize(28)
           .fontWeight(FontWeight.Bold)
           .fontColor('#A85474');
       }
-      .width('100%');
-      Progress({ value: this.totalProgressPercent(), total: 100, type: ProgressType.Linear })
+      .width('100%')
+      .alignItems(VerticalAlign.Center);
+      Progress({ value: this.refreshAwareNumber(this.totalProgressPercent()), total: 100, type: ProgressType.Linear })
         .width('100%')
-        .height(8)
         .color('#C86B8C')
-        .backgroundColor('#EEE4E9')
-        .borderRadius(4)
-        .style({ strokeWidth: 8 });
+        .backgroundColor($r('sys.color.comp_background_tertiary'))
+        .style({ strokeWidth: 8 })
+        .accessibilityText(this.refreshAwareText(`下载总进度 ${this.totalProgressPercent()}%`));
       if (this.managerStatus.length > 0) {
         Text(this.managerStatus)
-          .fontSize(11)
-          .fontColor('#6F5964')
-          .maxLines(1);
+          .width('100%')
+          .fontSize(13)
+          .fontColor($r('sys.color.font_secondary'));
       }
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .border({ width: 1, color: '#F2E6EC' })
-    .onClick(() => {
-      if (clickable) {
-        this.onViewModeChange(DOWNLOAD_VIEW_ACTIVE);
-      }
-    });
+    .padding(16)
+    .alignItems(HorizontalAlign.Start);
   }
 
   @Builder
@@ -458,97 +471,167 @@ export struct DownloadQueueView {
   }
 
   @Builder
-  private ActiveItemCard(item: DownloadQueueItem): void {
-    Row({ space: 12 }) {
-      if (item.cover.length > 0) {
-        Image(this.imageUrlForCover(item.cover))
-          .width(58)
-          .height(82)
-          .borderRadius(6)
-          .objectFit(ImageFit.Cover);
-      } else {
-        Column() {
-          Text('无封面')
-            .fontSize(10)
-            .fontColor('#9A7D8A');
-        }
-        .width(58)
-        .height(82)
-        .justifyContent(FlexAlign.Center)
-        .backgroundColor('#F3E3EA')
-        .borderRadius(6);
-      }
-
-      Column({ space: 7 }) {
-        Text(item.title.length > 0 ? item.title : `${item.gid}`)
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor('#2B2027')
-          .maxLines(2);
-        Column({ space: 7 }) {
-          Row({ space: 8 }) {
-            Text(this.itemStatusLabelLive(item))
-              .fontSize(11)
-              .fontColor('#FFFFFF')
-              .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-              .backgroundColor(this.itemStatusColorLive(item))
-              .borderRadius(6);
-            Text(this.itemProgressTextLive(item))
-              .fontSize(11)
-              .fontColor('#7C6470')
-              .maxLines(1);
+  private ActiveItemHeader(item: DownloadQueueItem): void {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 14 }) {
+        if (item.cover.length > 0) {
+          Image(this.imageUrlForCover(item.cover))
+            .width(64)
+            .height(88)
+            .borderRadius(10)
+            .clip(true)
+            .objectFit(ImageFit.Cover);
+        } else {
+          Column() {
+            SymbolGlyph($r('sys.symbol.waveform_folder_fill'))
+              .fontSize(24)
+              .fontColor([$r('sys.color.font_secondary')]);
           }
-          .width('100%');
-          Progress({ value: this.itemProgressPercentLive(item), total: 100, type: ProgressType.Linear })
-            .width('100%')
-            .height(8)
-            .color(this.itemStatusColorLive(item))
-            .backgroundColor('#EEE4E9')
-            .borderRadius(4)
-            .style({ strokeWidth: 8 });
-          Row({ space: 10 }) {
-            Text(this.itemSpeedTextLive(item))
-              .fontSize(11)
-              .fontColor('#7C6470');
-            Text(`剩余 ${this.itemRemainingTextLive(item)}`)
-              .fontSize(11)
-              .fontColor('#7C6470');
-          }
-          Text(this.itemActionTextLive(item))
-            .fontSize(11)
-            .fontColor(this.itemActionColorLive(item))
-            .maxLines(1);
+          .width(64)
+          .height(88)
+          .justifyContent(FlexAlign.Center)
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .borderRadius(10);
         }
-        .width('100%')
+        Column({ space: 8 }) {
+          Text(item.title.length > 0 ? item.title : `${item.gid}`)
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+            .maxLines(3)
+            .textOverflow({ overflow: TextOverflow.Ellipsis });
+          Text(this.siteDisplayNameForItem(item))
+            .fontSize(12)
+            .fontColor($r('sys.color.font_secondary'));
+          Text(this.itemStatusLabelLive(item))
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.itemStatusColorLive(item));
+        }
+        .layoutWeight(1)
         .alignItems(HorizontalAlign.Start);
-        Row({ space: 8 }) {
-          this.IconButton(
-            this.shouldPauseItem(item) ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
-            this.shouldPauseItem(item) ? '暂停' : '开始',
-            this.shouldPauseItem(item) ? '#F3E3EA' : '#C86B8C',
-            this.shouldPauseItem(item) ? '#2B2027' : '#FFFFFF',
-            () => {
-              if (this.shouldPauseItem(item)) {
-                this.onPauseItem(item);
-              } else {
-                this.onStartItem(item);
-              }
-            }
-          );
-          this.IconButton($r('sys.symbol.trash_fill'), '删除', '#FFF3F2', '#B42318', () => {
-            this.onRemoveItem(item);
-          });
-        }
-        .width('100%');
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(14)
+          .fontColor([$r('sys.color.font_secondary')]);
       }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start);
+      .width('100%')
+      .alignItems(VerticalAlign.Top);
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(8)
-    .border({ width: 1, color: '#F2E6EC' });
+    .constraintSize({ minHeight: 88 })
+    .padding(0)
+    .backgroundColor(Color.Transparent)
+    .borderRadius(10)
+    .accessibilityText(`查看画廊 ${item.title.length > 0 ? item.title : item.gid}`)
+    .onClick(() => {
+      this.onOpenItemDetail(item);
+    });
+  }
+
+  @Builder
+  private ActiveItemCard(item: DownloadQueueItem): void {
+    Column({ space: 14 }) {
+      this.ActiveItemHeader(item);
+      Column({ space: 10 }) {
+        Row({ space: 12 }) {
+          Text(this.itemProgressTextLive(item))
+            .layoutWeight(1)
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
+          Text(`${this.itemProgressPercentLive(item)}%`)
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'));
+        }
+        .width('100%');
+        Progress({ value: this.itemProgressPercentLive(item), total: 100, type: ProgressType.Linear })
+          .width('100%')
+          .color(this.itemStatusColorLive(item))
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .style({ strokeWidth: 6 })
+          .accessibilityText(`下载进度 ${this.itemProgressPercentLive(item)}%`);
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.SpaceBetween }) {
+          Text(`速度 ${this.itemSpeedTextLive(item)}`)
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'))
+            .margin({ right: 16, bottom: 4 });
+          Text(`剩余 ${this.itemRemainingTextLive(item)}`)
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'))
+            .margin({ bottom: 4 });
+        }
+        .width('100%');
+        if (this.itemActionTextLive(item).length > 0) {
+          Text(this.itemActionTextLive(item))
+            .width('100%')
+            .fontSize(13)
+            .fontColor(this.itemActionColorLive(item))
+            .copyOption(CopyOptions.LocalDevice);
+        }
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start);
+      Row({ space: 12 }) {
+        this.TextActionButton(
+          this.shouldPauseItem(item) ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
+          this.refreshAwareText(this.itemCommandLabel(item)),
+          !this.shouldPauseItem(item),
+          () => {
+            if (this.shouldPauseItem(item)) {
+              this.onPauseItem(item);
+            } else {
+              this.onStartItem(item);
+            }
+          }
+        );
+        Button('移除')
+          .constraintSize({ minWidth: 80, minHeight: 48 })
+          .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+          .fontSize(15)
+          .fontColor($r('sys.color.ohos_id_color_warning'))
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .borderRadius(12)
+          .accessibilityText(`移除下载任务及本地文件 ${item.title}`)
+          .onClick(() => {
+            this.onRemoveItem(item);
+          });
+      }
+      .width('100%');
+    }
+    .width('100%')
+    .padding(16)
+    .alignItems(HorizontalAlign.Start);
+  }
+
+  @Builder
+  private ActiveEmptyState(): void {
+    Column({ space: 12 }) {
+      SymbolGlyph($r('sys.symbol.waveform_folder_fill'))
+        .fontSize(40)
+        .fontColor([$r('sys.color.font_secondary')]);
+      Text('暂无下载任务')
+        .fontSize(18)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.font_primary'));
+      Text('添加下载后，可在这里查看进度和管理任务。')
+        .fontSize(14)
+        .fontColor($r('sys.color.font_secondary'))
+        .textAlign(TextAlign.Center);
+      if (this.downloadedItems().length > 0) {
+        Button('查看已下载')
+          .constraintSize({ minHeight: 48 })
+          .fontSize(15)
+          .fontColor('#A85474')
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .onClick(() => {
+            this.onViewModeChange(DOWNLOAD_VIEW_DOWNLOADED);
+          });
+      }
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 200 })
+    .padding(24)
+    .justifyContent(FlexAlign.Center);
   }
 
   @Builder
@@ -563,41 +646,91 @@ export struct DownloadQueueView {
 
   @Builder
   private ActivePage(): void {
-    Column({ space: 12 }) {
-      this.TotalProgressBlock(false);
-      Row({ space: 8 }) {
-        this.TextActionButton($r('sys.symbol.play_fill'), '全部开始', true, () => {
-          this.onStartAll();
-        });
-        this.TextActionButton($r('sys.symbol.pause_fill'), '全部暂停', false, () => {
-          this.onPauseAll();
-        });
+    Column() {
+      List({ space: 16, scroller: this.activeScroller }) {
+        if (this.activeLoading) {
+          ListItem({ style: ListItemStyle.CARD }) {
+            Column({ space: 12 }) {
+              LoadingProgress()
+                .width(32)
+                .height(32);
+              Text('正在加载下载任务...')
+                .fontSize(14)
+                .fontColor($r('sys.color.font_secondary'));
+            }
+            .width('100%')
+            .constraintSize({ minHeight: 160 })
+            .padding(24)
+            .justifyContent(FlexAlign.Center);
+          }
+          .height(undefined);
+        } else {
+          if (this.activeItems().length > 0) {
+            ListItemGroup({ header: this.GroupHeader('下载概览'), style: ListItemGroupStyle.CARD }) {
+              ListItem({ style: ListItemStyle.CARD }) {
+                this.TotalProgressBlock();
+              }
+              .height(undefined);
+              ListItem({ style: ListItemStyle.CARD }) {
+                Row({ space: 12 }) {
+                  this.TextActionButton($r('sys.symbol.play_fill'), '全部开始', true, () => {
+                    this.onStartAll();
+                  }, this.canStartAll());
+                  this.TextActionButton($r('sys.symbol.pause_fill'), '全部暂停', false, () => {
+                    this.onPauseAll();
+                  }, this.canPauseAll());
+                }
+                .width('100%')
+                .padding({ left: 16, right: 16, top: 4, bottom: 16 });
+              }
+              .height(undefined);
+            }
+            ListItemGroup({
+              header: this.GroupHeader(`下载任务 · ${this.activeItems().length}`),
+              style: ListItemGroupStyle.CARD
+            }) {
+              ForEach(this.activeItems(), (item: DownloadQueueItem) => {
+                ListItem({ style: ListItemStyle.CARD }) {
+                  this.ActiveItemCard(item);
+                }
+                .height(undefined);
+              }, (item: DownloadQueueItem) => this.itemRenderKey(item));
+            }
+            .divider({ strokeWidth: 0.5, color: $r('sys.color.comp_divider'), startMargin: 16, endMargin: 16 });
+          } else {
+            ListItem({ style: ListItemStyle.CARD }) {
+              this.ActiveEmptyState();
+            }
+            .height(undefined);
+          }
+          if (this.downloadRootText.length > 0) {
+            ListItemGroup({ header: this.GroupHeader('保存位置'), style: ListItemGroupStyle.CARD }) {
+              ListItem({ style: ListItemStyle.CARD }) {
+                Text(this.downloadRootText)
+                  .width('100%')
+                  .fontSize(13)
+                  .fontColor($r('sys.color.font_secondary'))
+                  .copyOption(CopyOptions.LocalDevice)
+                  .padding(16);
+              }
+              .height(undefined);
+            }
+          }
+        }
       }
-      .width('100%');
-
-      Text(`目录：${this.downloadRootText}`)
-        .fontSize(11)
-        .fontColor('#7C6470')
-        .maxLines(2);
-
-      if (this.activeItems().length === 0) {
-        Text('没有下载中的任务。')
-          .width('100%')
-          .fontSize(13)
-          .fontColor('#6F5964')
-          .padding(12)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8)
-          .border({ width: 1, color: '#F2E6EC' });
-      } else {
-        ForEach(this.activeItems(), (item: DownloadQueueItem) => {
-          this.ActiveItemCard(item);
-        }, (item: DownloadQueueItem) => this.itemRenderKey(item));
-      }
+      .width('100%')
+      .constraintSize({ maxWidth: 840 })
+      .height('100%')
+      .padding({ left: 12, right: 12 })
+      .contentStartOffset(this.activeContentStartOffset)
+      .contentEndOffset(this.activeContentEndOffset)
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring);
     }
     .width('100%')
-    .justifyContent(FlexAlign.Start)
-    .alignItems(HorizontalAlign.Start);
+    .height('100%')
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor($r('sys.color.ohos_id_color_sub_background'));
   }
 
   build() {
