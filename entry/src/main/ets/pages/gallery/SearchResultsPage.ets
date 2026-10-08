@@ -9,6 +9,7 @@ import {
 } from '../../components/GalleryWaterfallView';
 import { GalleryPagerBar, PagerAction } from '../../components/GalleryPagerBar';
 import { SystemLoadingBlock } from '../../components/SystemLoadingBlock';
+import { contentAppearTransition, feedbackTransition } from '../../styles/Transitions';
 
 @Component
 export struct SearchResultsPage {
@@ -53,7 +54,8 @@ export struct SearchResultsPage {
         .fontColor('#B42318')
         .padding(12)
         .backgroundColor('#FFF3F2')
-        .borderRadius(8);
+        .borderRadius(8)
+        .transition(feedbackTransition());
     }
   }
 
@@ -89,7 +91,8 @@ export struct SearchResultsPage {
           formatRatingValue: this.formatRatingValue,
           transitionIdForItem: this.transitionIdForItem,
           onOpenItem: this.onOpenItem
-        });
+        })
+          .transition(contentAppearTransition());
         if (this.loading) {
           this.LoadingBlock();
         }

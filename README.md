@@ -1,6 +1,6 @@
 # HarmonyOS EhViewer / 鸿蒙 Ehviewer
 
-HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyOS 6.1+ 的非官方 E-Hentai / ExHentai 浏览器，使用 ArkTS、ArkUI 原生开发，界面简洁好用，适配多种设备和屏幕比例。
+HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS 7 / API 26 及以上系统的非官方 E-Hentai / ExHentai 浏览器，使用 ArkTS、ArkUI 原生开发，界面简洁好用，适配多种设备和屏幕比例。
 
 原代码已开源：[HarmonyOS-EhViewer](https://github.com/MinamiJogen/HarmonyOS-EhViewer)
 
@@ -14,6 +14,8 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 
 - E-Hentai / ExHentai 插画、漫画等资源浏览
 - 原生列表、详情、阅读和下载界面
+- 添加下载时通过沉浸光感弹窗选择原图或压缩图；选择随任务保存，继续和重试沿用原画质。
+- 下载内容可在系统文件管理的“我的手机 / Download / E-Harmony”中浏览，画廊文件夹按画廊名称命名。
 - Web 登录与 Cookie 同步
 - 收藏、本地收藏、搜索历史和快捷搜索
 - 标签翻译、标签搜索与关键词联想
@@ -28,25 +30,18 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 ### 手机竖屏
 
 <p align="center">
-  <img src="docs/screenshots/single-search-waterfall.jpg" alt="手机竖屏搜索瀑布流" width="30%">
   <img src="docs/screenshots/single-filter.jpg" alt="手机竖屏筛选器" width="30%">
-  <img src="docs/screenshots/single-ranking-switch.jpg" alt="手机竖屏排行榜切换" width="30%">
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/single-watch-tag-manager.jpg" alt="手机竖屏关注 Tag 管理" width="30%">
   <img src="docs/screenshots/single-detail.jpg" alt="手机竖屏详情页" width="30%">
-  <img src="docs/screenshots/single-detail-continue.jpg" alt="手机竖屏继续阅读入口" width="30%">
-</p>
-
-<p align="center">
   <img src="docs/screenshots/single-comments.jpg" alt="手机竖屏评论区" width="30%">
-  <img src="docs/screenshots/single-background-download.jpg" alt="手机竖屏后台下载" width="30%">
-  <img src="docs/screenshots/single-settings.jpg" alt="手机竖屏设置页面" width="30%">
 </p>
 
 <p align="center">
-  <sub>搜索、筛选、排行榜、关注 Tag、详情、评论、下载和设置入口会在竖屏宽度下保持紧凑排版。</sub>
+  <img src="docs/screenshots/single-reader.jpg" alt="手机竖屏阅读器与沉浸光感控制面板" width="30%">
+  <img src="docs/screenshots/single-reader-settings.jpg" alt="手机竖屏阅读器设置" width="30%">
+</p>
+
+<p align="center">
+  <sub>已适配HarmonyOS 7沉浸光感！</sub>
 </p>
 
 ### 双折叠屏
@@ -57,13 +52,7 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/dual-reader.jpg" alt="双折叠屏阅读器" width="30%">
-  <img src="docs/screenshots/dual-comments.jpg" alt="双折叠屏评论区" width="30%">
-  <img src="docs/screenshots/dual-download-manager.jpg" alt="双折叠屏下载管理" width="30%">
-</p>
-
-<p align="center">
-  <sub>宽屏下详情信息、预览列表、阅读区域、评论和下载管理会展开。</sub>
+  <sub>双折叠界面展示</sub>
 </p>
 
 ### 三折叠屏 / 平板
@@ -81,10 +70,40 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 </p>
 
 <p align="center">
-  <sub>三折叠屏和平板等更宽比例会展示更多内容列，适合横向浏览与快速比较。</sub>
+  <img src="docs/screenshots/wide-reader.jpg" alt="三折叠屏和平板阅读器与沉浸光感控制面板" width="90%">
+</p>
+
+<p align="center">
+  <sub>三折叠屏和平板展示</sub>
+</p>
+
+### 下载与文件管理
+
+<p align="center">
+  <img src="docs/screenshots/single-download-active.jpg" alt="手机竖屏下载任务与进度控制" width="30%">
+  <img src="docs/screenshots/single-background-download.jpg" alt="手机竖屏后台下载通知" width="30%">
+  <img src="docs/screenshots/single-download-completed.jpg" alt="手机竖屏已下载画廊与文件管理入口" width="30%">
+</p>
+
+<p align="center">
+  <sub>更健壮的后台下载</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/wide-system-file-manager.jpg" alt="系统文件管理中浏览 E-Harmony 下载的画廊图片" width="90%">
+</p>
+
+<p align="center">
+  <sub>在系统文件管理中打开“我的手机 / Download / E-Harmony”，按画廊名称查找文件夹，浏览和分享下载的图片。</sub>
 </p>
 
 ## 更新记录
+
+### 1.1.0 (2026-10-08)
+
+- 适配HarmonyOS 7 (API 26)全新沉浸光感外观，UI更精致，动画更流畅。
+- 新增原图下载功能，点击下载后可选择下载原图或压缩图。
+- 新增外部访问已下载画廊的功能，可在系统“文件管理“中访问已下载的画廊，直接查看/分享图片，更便捷。
 
 ### 1.0.7 (2026-09-09)
 
@@ -131,10 +150,10 @@ HarmonyOS EhViewer（鸿蒙 Ehviewer）是一个面向 HarmonyOS NEXT / HarmonyO
 
 可以在 [Releases](../../releases) 页面直接下载安装包，并使用 [HoKit](https://github.com/yabi-zzh/HoKit) 进行安装。
 
-也可以从源码自行构建。本项目使用 HarmonyOS / DevEco Studio 工程结构。
+也可以从源码自行构建。本项目使用 HarmonyOS / DevEco Studio 工程结构，需要安装 HarmonyOS 26.0.0（API 26）或更高版本 SDK。目标 API 与最低兼容 API 均为 26，应用启用系统沉浸光感材质。
 
 ```sh
-hvigor assembleHap --mode module -p product=default -p buildMode=release --no-daemon
+hvigor assembleHap --mode module -p product=default -p buildMode=release -p properties.enableSignTask=false --no-daemon
 ```
 
 未签名 HAP 通常会生成在：

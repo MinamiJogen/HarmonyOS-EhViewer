@@ -1,6 +1,7 @@
 import { NativeGallerySummary } from '../../ehviewer/EhNative';
 import { GalleryPagerBar, PagerAction } from '../../components/GalleryPagerBar';
 import { SystemLoadingBlock } from '../../components/SystemLoadingBlock';
+import { contentAppearTransition, feedbackTransition } from '../../styles/Transitions';
 
 export type FavoriteGalleryImageResolver = (item: NativeGallerySummary) => string;
 export type FavoriteGalleryCategoryColorResolver = (category: string) => string;
@@ -235,7 +236,8 @@ struct FavoriteGalleryWaterfallView {
         .fontColor('#6F5964')
         .padding(12)
         .backgroundColor('#FFFFFF')
-        .borderRadius(8);
+        .borderRadius(8)
+        .transition(feedbackTransition());
     } else {
       WaterFlow() {
         ForEach(this.items, (item: NativeGallerySummary) => {
@@ -301,7 +303,8 @@ export struct FavoriteGalleryPage {
         .fontColor('#B42318')
         .padding(12)
         .backgroundColor('#FFF3F2')
-        .borderRadius(8);
+        .borderRadius(8)
+        .transition(feedbackTransition());
     }
   }
 
@@ -321,7 +324,8 @@ export struct FavoriteGalleryPage {
           formatRatingValue: this.formatRatingValue,
           transitionIdForItem: this.transitionIdForItem,
           onOpenItem: this.onOpenItem
-        });
+        })
+          .transition(contentAppearTransition());
         if (this.loading) {
           this.LoadingBlock();
         }

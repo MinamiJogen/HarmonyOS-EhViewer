@@ -10,6 +10,7 @@ import {
 } from '../../components/GalleryWaterfallView';
 import { GalleryPagerBar, PagerAction } from '../../components/GalleryPagerBar';
 import { SystemLoadingBlock } from '../../components/SystemLoadingBlock';
+import { contentAppearTransition, feedbackTransition } from '../../styles/Transitions';
 
 @Component
 export struct HomeGalleryPage {
@@ -56,7 +57,8 @@ export struct HomeGalleryPage {
         .fontColor('#B42318')
         .padding(12)
         .backgroundColor('#FFF3F2')
-        .borderRadius(8);
+        .borderRadius(8)
+        .transition(feedbackTransition());
     }
   }
 
@@ -78,7 +80,8 @@ export struct HomeGalleryPage {
           transitionIdForItem: this.transitionIdForItem,
           rankLabelForItem: this.rankLabelForItem,
           onOpenItem: this.onOpenItem
-        });
+        })
+          .transition(contentAppearTransition());
         if (this.loading && this.loadingMessage.indexOf('下一页') >= 0) {
           this.LoadingBlock();
         }

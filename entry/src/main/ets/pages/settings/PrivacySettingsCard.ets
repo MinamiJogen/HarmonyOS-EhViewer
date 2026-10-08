@@ -1,4 +1,5 @@
 import { ReaderToggleChangeHandler } from '../../models/AppModels';
+import { IMMERSIVE_CONTROL_MATERIAL } from '../../styles/ImmersiveMaterials';
 
 @Component
 export struct PrivacySettingsCard {
@@ -41,8 +42,7 @@ export struct PrivacySettingsCard {
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start);
         Toggle({ type: ToggleType.Switch, isOn: value })
-          .selectedColor('#C86B8C')
-          .switchPointColor('#FFFFFF')
+          .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
           .responseRegion({ x: 0, y: -8, width: '100%', height: 48 })
           .enabled(enabled)
           .accessibilityText(title)

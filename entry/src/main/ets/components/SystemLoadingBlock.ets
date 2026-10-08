@@ -1,3 +1,5 @@
+import { feedbackTransition } from '../styles/Transitions';
+
 @Component
 export struct SystemLoadingBlock {
   @Prop message: string = '';
@@ -19,6 +21,7 @@ export struct SystemLoadingBlock {
     .width('100%')
     .constraintSize({ minHeight: this.minHeight })
     .justifyContent(FlexAlign.Center)
-    .alignItems(HorizontalAlign.Center);
+    .alignItems(HorizontalAlign.Center)
+    .transition(feedbackTransition());
   }
 }

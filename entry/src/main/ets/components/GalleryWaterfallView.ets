@@ -1,4 +1,5 @@
 import { NativeGallerySummary } from '../ehviewer/EhNative';
+import { feedbackTransition } from '../styles/Transitions';
 
 export type GalleryImageResolver = (item: NativeGallerySummary) => string;
 export type GalleryCategoryColorResolver = (category: string) => string;
@@ -260,7 +261,8 @@ export struct GalleryWaterfallView {
         .fontColor('#6F5964')
         .padding(12)
         .backgroundColor('#FFFFFF')
-        .borderRadius(8);
+        .borderRadius(8)
+        .transition(feedbackTransition());
     } else {
       WaterFlow() {
         ForEach(this.items, (item: NativeGallerySummary, index: number) => {

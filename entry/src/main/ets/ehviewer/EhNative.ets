@@ -1,11 +1,19 @@
 import http from '@ohos.net.http';
 import webview from '@ohos.web.webview';
 import fileIo from '@ohos.file.fs';
+import url from '@ohos.url';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AppNetworkProxy } from '../network/AppNetworkProxy';
 
 const DOMAIN = 0x0000;
 const LOG_TAG = 'EhNative';
+
+export interface NativeRequestControl {
+  onStart: (request: http.HttpRequest) => void;
+  onFinish: (request: http.HttpRequest) => void;
+  isCancelled: () => boolean;
+  cancelled?: Promise<void>;
+}
 
 interface NativeRequestErrorInfo {
   code?: number | string;
@@ -219,6 +227,8 @@ export interface NativeGalleryImagePage {
   imageUrl: string;
   originImageUrl: string;
   skipHathKey?: string;
+  originalWidth?: number;
+  originalHeight?: number;
 }
 
 export interface NativeTopListEntry {
@@ -444,8 +454,8 @@ const GALLERY_QUERY_IDENTITY_PATTERN: RegExp =
 const RESULT_COUNT_PATTERN: RegExp = /Found\s+(.+?)\s+results/i;
 const PREVIEW_LINK_PATTERN: RegExp =
   /<a[^>]+href=["']([^"']*\/s\/[0-9a-f]{10}\/\d+-\d+[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
-const IMAGE_URL_PATTERN: RegExp = /<img[^>]*src="([^"]+)" style/i;
-const ORIGIN_IMAGE_URL_PATTERN: RegExp = /<a href="([^"]+)fullimg([^"]+)">/i;
+const IMAGE_URL_PATTERN: RegExp = /<img\b(?=[^>]*\sid\s*=\s*["']img["'])[^>]*\ssrc\s*=\s*["']([^"'<>]+)["'][^>]*>/i;
+const ORIGIN_IMAGE_URL_PATTERN: RegExp = /<a\b[^>]*\shref\s*=\s*["']([^"'<>]*\/(?:fullimg\.php(?:\?|$)|fullimg\/)[^"'<>]*)["'][^>]*>([\s\S]*?)<\/a>/i;
 const PAGE_URL_PATTERN: RegExp = /\/s\/([0-9a-f]{10})\/(\d+)-(\d+)/i;
 const SKIP_HATH_KEY_PATTERN: RegExp = /return\s+nl\(['"]([^'"]+)['"]\)/i;
 const DETAIL_SCRIPT_PATTERN: RegExp =
@@ -1960,14 +1970,18 @@ function parseReaderPage(html: string, pageUrl: string): NativeGalleryImagePage 
   const originMatch = ORIGIN_IMAGE_URL_PATTERN.exec(html);
   const skipHathMatch = SKIP_HATH_KEY_PATTERN.exec(html);
   const imageUrl = imageMatch && imageMatch[1] ? decodeHtml(imageMatch[1]) : '';
-  const originImageUrl = originMatch && originMatch[1] && originMatch[2]
-    ? `${decodeHtml(originMatch[1])}fullimg${decodeHtml(originMatch[2])}`
+  const originImageUrl = originMatch && originMatch[1]
+    ? new url.URL(decodeHtml(originMatch[1]), pageUrl).toString()
     : '';
   const skipHathKey = skipHathMatch && skipHathMatch[1] ? decodeHtml(skipHathMatch[1]) : '';
   const pageIndex = parsePageIndexFromUrl(pageUrl);
 
   if (imageUrl.length === 0) {
     throw new Error('Reader image parse failed');
+  }
+  if (originImageUrl.length === 0 &&
+    /<a\b[^>]*>\s*(?:<[^>]*>\s*)*Download\s+original\b/i.test(html)) {
+    throw new Error('原图入口解析失败，请重试');
   }
 
   const page: NativeGalleryImagePage = {
@@ -1978,6 +1992,16 @@ function parseReaderPage(html: string, pageUrl: string): NativeGalleryImagePage 
     originImageUrl,
     skipHathKey
   };
+  const originalLabel = originMatch && originMatch[2] ? decodeHtml(originMatch[2].replace(/<[^>]*>/g, ' ')) : '';
+  const originalDimensions = /Download\s+original\s+(\d[\d,]*)\s*[x×]\s*(\d[\d,]*)/i.exec(originalLabel);
+  if (originalDimensions) {
+    const width = Number(originalDimensions[1].replace(/,/g, ''));
+    const height = Number(originalDimensions[2].replace(/,/g, ''));
+    if (Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0) {
+      page.originalWidth = width;
+      page.originalHeight = height;
+    }
+  }
   return page;
 }
 
@@ -2691,6 +2715,9 @@ export class NativeEhClient {
   private static readonly REQUEST_ACCEPT: string =
     'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
   private static readonly REQUEST_ACCEPT_LANGUAGE: string = 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7';
+  static readonly DOWNLOAD_USER_AGENT: string = NativeEhClient.REQUEST_USER_AGENT;
+  static readonly DOWNLOAD_ACCEPT: string = NativeEhClient.REQUEST_ACCEPT;
+  static readonly DOWNLOAD_ACCEPT_LANGUAGE: string = NativeEhClient.REQUEST_ACCEPT_LANGUAGE;
   private static stableCookieHeader: string = '';
 
   private static hostFromUrl(url: string): string {
@@ -2764,7 +2791,10 @@ export class NativeEhClient {
   }
 
   private static captureResponseCookies(url: string, response: http.HttpResponse): void {
-    const cookieHeader = response.cookies;
+    NativeEhClient.captureCookieHeader(url, response.cookies);
+  }
+
+  private static captureCookieHeader(url: string, cookieHeader: string): void {
     if (cookieHeader.length === 0) {
       return;
     }
@@ -2817,50 +2847,242 @@ export class NativeEhClient {
     return values.join('; ');
   }
 
+  public static async fetchOriginalImageUrl(
+    site: string,
+    page: NativeGalleryImagePage,
+    control?: NativeRequestControl
+  ): Promise<string> {
+    if (control && control.isCancelled()) {
+      throw new Error('请求已取消');
+    }
+    if (page.originImageUrl.length === 0) {
+      throw new Error('此页面未提供原图链接');
+    }
+    const originalUrl = new url.URL(page.originImageUrl, page.pageUrl);
+    const expected = new url.URL(site === GallerySite.EX ? EhUrl.DOMAIN_EX : EhUrl.DOMAIN_E);
+    const originalPathValid = originalUrl.pathname === '/fullimg.php' ||
+      (originalUrl.pathname.startsWith('/fullimg/') && originalUrl.pathname.length > '/fullimg/'.length);
+    const supportedProtocol = originalUrl.protocol === 'https:' || originalUrl.protocol === 'http:';
+    const defaultPort = originalUrl.port.length === 0 ||
+      (originalUrl.protocol === 'https:' && originalUrl.port === '443') ||
+      (originalUrl.protocol === 'http:' && originalUrl.port === '80');
+    if (!supportedProtocol || originalUrl.hostname !== expected.hostname || !defaultPort ||
+      originalUrl.username.length > 0 || originalUrl.password.length > 0 || !originalPathValid) {
+      throw new Error('原图入口地址无效');
+    }
+    const requestUrl = readerPageUrlWithSkipHathKey(originalUrl.toString(), page.skipHathKey || '');
+    const request = http.createHttp();
+    let receivedLocation = '';
+    let receivedStatus = 0;
+    let receivedCookies = '';
+    let finishReceivingHeaders: () => void = (): void => {};
+    const locationReceived = new Promise<void>((resolve: () => void): void => {
+      finishReceivingHeaders = resolve;
+    });
+    let redirectHeadersTimeout: number | undefined = undefined;
+    const readRedirectHeaders = (header: Object): void => {
+      receivedLocation = '';
+      receivedStatus = 0;
+      receivedCookies = '';
+      const responseHeaders = header as Record<string, string>;
+      for (const name of Object.keys(responseHeaders)) {
+        const value = `${responseHeaders[name]}`.trim();
+        if (name.toLowerCase() === 'location') {
+          receivedLocation = value;
+        } else if (name.toLowerCase() === 'set-cookie') {
+          receivedCookies = value;
+        }
+        // NetStack can expose the HTTP status line as a key with an empty
+        // value; other runtimes expose it through the status-line field.
+        const statusLine = /^HTTP\/\S+\s+(\d{3})(?:\s|$)/i.exec(name) ||
+          (name.toLowerCase() === 'status-line' ? /^HTTP\/\S+\s+(\d{3})(?:\s|$)/i.exec(value) : null);
+        if (statusLine) {
+          receivedStatus = Number(statusLine[1]);
+        }
+      }
+    };
+    const onHeadersReceive = (header: Object): void => {
+      if (!control || !control.isCancelled()) {
+        readRedirectHeaders(header);
+        if (receivedLocation.length > 0 ||
+          (receivedStatus >= 300 && [301, 302, 303, 307, 308].indexOf(receivedStatus) < 0)) {
+          finishReceivingHeaders();
+        }
+      }
+    };
+    const resolveRedirectTarget = (): string => {
+      const target = new url.URL(receivedLocation, requestUrl);
+      if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+        throw new Error('原图返回的图片地址无效');
+      }
+      return target.toString();
+    };
+    try {
+      if (control) {
+        control.onStart(request);
+        if (control.isCancelled()) {
+          throw new Error('请求已取消');
+        }
+      }
+      request.on('headersReceive', onHeadersReceive);
+      const headers: Record<string, string> = {
+        'Accept': NativeEhClient.DOWNLOAD_ACCEPT,
+        'Accept-Language': NativeEhClient.REQUEST_ACCEPT_LANGUAGE,
+        'User-Agent': NativeEhClient.REQUEST_USER_AGENT,
+        'Referer': page.pageUrl
+      };
+      const cookie = NativeEhClient.readCookie(requestUrl, site);
+      if (cookie.length > 0) {
+        headers['Cookie'] = cookie;
+      }
+      const requestPromise = request.request(requestUrl, {
+        method: http.RequestMethod.GET,
+        expectDataType: http.HttpDataType.STRING,
+        maxRedirects: 0,
+        usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
+        readTimeout: 30000,
+        connectTimeout: 15000,
+        header: headers
+      });
+      const response = control && control.cancelled ? await Promise.race<http.HttpResponse>([
+        requestPromise,
+        control.cancelled.then((): http.HttpResponse => {
+          throw new Error('请求已取消');
+        })
+      ]) : await requestPromise;
+      if (control && control.isCancelled()) {
+        throw new Error('请求已取消');
+      }
+      NativeEhClient.captureResponseCookies(requestUrl, response);
+      const code = Number(response.responseCode);
+      readRedirectHeaders(response.header);
+      if ([301, 302, 303, 307, 308].indexOf(code) < 0 || receivedLocation.length === 0) {
+        throw new Error(`原图链接获取失败（HTTP ${code}），请检查登录状态或原图额度`);
+      }
+      return resolveRedirectTarget();
+    } catch (error) {
+      if (control && control.isCancelled()) {
+        throw new Error('请求已取消');
+      }
+      const errorCode = error !== undefined && error !== null && typeof error === 'object' ?
+        Number((error as NativeRequestErrorInfo).code) : 0;
+      // Some NetStack builds enable FOLLOWLOCATION even with MAXREDIRS=0:
+      // the expected first redirect arrives as curl error 47 rather than a
+      // successful HttpResponse. Its previously received Location is still
+      // the original-image URL, just as response.header("location") on Android.
+      if (errorCode === 2300047 && receivedLocation.length === 0 &&
+        (receivedStatus < 300 || [301, 302, 303, 307, 308].indexOf(receivedStatus) >= 0)) {
+        // Header events and request completion use separate native UV jobs.
+        // Keep the listener alive if completion reaches JS before the header.
+        const headerDeadline = new Promise<void>((resolve: () => void): void => {
+          redirectHeadersTimeout = setTimeout(resolve, 500);
+        });
+        const headerWaits: Promise<void>[] = [locationReceived, headerDeadline];
+        if (control && control.cancelled) {
+          headerWaits.push(control.cancelled);
+        }
+        try {
+          await Promise.race(headerWaits);
+        } finally {
+          if (redirectHeadersTimeout !== undefined) {
+            clearTimeout(redirectHeadersTimeout);
+            redirectHeadersTimeout = undefined;
+          }
+        }
+        if (control && control.isCancelled()) {
+          throw new Error('请求已取消');
+        }
+      }
+      if (errorCode === 2300047 && receivedLocation.length > 0 &&
+        (receivedStatus === 0 || [301, 302, 303, 307, 308].indexOf(receivedStatus) >= 0)) {
+        const target = resolveRedirectTarget();
+        NativeEhClient.captureCookieHeader(requestUrl, receivedCookies);
+        return target;
+      }
+      throw new Error(nativeRequestErrorMessage(error, '原图链接获取失败'));
+    } finally {
+      if (redirectHeadersTimeout !== undefined) {
+        clearTimeout(redirectHeadersTimeout);
+      }
+      try {
+        request.off('headersReceive', onHeadersReceive);
+      } catch (offError) {
+      }
+      try {
+        if (control) {
+          control.onFinish(request);
+        }
+      } finally {
+        try {
+          request.destroy();
+        } catch (destroyError) {
+        }
+      }
+    }
+  }
+
   private static async requestText(
     url: string,
     site: string,
     method: http.RequestMethod,
     referer: string,
-    body?: string
+    body?: string,
+    control?: NativeRequestControl
   ): Promise<string> {
+    if (control && control.isCancelled()) {
+      throw new Error('请求已取消');
+    }
     const request = http.createHttp();
-    const headers: Record<string, string> = {
-      'Accept': NativeEhClient.REQUEST_ACCEPT,
-      'Accept-Language': NativeEhClient.REQUEST_ACCEPT_LANGUAGE,
-      'User-Agent': NativeEhClient.REQUEST_USER_AGENT
-    };
-    const host = NativeEhClient.hostFromUrl(url);
-    if (host.length > 0) {
-      headers['Host'] = host;
-    }
-    const cookie = NativeEhClient.readCookie(url, site);
-    if (cookie.length > 0) {
-      headers['Cookie'] = cookie;
-    }
-    if (referer.length > 0) {
-      headers['Referer'] = referer;
-    }
-    if (method === http.RequestMethod.POST) {
-      headers['Content-Type'] = 'application/json; charset=UTF-8';
-      headers['Origin'] = EhUrl.origin(site);
-    }
-
-    const options: http.HttpRequestOptions = {
-      method,
-      expectDataType: http.HttpDataType.STRING,
-      usingCache: false,
-      usingProxy: AppNetworkProxy.requestProxy(),
-      readTimeout: 20000,
-      connectTimeout: 12000,
-      header: headers
-    };
-    if (body !== undefined) {
-      options.extraData = body;
-    }
-
     try {
-      const response = await request.request(url, options);
+      if (control) {
+        control.onStart(request);
+        if (control.isCancelled()) {
+          throw new Error('请求已取消');
+        }
+      }
+      const headers: Record<string, string> = {
+        'Accept': NativeEhClient.REQUEST_ACCEPT,
+        'Accept-Language': NativeEhClient.REQUEST_ACCEPT_LANGUAGE,
+        'User-Agent': NativeEhClient.REQUEST_USER_AGENT
+      };
+      const host = NativeEhClient.hostFromUrl(url);
+      if (host.length > 0) {
+        headers['Host'] = host;
+      }
+      const cookie = NativeEhClient.readCookie(url, site);
+      if (cookie.length > 0) {
+        headers['Cookie'] = cookie;
+      }
+      if (referer.length > 0) {
+        headers['Referer'] = referer;
+      }
+      if (method === http.RequestMethod.POST) {
+        headers['Content-Type'] = 'application/json; charset=UTF-8';
+        headers['Origin'] = EhUrl.origin(site);
+      }
+      const options: http.HttpRequestOptions = {
+        method,
+        expectDataType: http.HttpDataType.STRING,
+        usingCache: false,
+        usingProxy: AppNetworkProxy.requestProxy(),
+        readTimeout: 20000,
+        connectTimeout: 12000,
+        header: headers
+      };
+      if (body !== undefined) {
+        options.extraData = body;
+      }
+      const requestPromise = request.request(url, options);
+      const response = control && control.cancelled ? await Promise.race<http.HttpResponse>([
+        requestPromise,
+        control.cancelled.then((): http.HttpResponse => {
+          throw new Error('请求已取消');
+        })
+      ]) : await requestPromise;
+      if (control && control.isCancelled()) {
+        throw new Error('请求已取消');
+      }
       NativeEhClient.captureResponseCookies(url, response);
       const code = Number(response.responseCode);
       const text = typeof response.result === 'string' ? response.result : '';
@@ -2869,11 +3091,23 @@ export class NativeEhClient {
       }
       return text;
     } catch (error) {
+      if (control && control.isCancelled()) {
+        throw new Error('请求已取消');
+      }
       const message = nativeRequestErrorMessage(error, 'Network request failed');
       hilog.error(DOMAIN, LOG_TAG, 'Native text request failed. Url=%{public}s Cause=%{public}s', url, message);
       throw new Error(message);
     } finally {
-      request.destroy();
+      try {
+        if (control) {
+          control.onFinish(request);
+        }
+      } finally {
+        try {
+          request.destroy();
+        } catch (destroyError) {
+        }
+      }
     }
   }
 
@@ -3343,13 +3577,19 @@ export class NativeEhClient {
     return NativeEhClient.createGalleryListResultFromHtml(site, requestUrl, html);
   }
 
-  public static async fetchGalleryDetail(site: string, summary: NativeGallerySummary): Promise<NativeGalleryDetail> {
+  public static async fetchGalleryDetail(site: string, summary: NativeGallerySummary,
+    control?: NativeRequestControl): Promise<NativeGalleryDetail> {
     const html = await NativeEhClient.requestText(
       summary.detailUrl,
       site,
       http.RequestMethod.GET,
-      EhUrl.referer(site)
+      EhUrl.referer(site),
+      undefined,
+      control
     );
+    if (control && control.isCancelled()) {
+      throw new Error('请求已取消');
+    }
     return mergeDetailHtml(createDetailFromSummary(summary), html, site);
   }
 
@@ -3508,15 +3748,21 @@ export class NativeEhClient {
   public static async fetchGalleryPreviewPage(
     site: string,
     detailUrl: string,
-    pageIndex: number
+    pageIndex: number,
+    control?: NativeRequestControl
   ): Promise<NativeGalleryPreviewPage> {
     const requestUrl = buildPreviewPageUrl(detailUrl, pageIndex);
     const html = await NativeEhClient.requestText(
       requestUrl,
       site,
       http.RequestMethod.GET,
-      detailUrl
+      detailUrl,
+      undefined,
+      control
     );
+    if (control && control.isCancelled()) {
+      throw new Error('请求已取消');
+    }
     const page: NativeGalleryPreviewPage = {
       items: parsePreviewItems(html, site),
       pageIndex,
@@ -3538,15 +3784,21 @@ export class NativeEhClient {
   public static async fetchReaderPage(
     site: string,
     pageUrl: string,
-    skipHathKey: string = ''
+    skipHathKey: string = '',
+    control?: NativeRequestControl
   ): Promise<NativeGalleryImagePage> {
     const requestUrl = readerPageUrlWithSkipHathKey(pageUrl, skipHathKey);
     const html = await NativeEhClient.requestText(
       requestUrl,
       site,
       http.RequestMethod.GET,
-      pageUrl
+      pageUrl,
+      undefined,
+      control
     );
+    if (control && control.isCancelled()) {
+      throw new Error('请求已取消');
+    }
     return parseReaderPage(html, pageUrl);
   }
 }

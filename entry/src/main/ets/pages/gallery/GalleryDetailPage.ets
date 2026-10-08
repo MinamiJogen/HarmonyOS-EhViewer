@@ -246,6 +246,11 @@ export struct GalleryDetailPage {
     Column({ space: 12 }) {
       this.HeaderBlock();
       this.InfoActionBlock();
+      this.statusContent();
+      this.favoritePanelContent();
+      this.ratingPanelContent();
+      this.torrentPanelContent();
+      this.archivePanelContent();
       this.TagsBlock();
       this.commentsContent();
       this.previewStripContent();

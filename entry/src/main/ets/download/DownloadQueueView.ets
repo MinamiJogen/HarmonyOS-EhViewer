@@ -7,6 +7,8 @@ import {
   DOWNLOAD_STATUS_QUEUED,
   DownloadQueueItem
 } from './DownloadModels';
+import { ContentTransition } from '../components/ContentTransition';
+import { feedbackTransition, listItemTransition } from '../styles/Transitions';
 
 export const DOWNLOAD_VIEW_DOWNLOADED: string = 'downloaded';
 export const DOWNLOAD_VIEW_ACTIVE: string = 'active';
@@ -18,6 +20,9 @@ export type DownloadQueueItemBooleanResolver = (item: DownloadQueueItem) => bool
 export type DownloadQueueItemNumberResolver = (item: DownloadQueueItem) => number;
 export type DownloadQueueItemStringResolver = (item: DownloadQueueItem) => string;
 export type DownloadQueueStringResolver = (value: string) => string;
+export type DownloadQueueBooleanResolver = () => boolean;
+export type DownloadQueueLabelResolver = () => string;
+export type DownloadQueueSymbolResolver = () => Resource;
 
 const DOWNLOAD_WATERFALL_MIN_COLUMNS: number = 2;
 const DOWNLOAD_WATERFALL_COLUMN_GAP: number = 10;
@@ -26,7 +31,7 @@ const DOWNLOAD_WATERFALL_PREFERRED_ITEM_WIDTH: number = 176;
 
 @Component
 export struct DownloadQueueView {
-  @Prop items: DownloadQueueItem[] = [];
+  @Prop @Watch('handleItemsChanged') items: DownloadQueueItem[] = [];
   @Prop viewMode: string = DOWNLOAD_VIEW_DOWNLOADED;
   @Prop managerStatus: string = '下载器空闲';
   @Prop downloadRootText: string = '';
@@ -36,6 +41,7 @@ export struct DownloadQueueView {
   @Prop activeLoading: boolean = false;
   activeScroller: Scroller = new Scroller();
   @State private containerWidth: number = 0;
+  private itemsByKey: Map<string, DownloadQueueItem> = new Map();
 
   imageUrlForCover: DownloadQueueStringResolver = (value: string): string => value;
   siteDisplayNameForItem: DownloadQueueItemStringResolver = (item: DownloadQueueItem): string => item.site;
@@ -46,14 +52,36 @@ export struct DownloadQueueView {
   speedTextForItem: DownloadQueueItemStringResolver = (_item: DownloadQueueItem): string => '--';
   remainingTextForItem: DownloadQueueItemStringResolver = (_item: DownloadQueueItem): string => '--';
   isItemRunning: DownloadQueueItemBooleanResolver = (_item: DownloadQueueItem): boolean => false;
+  isItemQueued: DownloadQueueItemBooleanResolver = (_item: DownloadQueueItem): boolean => false;
 
   onViewModeChange: DownloadQueueTextChange = (_value: string): void => {};
   onStartAll: DownloadQueueCommand = (): void => {};
   onPauseAll: DownloadQueueCommand = (): void => {};
+  onOpenDownloadDirectory: DownloadQueueCommand = (): void => {};
   onStartItem: DownloadQueueItemAction = (_item: DownloadQueueItem): void => {};
   onPauseItem: DownloadQueueItemAction = (_item: DownloadQueueItem): void => {};
   onOpenItemDetail: DownloadQueueItemAction = (_item: DownloadQueueItem): void => {};
   onRemoveItem: DownloadQueueItemAction = (_item: DownloadQueueItem): void => {};
+
+  aboutToAppear(): void {
+    this.handleItemsChanged();
+  }
+
+  private handleItemsChanged(): void {
+    const nextItemsByKey: Map<string, DownloadQueueItem> = new Map();
+    for (const item of this.items) {
+      nextItemsByKey.set(this.itemRenderKey(item), item);
+    }
+    this.itemsByKey = nextItemsByKey;
+  }
+
+  private latestItem(item: DownloadQueueItem): DownloadQueueItem {
+    // Stable ForEach keys retain their initial item closure. Resolve current
+    // snapshots without remounting cards on status or progress updates.
+    this.items;
+    this.revision;
+    return this.itemsByKey.get(this.itemRenderKey(item)) || item;
+  }
 
   private activeItems(): DownloadQueueItem[] {
     return this.items.filter((item: DownloadQueueItem) =>
@@ -118,8 +146,7 @@ export struct DownloadQueueView {
   }
 
   private itemRenderKey(item: DownloadQueueItem): string {
-    const displayState = this.isItemRunning(item) ? 'running' : item.status;
-    return `${item.site}-${item.gid}-${displayState}`;
+    return `${item.site}-${item.gid}`;
   }
 
   private refreshAwareNumber(value: number): number {
@@ -131,52 +158,68 @@ export struct DownloadQueueView {
   }
 
   private itemProgressPercentLive(item: DownloadQueueItem): number {
-    return this.refreshAwareNumber(this.itemProgressPercent(item));
+    return this.refreshAwareNumber(this.itemProgressPercent(this.latestItem(item)));
   }
 
   private itemStatusLabelLive(item: DownloadQueueItem): string {
-    return this.refreshAwareText(this.statusLabelForItem(item));
+    return this.refreshAwareText(this.statusLabelForItem(this.latestItem(item)));
+  }
+
+  private itemSiteAndQualityLive(item: DownloadQueueItem): string {
+    const current = this.latestItem(item);
+    const quality = current.imageQuality === 'original' ? '原图' :
+      (current.imageQuality === 'compressed' ? '压缩图' : '');
+    return this.refreshAwareText(`${this.siteDisplayNameForItem(current)}${quality.length > 0 ? ` · ${quality}` : ''}`);
   }
 
   private itemStatusColorLive(item: DownloadQueueItem): string {
-    return this.refreshAwareText(this.statusColorForItem(item));
+    return this.refreshAwareText(this.statusColorForItem(this.latestItem(item)));
   }
 
   private itemProgressTextLive(item: DownloadQueueItem): string {
-    return this.refreshAwareText(this.progressTextForItem(item));
+    return this.refreshAwareText(this.progressTextForItem(this.latestItem(item)));
   }
 
   private itemSpeedTextLive(item: DownloadQueueItem): string {
-    return this.refreshAwareText(this.speedTextForItem(item));
+    return this.refreshAwareText(this.speedTextForItem(this.latestItem(item)));
   }
 
   private itemRemainingTextLive(item: DownloadQueueItem): string {
-    return this.refreshAwareText(this.remainingTextForItem(item));
+    return this.refreshAwareText(this.remainingTextForItem(this.latestItem(item)));
   }
 
   private itemActionTextLive(item: DownloadQueueItem): string {
-    const text = item.error.length > 0 ? item.error : (item.lastAction.length > 0 ? item.lastAction : item.queuedAt);
+    const currentItem = this.latestItem(item);
+    const text = currentItem.error.length > 0 ? currentItem.error :
+      (currentItem.lastAction.length > 0 ? currentItem.lastAction : currentItem.queuedAt);
     return this.refreshAwareText(text);
   }
 
   private itemActionColorLive(item: DownloadQueueItem): ResourceColor {
-    return this.refreshAwareText(item.error).length > 0 ?
+    return this.refreshAwareText(this.latestItem(item).error).length > 0 ?
       $r('sys.color.ohos_id_color_warning') : $r('sys.color.font_secondary');
   }
 
+  private itemActionKindLive(item: DownloadQueueItem): string {
+    return this.latestItem(item).error.length > 0 ? 'error' : 'action';
+  }
+
   private shouldPauseItem(item: DownloadQueueItem): boolean {
-    return this.refreshAwareNumber(this.isItemRunning(item) || item.status === DOWNLOAD_STATUS_QUEUED ? 1 : 0) === 1;
+    const currentItem = this.latestItem(item);
+    return this.refreshAwareNumber(
+      this.isItemRunning(currentItem) || this.isItemQueued(currentItem) ? 1 : 0) === 1;
   }
 
   private itemCommandLabel(item: DownloadQueueItem): string {
     if (this.shouldPauseItem(item)) {
       return '暂停';
     }
-    if (item.status === DOWNLOAD_STATUS_FAILED) {
+    const currentItem = this.latestItem(item);
+    if (currentItem.status === DOWNLOAD_STATUS_FAILED) {
       return '重试';
     }
-    if (item.status === DOWNLOAD_STATUS_PAUSED || item.status === DOWNLOAD_STATUS_DOWNLOADING ||
-      item.downloaded > 0) {
+    if (currentItem.status === DOWNLOAD_STATUS_PAUSED || currentItem.status === DOWNLOAD_STATUS_DOWNLOADING ||
+      currentItem.downloaded > 0) {
       return '继续';
     }
     return '开始';
@@ -184,7 +227,7 @@ export struct DownloadQueueView {
 
   private canStartAll(): boolean {
     return this.refreshAwareNumber(
-      this.activeItems().some((item: DownloadQueueItem) => !this.isItemRunning(item)) ? 1 : 0) === 1;
+      this.activeItems().some((item: DownloadQueueItem) => !this.shouldPauseItem(item)) ? 1 : 0) === 1;
   }
 
   private canPauseAll(): boolean {
@@ -302,30 +345,50 @@ export struct DownloadQueueView {
   }
 
   @Builder
-  private TextActionButton(symbol: Resource, label: string, primary: boolean,
-    action: DownloadQueueCommand, enabled: boolean = true): void {
+  private ActionButtonLabel(symbol: DownloadQueueSymbolResolver, label: DownloadQueueLabelResolver,
+    primary: DownloadQueueBooleanResolver, animated: boolean): void {
+    Row({ space: 8 }) {
+      SymbolGlyph(symbol())
+        .fontSize(18)
+        .fontColor([primary() ? '#FFFFFF' : $r('sys.color.font_primary')]);
+      Text(label())
+        .layoutWeight(1)
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(primary() ? '#FFFFFF' : $r('sys.color.font_primary'))
+        .textAlign(TextAlign.Center);
+    }
+    .width('100%')
+    .justifyContent(FlexAlign.Center)
+    .transition(animated ? listItemTransition() : TransitionEffect.IDENTITY);
+  }
+
+  @Builder
+  private TextActionButton(symbol: DownloadQueueSymbolResolver, label: DownloadQueueLabelResolver,
+    primary: DownloadQueueBooleanResolver, action: DownloadQueueCommand,
+    enabled: DownloadQueueBooleanResolver = (): boolean => true, animated: boolean = false): void {
+    // Evaluate getters in native nodes' observed updates. Primitive builder
+    // arguments retain their first values when ForEach keeps the task card.
     Button({ type: ButtonType.Normal }) {
-      Row({ space: 8 }) {
-        SymbolGlyph(symbol)
-          .fontSize(18)
-          .fontColor([primary ? '#FFFFFF' : $r('sys.color.font_primary')]);
-        Text(label)
-          .layoutWeight(1)
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(primary ? '#FFFFFF' : $r('sys.color.font_primary'))
-          .textAlign(TextAlign.Center);
+      Stack() {
+        if (animated) {
+          ForEach([label()], (visualLabel: string) => {
+            this.ActionButtonLabel(symbol, (): string => visualLabel, primary, true);
+          }, (visualLabel: string) => visualLabel);
+        } else {
+          this.ActionButtonLabel(symbol, label, primary, false);
+        }
       }
-      .width('100%')
-      .justifyContent(FlexAlign.Center);
+      .width('100%');
     }
     .layoutWeight(1)
     .constraintSize({ minHeight: 48 })
     .padding({ left: 12, right: 12, top: 12, bottom: 12 })
-    .backgroundColor(primary ? '#C86B8C' : $r('sys.color.comp_background_tertiary'))
+    .backgroundColor(primary() ? '#C86B8C' : $r('sys.color.comp_background_tertiary'))
+    .animation({ duration: 160, curve: Curve.EaseOut })
     .borderRadius(12)
-    .enabled(enabled)
-    .accessibilityText(label)
+    .enabled(enabled())
+    .accessibilityText(label())
     .onClick(() => {
       action();
     });
@@ -420,6 +483,11 @@ export struct DownloadQueueView {
         Text(`${item.total > 0 ? item.total : item.pages}P`)
           .fontSize(11)
           .fontColor('#7C6470');
+        if (item.imageQuality === 'original' || item.imageQuality === 'compressed') {
+          Text(item.imageQuality === 'original' ? '原图' : '压缩图')
+            .fontSize(11)
+            .fontColor('#7C6470');
+        }
       }
       Text(item.updatedAt.length > 0 ? item.updatedAt : item.queuedAt)
         .fontSize(10)
@@ -433,41 +501,30 @@ export struct DownloadQueueView {
     .border({ width: 1, color: '#F2E6EC' })
     .alignItems(HorizontalAlign.Start)
     .onClick(() => {
-      this.onOpenItemDetail(item);
+      this.onOpenItemDetail(this.latestItem(item));
     });
   }
 
   @Builder
   private DownloadedWaterfall(): void {
-    if (this.downloadedItems().length === 0) {
-      Text('还没有已下载画廊。下载完成后会显示在这里。')
-        .width('100%')
-        .fontSize(13)
-        .fontColor('#6F5964')
-        .padding(12)
-        .backgroundColor('#FFFFFF')
-        .borderRadius(8)
-        .border({ width: 1, color: '#F2E6EC' });
-    } else {
-      WaterFlow() {
-        ForEach(this.downloadedItems(), (item: DownloadQueueItem) => {
-          FlowItem() {
-            this.DownloadedCard(item);
-          }
-          .width('100%');
-        }, (item: DownloadQueueItem) => this.itemRenderKey(item));
-      }
-      .width('100%')
-      .height(this.downloadedWaterfallHeight())
-      .columnsTemplate(this.columnsTemplate())
-      .columnsGap(DOWNLOAD_WATERFALL_COLUMN_GAP)
-      .rowsGap(DOWNLOAD_WATERFALL_ROW_GAP)
-      .onAreaChange((_oldValue: Area, newValue: Area) => {
-        this.updateContainerWidth(newValue.width);
-      })
-      .edgeEffect(EdgeEffect.Spring)
-      .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST });
+    WaterFlow() {
+      ForEach(this.downloadedItems(), (item: DownloadQueueItem) => {
+        FlowItem() {
+          this.DownloadedCard(item);
+        }
+        .width('100%');
+      }, (item: DownloadQueueItem) => this.itemRenderKey(item));
     }
+    .width('100%')
+    .height(this.downloadedWaterfallHeight())
+    .columnsTemplate(this.columnsTemplate())
+    .columnsGap(DOWNLOAD_WATERFALL_COLUMN_GAP)
+    .rowsGap(DOWNLOAD_WATERFALL_ROW_GAP)
+    .onAreaChange((_oldValue: Area, newValue: Area) => {
+      this.updateContainerWidth(newValue.width);
+    })
+    .edgeEffect(EdgeEffect.Spring)
+    .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST });
   }
 
   @Builder
@@ -500,7 +557,7 @@ export struct DownloadQueueView {
             .fontColor($r('sys.color.font_primary'))
             .maxLines(3)
             .textOverflow({ overflow: TextOverflow.Ellipsis });
-          Text(this.siteDisplayNameForItem(item))
+          Text(this.itemSiteAndQualityLive(item))
             .fontSize(12)
             .fontColor($r('sys.color.font_secondary'));
           Text(this.itemStatusLabelLive(item))
@@ -524,7 +581,7 @@ export struct DownloadQueueView {
     .borderRadius(10)
     .accessibilityText(`查看画廊 ${item.title.length > 0 ? item.title : item.gid}`)
     .onClick(() => {
-      this.onOpenItemDetail(item);
+      this.onOpenItemDetail(this.latestItem(item));
     });
   }
 
@@ -546,7 +603,7 @@ export struct DownloadQueueView {
         .width('100%');
         Progress({ value: this.itemProgressPercentLive(item), total: 100, type: ProgressType.Linear })
           .width('100%')
-          .color(this.itemStatusColorLive(item))
+          .color('#C86B8C')
           .backgroundColor($r('sys.color.comp_background_tertiary'))
           .style({ strokeWidth: 6 })
           .accessibilityText(`下载进度 ${this.itemProgressPercentLive(item)}%`);
@@ -562,27 +619,32 @@ export struct DownloadQueueView {
         }
         .width('100%');
         if (this.itemActionTextLive(item).length > 0) {
-          Text(this.itemActionTextLive(item))
-            .width('100%')
-            .fontSize(13)
-            .fontColor(this.itemActionColorLive(item))
-            .copyOption(CopyOptions.LocalDevice);
+          ForEach([this.itemActionKindLive(item)], (_kind: string) => {
+            Text(this.itemActionTextLive(item))
+              .width('100%')
+              .fontSize(13)
+              .fontColor(this.itemActionColorLive(item))
+              .copyOption(CopyOptions.LocalDevice)
+              .transition(feedbackTransition());
+          }, (kind: string) => kind);
         }
       }
       .width('100%')
       .alignItems(HorizontalAlign.Start);
       Row({ space: 12 }) {
         this.TextActionButton(
-          this.shouldPauseItem(item) ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
-          this.refreshAwareText(this.itemCommandLabel(item)),
-          !this.shouldPauseItem(item),
+          (): Resource => this.shouldPauseItem(item) ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
+          (): string => this.itemCommandLabel(item),
+          (): boolean => !this.shouldPauseItem(item),
           () => {
             if (this.shouldPauseItem(item)) {
-              this.onPauseItem(item);
+              this.onPauseItem(this.latestItem(item));
             } else {
-              this.onStartItem(item);
+              this.onStartItem(this.latestItem(item));
             }
-          }
+          },
+          (): boolean => true,
+          true
         );
         Button('移除')
           .constraintSize({ minWidth: 80, minHeight: 48 })
@@ -593,7 +655,7 @@ export struct DownloadQueueView {
           .borderRadius(12)
           .accessibilityText(`移除下载任务及本地文件 ${item.title}`)
           .onClick(() => {
-            this.onRemoveItem(item);
+            this.onRemoveItem(this.latestItem(item));
           });
       }
       .width('100%');
@@ -604,20 +666,20 @@ export struct DownloadQueueView {
   }
 
   @Builder
-  private ActiveEmptyState(): void {
+  private EmptyStateContent(title: string, message: string, downloaded: boolean): void {
     Column({ space: 12 }) {
       SymbolGlyph($r('sys.symbol.waveform_folder_fill'))
         .fontSize(40)
         .fontColor([$r('sys.color.font_secondary')]);
-      Text('暂无下载任务')
+      Text(title)
         .fontSize(18)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('sys.color.font_primary'));
-      Text('添加下载后，可在这里查看进度和管理任务。')
+      Text(message)
         .fontSize(14)
         .fontColor($r('sys.color.font_secondary'))
         .textAlign(TextAlign.Center);
-      if (this.downloadedItems().length > 0) {
+      if (!downloaded && this.downloadedItems().length > 0) {
         Button('查看已下载')
           .constraintSize({ minHeight: 48 })
           .fontSize(15)
@@ -635,13 +697,70 @@ export struct DownloadQueueView {
   }
 
   @Builder
-  private DownloadedPage(): void {
-    Column({ space: 12 }) {
-      this.DownloadedWaterfall();
+  private ActiveEmptyState(): void {
+    this.EmptyStateContent('暂无下载任务', '添加下载后，可在这里查看进度和管理任务。', false);
+  }
+
+  @Builder
+  private FileManagerButton(): void {
+    Row() {
+      Button('在文件管理中查看', { type: ButtonType.Capsule })
+        .constraintSize({ minHeight: 48 })
+        .padding({ left: 24, right: 24 })
+        .fontSize(15)
+        .fontColor('#FFFFFF')
+        .backgroundColor('#C86B8C')
+        .onClick(() => {
+          this.onOpenDownloadDirectory();
+        });
     }
     .width('100%')
-    .justifyContent(FlexAlign.Start)
-    .alignItems(HorizontalAlign.Start);
+    .justifyContent(FlexAlign.Center);
+  }
+
+  @Builder
+  private DownloadedEmptyPage(): void {
+    Column() {
+      List({ space: 16, scroller: this.activeScroller }) {
+        ListItem({ style: ListItemStyle.CARD }) {
+          this.EmptyStateContent('暂无已下载画廊', '下载完成后，画廊会显示在这里。', true);
+        }
+        .height(undefined)
+        .transition(feedbackTransition());
+        ListItem() {
+          this.FileManagerButton();
+        }
+        .height(undefined)
+        .backgroundColor(Color.Transparent);
+      }
+      .width('100%')
+      .constraintSize({ maxWidth: 840 })
+      .height('100%')
+      .padding({ left: 12, right: 12 })
+      .contentStartOffset(this.activeContentStartOffset)
+      .contentEndOffset(this.activeContentEndOffset)
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring);
+    }
+    .width('100%')
+    .height('100%')
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor($r('sys.color.ohos_id_color_sub_background'));
+  }
+
+  @Builder
+  private DownloadedPage(): void {
+    if (this.downloadedItems().length === 0) {
+      this.DownloadedEmptyPage();
+    } else {
+      Column({ space: 12 }) {
+        this.DownloadedWaterfall();
+        this.FileManagerButton();
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Start)
+      .alignItems(HorizontalAlign.Start);
+    }
   }
 
   @Builder
@@ -653,7 +772,8 @@ export struct DownloadQueueView {
             Column({ space: 12 }) {
               LoadingProgress()
                 .width(32)
-                .height(32);
+                .height(32)
+                .color('#C86B8C');
               Text('正在加载下载任务...')
                 .fontSize(14)
                 .fontColor($r('sys.color.font_secondary'));
@@ -663,7 +783,8 @@ export struct DownloadQueueView {
             .padding(24)
             .justifyContent(FlexAlign.Center);
           }
-          .height(undefined);
+          .height(undefined)
+          .transition(feedbackTransition());
         } else {
           if (this.activeItems().length > 0) {
             ListItemGroup({ header: this.GroupHeader('下载概览'), style: ListItemGroupStyle.CARD }) {
@@ -673,18 +794,22 @@ export struct DownloadQueueView {
               .height(undefined);
               ListItem({ style: ListItemStyle.CARD }) {
                 Row({ space: 12 }) {
-                  this.TextActionButton($r('sys.symbol.play_fill'), '全部开始', true, () => {
+                  this.TextActionButton((): Resource => $r('sys.symbol.play_fill'),
+                    (): string => '全部开始', (): boolean => true, () => {
                     this.onStartAll();
-                  }, this.canStartAll());
-                  this.TextActionButton($r('sys.symbol.pause_fill'), '全部暂停', false, () => {
+                  }, (): boolean => this.canStartAll());
+                  this.TextActionButton((): Resource => $r('sys.symbol.pause_fill'),
+                    (): string => '全部暂停', (): boolean => false, () => {
                     this.onPauseAll();
-                  }, this.canPauseAll());
+                  }, (): boolean => this.canPauseAll());
                 }
                 .width('100%')
                 .padding({ left: 16, right: 16, top: 4, bottom: 16 });
               }
               .height(undefined);
             }
+            .width('100%')
+            .margin({ left: 0, right: 0 });
             ListItemGroup({
               header: this.GroupHeader(`下载任务 · ${this.activeItems().length}`),
               style: ListItemGroupStyle.CARD
@@ -696,25 +821,36 @@ export struct DownloadQueueView {
                 .height(undefined);
               }, (item: DownloadQueueItem) => this.itemRenderKey(item));
             }
+            .width('100%')
+            .margin({ left: 0, right: 0 })
             .divider({ strokeWidth: 0.5, color: $r('sys.color.comp_divider'), startMargin: 16, endMargin: 16 });
           } else {
             ListItem({ style: ListItemStyle.CARD }) {
               this.ActiveEmptyState();
             }
-            .height(undefined);
+            .height(undefined)
+            .transition(feedbackTransition());
           }
           if (this.downloadRootText.length > 0) {
-            ListItemGroup({ header: this.GroupHeader('保存位置'), style: ListItemGroupStyle.CARD }) {
-              ListItem({ style: ListItemStyle.CARD }) {
+            ListItem({ style: ListItemStyle.CARD }) {
+              Column({ space: 8 }) {
+                Text('保存位置')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('sys.color.font_primary'));
                 Text(this.downloadRootText)
                   .width('100%')
-                  .fontSize(13)
+                  .fontSize(14)
                   .fontColor($r('sys.color.font_secondary'))
-                  .copyOption(CopyOptions.LocalDevice)
-                  .padding(16);
+                  .copyOption(CopyOptions.LocalDevice);
               }
-              .height(undefined);
+              .width('100%')
+              .constraintSize({ minHeight: 104 })
+              .padding(16)
+              .alignItems(HorizontalAlign.Start)
+              .justifyContent(FlexAlign.Center);
             }
+            .height(undefined);
           }
         }
       }
@@ -735,9 +871,21 @@ export struct DownloadQueueView {
 
   build() {
     if (this.viewMode === DOWNLOAD_VIEW_ACTIVE) {
-      this.ActivePage();
+      ContentTransition({
+        changeKey: DOWNLOAD_VIEW_ACTIVE,
+        fillHeight: true,
+        content: (): void => {
+          this.ActivePage();
+        }
+      });
     } else {
-      this.DownloadedPage();
+      ContentTransition({
+        changeKey: DOWNLOAD_VIEW_DOWNLOADED,
+        fillHeight: this.downloadedItems().length === 0,
+        content: (): void => {
+          this.DownloadedPage();
+        }
+      });
     }
   }
 }

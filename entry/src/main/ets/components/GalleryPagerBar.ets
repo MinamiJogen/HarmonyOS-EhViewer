@@ -1,3 +1,5 @@
+import { feedbackTransition } from '../styles/Transitions';
+
 export type PagerAction = () => void;
 
 @Component
@@ -23,6 +25,7 @@ export struct GalleryPagerBar {
       .fontSize(12)
       .fontColor(enabled ? '#2B2027' : '#9A7D8A')
       .backgroundColor(enabled ? '#F8E4ED' : '#EEEEEE')
+      .animation({ duration: 160, curve: Curve.EaseOut })
       .borderRadius(8)
       .enabled(enabled)
       .onClick(() => {
@@ -41,7 +44,8 @@ export struct GalleryPagerBar {
       .width('100%')
       .padding(12)
       .backgroundColor('#FFFFFF')
-      .borderRadius(8);
+      .borderRadius(8)
+      .transition(feedbackTransition());
     }
   }
 }

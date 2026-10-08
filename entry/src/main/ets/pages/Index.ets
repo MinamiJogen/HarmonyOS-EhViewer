@@ -3,6 +3,17 @@ import wantAgent from '@ohos.app.ability.wantAgent';
 import batteryInfo from '@ohos.batteryInfo';
 import preferences from '@ohos.data.preferences';
 import fileIo from '@ohos.file.fs';
+import { image } from '@kit.ImageKit';
+import { getPublicDownloadDirectory, openPublicDownloadDirectory, publicDownloadFileUri } from '../download/PublicDownloadDirectory';
+import {
+  chooseGalleryDirectory,
+  findGalleryDirectory,
+  GalleryDirectoryIdentity,
+  isGalleryDirectory,
+  migrateGalleryDirectory,
+  writeGalleryDirectoryIdentity
+} from '../download/GalleryDownloadDirectory';
+import { recordOriginalDownloadPage, verifiedOriginalDownloadPath } from '../download/OriginalDownloadPages';
 import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import connection from '@ohos.net.connection';
 import http from '@ohos.net.http';
@@ -51,6 +62,7 @@ import {
   NativeGalleryComment,
   NativeGalleryDetail,
   NativeGalleryImagePage,
+  NativeRequestControl,
   NativeGalleryListResult,
   NativeGalleryPreview,
   NativeGallerySummary,
@@ -71,6 +83,25 @@ import { GalleryDetailPage } from './gallery/GalleryDetailPage';
 import { SearchResultsPage } from './gallery/SearchResultsPage';
 import { PrivacySettingsCard } from './settings/PrivacySettingsCard';
 import { SystemLoadingBlock } from '../components/SystemLoadingBlock';
+import { ImmersiveTitleSurface } from '../components/ImmersiveTitleSurface';
+import { FrameCallback } from '@kit.ArkUI';
+import { ContentTransition } from '../components/ContentTransition';
+import { contentAppearTransition, feedbackTransition, listItemTransition } from '../styles/Transitions';
+import {
+  IMMERSIVE_CONTROL_MATERIAL,
+  IMMERSIVE_MENU_MATERIAL,
+  IMMERSIVE_DIALOG_MATERIAL,
+  IMMERSIVE_SHEET_MATERIAL,
+  IMMERSIVE_SEARCH_MATERIAL,
+  IMMERSIVE_SEARCH_FIELD_MATERIAL,
+  IMMERSIVE_TOOLBAR_MATERIAL,
+  IMMERSIVE_SEGMENT_MATERIAL,
+  IMMERSIVE_DOWNLOAD_SEGMENT_MATERIAL,
+  IMMERSIVE_RANKING_SEGMENT_MATERIAL,
+  IMMERSIVE_RANKING_CONTROL_MATERIAL,
+  IMMERSIVE_SELECTED_MATERIAL,
+  IMMERSIVE_SEARCH_CHIP_SELECTED_MATERIAL
+} from '../styles/ImmersiveMaterials';
 import { LocalGalleryRecord, HistoryItem } from '../models/LocalModels';
 import {
   DOWNLOAD_BACKGROUND_MODE,
@@ -334,12 +365,37 @@ import {
 let sharedDownloadWorkerRunning: boolean = false;
 let sharedDownloadActiveKey: string = '';
 let sharedDownloadItemsSnapshot: DownloadQueueItem[] = [];
+let sharedDownloadItemsInitialized: boolean = false;
 let sharedDownloadWaitKeys: string[] = [];
-let sharedDownloadBackgroundStopAttempted: boolean = false;
+let sharedDownloadBackgroundRunning: boolean = false;
+let sharedDownloadBackgroundStarting: boolean = false;
+let sharedDownloadBackgroundTaskId: number = -1;
+let sharedDownloadBackgroundNotificationId: number = -1;
+let sharedDownloadBackgroundContext: common.UIAbilityContext | undefined = undefined;
+let sharedDownloadBackgroundRecoveryChecked: boolean = false;
+const sharedDownloadBackgroundTaskHandles: Map<number, common.UIAbilityContext> = new Map();
+const sharedDownloadBackgroundNotificationIds: Map<number, number> = new Map();
+const sharedDownloadBackgroundStoppingIds: Set<number> = new Set();
+const sharedDownloadBackgroundRetiredIds: Set<number> = new Set();
+const sharedDownloadBackgroundPendingCancelIds: Set<number> = new Set();
+let sharedDownloadBackgroundCancelSubscribed: boolean = false;
+let sharedDownloadRuntimeSyncInFlight: boolean = false;
+let sharedDownloadRuntimeSyncPending: boolean = false;
+let sharedDownloadRuntimeSyncPendingForce: boolean = false;
+let sharedDownloadRuntimeCleanupNeeded: boolean = false;
+let sharedDownloadRuntimeCleanupTimerId: number = -1;
+let sharedDownloadRuntimeCleanupRetryCount: number = 0;
+let sharedDownloadNotificationRecoveryChecked: boolean = false;
 const sharedDownloadCancelKeys: Set<string> = new Set<string>();
 const sharedDownloadRemovedKeys: Set<string> = new Set<string>();
 const sharedDownloadStartRequestedKeys: Set<string> = new Set<string>();
+const sharedDownloadQualityPromptKeys: Set<string> = new Set<string>();
 const sharedDownloadRunGenerations: Map<string, number> = new Map<string, number>();
+const sharedDownloadActiveRequests: Map<string, http.HttpRequest[]> = new Map();
+const sharedDownloadRequestCancelSignals: Map<http.HttpRequest, () => void> = new Map();
+const sharedDownloadPageTransferFractions: Map<string, Map<number, number>> = new Map();
+const sharedDownloadPersistVersions: Map<string, number> = new Map();
+let sharedDownloadPersistQueue: Promise<void> = Promise.resolve();
 const sharedDownloadNotificationStates: Map<string, string> = new Map<string, string>();
 const sharedDownloadNotificationLastAt: Map<string, number> = new Map<string, number>();
 const sharedDownloadNotificationIds: Map<string, number> = new Map<string, number>();
@@ -353,6 +409,8 @@ const DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY: string = 'download_runtime_removed_keys
 const DOWNLOAD_RUNTIME_HEARTBEAT_KEY: string = 'download_runtime_heartbeat_at';
 const DOWNLOAD_RUNTIME_HEARTBEAT_INTERVAL_MS: number = 1000;
 const DOWNLOAD_RUNTIME_HEARTBEAT_TTL_MS: number = 12000;
+const DOWNLOAD_IMAGE_RESPONSE_MAX_BYTES: number = 100 * 1024 * 1024;
+const DOWNLOAD_DIRECTORY_DISPLAY_TEXT: string = '文件管理 App 中：我的手机/Download/E-Harmony';
 const DIAG_DOMAIN = 0x0000;
 const DIAG_TAG = 'EhIndex';
 
@@ -420,11 +478,25 @@ const SEARCH_INPUT_BAR_HEIGHT: number = 44;
 const SEARCH_TITLE_BAR_BOTTOM_HEIGHT: number = 60;
 const SEARCH_SUGGESTION_OVERLAY_GAP: number = 8;
 const TOP_LIST_TITLE_BAR_CLEARANCE: number = 36;
+const TOP_LIST_CONTROL_HEIGHT: number = 36;
 const TOP_LIST_ENTRY_ROW_ESTIMATED_HEIGHT: number = 78;
 const TOP_LIST_ENTRY_STATIC_HEIGHT: number = 104;
 const TITLE_BAR_GRADIENT_MASK_EXTRA_HEIGHT: number = 32;
 const TITLE_BAR_GRADIENT_BLUR_RADIUS: number = 20;
 const TITLE_BAR_DIVIDER_COLOR: string = 'rgba(43,32,39,0.08)';
+
+class SearchAdvancedFrameCallback extends FrameCallback {
+  private action: () => void;
+
+  constructor(action: () => void) {
+    super();
+    this.action = action;
+  }
+
+  onFrame(_frameTime: number): void {
+    this.action();
+  }
+}
 
 @Entry
 @Component
@@ -461,26 +533,20 @@ struct Index {
   private readonly galleryImageInFlight: Map<string, Promise<string>> = new Map();
   private localDao?: EhLocalDataDao = undefined;
   private downloadWorkerRunning: boolean = false;
+  private legacyDownloadDirectoryPath: string = '';
   private downloadActiveKey: string = '';
-  private downloadBackgroundRunning: boolean = false;
-  private downloadBackgroundStarting: boolean = false;
-  private downloadBackgroundTaskId: number = -1;
   private downloadNotificationPermissionAsked: boolean = false;
-  private readonly downloadCancelKeys: Set<string> = new Set();
-  private readonly downloadRemovedKeys: Set<string> = new Set();
-  private readonly downloadStartRequestedKeys: Set<string> = new Set();
-  private readonly downloadRunGenerations: Map<string, number> = new Map();
+  private readonly downloadCancelKeys: Set<string> = sharedDownloadCancelKeys;
+  private readonly downloadRemovedKeys: Set<string> = sharedDownloadRemovedKeys;
+  private readonly downloadStartRequestedKeys: Set<string> = sharedDownloadStartRequestedKeys;
+  private readonly downloadRunGenerations: Map<string, number> = sharedDownloadRunGenerations;
   private downloadWaitKeys: string[] = [];
   private readonly downloadPageUrlCache: Map<string, string[]> = new Map();
-  private readonly downloadPersistVersions: Map<string, number> = new Map();
-  private readonly downloadPageTransferFractions: Map<string, Map<number, number>> = new Map();
-  private readonly downloadActiveRequests: Map<string, http.HttpRequest[]> = new Map();
-  private downloadPersistQueue: Promise<void> = Promise.resolve();
+  private readonly downloadPersistVersions: Map<string, number> = sharedDownloadPersistVersions;
+  private readonly downloadPageTransferFractions: Map<string, Map<number, number>> = sharedDownloadPageTransferFractions;
+  private readonly downloadActiveRequests: Map<string, http.HttpRequest[]> = sharedDownloadActiveRequests;
   private downloadStatePollTimerId: number = -1;
   private downloadStateLoadSerial: number = 0;
-  private downloadRuntimeSyncInFlight: boolean = false;
-  private downloadRuntimeSyncPending: boolean = false;
-  private downloadRuntimeSyncPendingForce: boolean = false;
   private downloadRuntimeHeartbeatLastWriteAt: number = 0;
   private readerHtmlPrefetchQueue: ReaderPrefetchTask[] = [];
   private readerImagePrefetchQueue: ReaderImagePrefetchTask[] = [];
@@ -571,8 +637,10 @@ struct Index {
   @State private activeDownloadLabel: string = DOWNLOAD_LABEL_ALL;
   @State private downloadLabelDraft: string = '';
   @State private downloadDirectoryPath: string = '';
+  @State private downloadDirectoryStatus: string = '正在准备公共下载目录';
+  @State private downloadDirectoryPreparing: boolean = false;
+  private downloadDirectoryOpening: boolean = false;
   @State private downloadConcurrency: number = DOWNLOAD_DEFAULT_CONCURRENCY;
-  @State private downloadUseOriginImage: boolean = false;
   @State private downloadImportExportText: string = '';
   @State private downloadManagerStatus: string = '下载器空闲';
   @State private downloadStateLoading: boolean = false;
@@ -584,14 +652,15 @@ struct Index {
   @State private downloadViewSegmentOptions: SegmentButtonOptions = SegmentButtonOptions.capsule({
     buttons: DOWNLOAD_VIEW_SEGMENT_BUTTONS,
     multiply: false,
-    fontColor: '#2B2027',
-    selectedFontColor: '#2B2027',
+    fontColor: $r('sys.color.font_primary'),
+    selectedFontColor: $r('sys.color.font_primary'),
     fontSize: 14,
     selectedFontSize: 14,
     fontWeight: FontWeight.Regular,
     selectedFontWeight: FontWeight.Medium,
-    backgroundColor: 'rgba(0,0,0,0.05)',
-    selectedBackgroundColor: 'rgba(255,255,255,0.70)',
+    backgroundColor: Color.Transparent,
+    selectedBackgroundColor: $r('sys.color.segment_button_checked_foreground_color'),
+    backgroundSystemMaterial: IMMERSIVE_DOWNLOAD_SEGMENT_MATERIAL,
     textPadding: { left: 12, right: 12, top: 7, bottom: 7 }
   });
   @StorageLink(DOWNLOAD_RUNTIME_ITEMS_KEY) private downloadRuntimeItemsJson: string = '[]';
@@ -608,9 +677,17 @@ struct Index {
   @State private tagSearchTransitionQuery: string = '';
   @State private searchMode: string = SEARCH_MODE_NORMAL;
   @State private searchCategoryMask: number = CATEGORY_ALL;
-  @State private searchAdvancedEnabled: boolean = true;
+  @State @Watch('syncSearchAdvancedVisibility') private searchAdvancedEnabled: boolean = true;
+  @State private searchAdvancedContentMounted: boolean = true;
+  @State private searchAdvancedContentOpacity: number = 1;
+  @State private searchAdvancedHeaderHeight: number = 108;
+  @State private searchAdvancedChipHeight: number = 52;
+  @State private searchAdvancedFieldsHeight: number = 84;
+  private searchAdvancedSheetActive: boolean = false;
+  private searchAdvancedAnimationGeneration: number = 0;
+  private searchAdvancedInputFocused: boolean = false;
   @State private searchFiltersExpanded: boolean = true;
-  @State private searchFilterSheetVisible: boolean = false;
+  @State @Watch('syncSearchAdvancedVisibility') private searchFilterSheetVisible: boolean = false;
   @State private searchName: boolean = true;
   @State private searchTags: boolean = true;
   @State private searchDescription: boolean = false;
@@ -838,14 +915,15 @@ struct Index {
   @State private topListPeriodSegmentOptions: SegmentButtonOptions = SegmentButtonOptions.capsule({
     buttons: TOP_LIST_PERIOD_SEGMENT_BUTTONS,
     multiply: false,
-    fontColor: '#2B2027',
-    selectedFontColor: '#2B2027',
+    fontColor: $r('sys.color.font_primary'),
+    selectedFontColor: $r('sys.color.font_primary'),
     fontSize: 14,
     selectedFontSize: 14,
     fontWeight: FontWeight.Regular,
     selectedFontWeight: FontWeight.Medium,
-    backgroundColor: 'rgba(0,0,0,0.05)',
-    selectedBackgroundColor: 'rgba(255,255,255,0.70)',
+    backgroundColor: Color.Transparent,
+    selectedBackgroundColor: $r('sys.color.segment_button_checked_foreground_color'),
+    backgroundSystemMaterial: IMMERSIVE_RANKING_SEGMENT_MATERIAL,
     textPadding: { left: 12, right: 12, top: 7, bottom: 7 }
   });
   @State private myTags: NativeUserTag[] = [];
@@ -875,8 +953,6 @@ struct Index {
   @State private systemSafeBottom: number = BOTTOM_NAV_SAFE_FALLBACK;
   @State private pageViewportWidth: number = 1;
   @State private pageViewportHeight: number = 1;
-  @State private customMaterialLevel: hdsMaterial.MaterialLevel = hdsMaterial.MaterialLevel.EXQUISITE;
-  @State private titleBarMaterialType: hdsMaterial.MaterialType = hdsMaterial.MaterialType.ADAPTIVE;
   private signInSyncSerial: number = 0;
   private watchedProbeSerial: number = 0;
   private watchedProbeTargetUrl: string = '';
@@ -895,7 +971,6 @@ struct Index {
 
   aboutToAppear(): void {
     this.ensureDownloadRuntimeStorageDefaults();
-    this.resolveBottomBarMaterialLevel();
     this.applyRouteParams(false);
     this.primeInitialRouteDisplay();
     if (this.hasInitialRouteParams()) {
@@ -903,17 +978,6 @@ struct Index {
     }
     void this.applyReaderWindowState();
     void this.loadState();
-  }
-
-  private resolveBottomBarMaterialLevel(): void {
-    const materialTypes = hdsMaterial.getSystemMaterialTypes();
-    if (materialTypes.indexOf(hdsMaterial.MaterialType.IMMERSIVE) < 0) {
-      this.titleBarMaterialType = hdsMaterial.MaterialType.ADAPTIVE;
-      this.customMaterialLevel = hdsMaterial.MaterialLevel.SMOOTH;
-      return;
-    }
-    this.titleBarMaterialType = hdsMaterial.MaterialType.IMMERSIVE;
-    this.customMaterialLevel = hdsMaterial.MaterialLevel.EXQUISITE;
   }
 
   onPageShow(): void {
@@ -1031,13 +1095,15 @@ struct Index {
     await this.migratePreferencesToLocalDatabase();
     await this.loadLocalSideData();
     await this.loadLocalFilterData();
-    this.downloadDirectoryPath = this.readString('download_directory_path', '');
+    // Preserve existing downloads at their recorded location; new downloads use
+    // the system-authorized public Download directory rather than a typed path.
+    this.legacyDownloadDirectoryPath = this.readString('download_directory_path', '');
+    await this.preparePublicDownloadDirectory();
     this.downloadConcurrency = clampNumber(
       this.readNumber('download_concurrency', DOWNLOAD_DEFAULT_CONCURRENCY),
       1,
       DOWNLOAD_MAX_CONCURRENCY
     );
-    this.downloadUseOriginImage = this.readBoolean('download_origin_image', false);
     await this.loadDownloadState();
     this.nativeQuery = hasPrimedRoute ? primedRouteNativeQuery : this.readString('native_query', '');
     this.loadReaderSettings();
@@ -1324,21 +1390,28 @@ struct Index {
     }
   }
 
-  private async loadLocalFilterData(): Promise<void> {
+  private async loadLocalFilterData(animateLists: boolean = false): Promise<void> {
     if (!this.localDao) {
       this.filterRules = [];
       this.blacklistItems = [];
       return;
     }
     try {
-      await this.reloadLocalGalleryFilters();
-      this.blacklistItems = await this.localDao.loadBlacklist();
+      await this.reloadLocalGalleryFilters(false, animateLists);
+      const items = await this.localDao.loadBlacklist();
+      if (animateLists) {
+        this.animateManagedListChange((): void => {
+          this.blacklistItems = items;
+        });
+      } else {
+        this.blacklistItems = items;
+      }
     } catch (error) {
       this.blacklistItems = [];
     }
   }
 
-  private async reloadLocalGalleryFilters(allowWhileSaving: boolean = false): Promise<void> {
+  private async reloadLocalGalleryFilters(allowWhileSaving: boolean = false, animateLists: boolean = false): Promise<void> {
     if (this.filterRulesSaving && !allowWhileSaving) {
       return;
     }
@@ -1350,7 +1423,13 @@ struct Index {
       }
       // Each routed Index owns its own state. Read persisted rules again when
       // returning to a page or refreshing, then rebuild from unfiltered items.
-      this.filterRules = rules;
+      if (animateLists) {
+        this.animateManagedListChange((): void => {
+          this.filterRules = rules;
+        });
+      } else {
+        this.filterRules = rules;
+      }
       this.excludedLanguageTags = parseExcludedLanguageTags(this.readString(EXCLUDED_LANGUAGE_KEY, '[]'));
       this.refreshVisibleGalleryListsFromRaw();
     } catch (error) {
@@ -1397,7 +1476,7 @@ struct Index {
         enabled: true
       });
       this.setFilterTextDraft('');
-      await this.reloadLocalGalleryFilters(true);
+      await this.reloadLocalGalleryFilters(true, true);
       this.toast('过滤规则已添加');
     } catch (error) {
       this.toast('过滤规则保存失败');
@@ -1453,7 +1532,9 @@ struct Index {
     this.localFilterLoadSerial++;
     try {
       await this.localDao.deleteFilter(rule.id);
-      this.filterRules = this.filterRules.filter((item: FilterRule) => item.id !== rule.id);
+      this.animateManagedListChange((): void => {
+        this.filterRules = this.filterRules.filter((item: FilterRule) => item.id !== rule.id);
+      });
       this.refreshVisibleGalleryListsFromRaw();
       this.toast('过滤规则已删除');
     } catch (error) {
@@ -1504,7 +1585,7 @@ struct Index {
         this.blacklistNameDraft = '';
         this.blacklistReasonDraft = '';
       }
-      await this.loadLocalFilterData();
+      await this.loadLocalFilterData(true);
       this.toast('黑名单已添加');
     } catch (error) {
       this.toast('黑名单保存失败');
@@ -1517,7 +1598,7 @@ struct Index {
     }
     try {
       await this.localDao.deleteBlacklist(item.id);
-      await this.loadLocalFilterData();
+      await this.loadLocalFilterData(true);
       this.toast('黑名单已删除');
     } catch (error) {
       this.toast('黑名单删除失败');
@@ -1530,10 +1611,19 @@ struct Index {
     const dbItems = await this.loadDownloadItemsFromDatabase();
     const dbLabels = await this.loadDownloadLabelsFromDatabase();
 
-    if (sharedDownloadItemsSnapshot.length > 0) {
+    if (sharedDownloadItemsInitialized) {
       this.downloadItems = this.downloadItemsSource();
+      const existingKeys = new Set(this.downloadItems.map((item: DownloadQueueItem): string =>
+        this.downloadKey(item.gid, item.site)));
+      const persisted = this.recoverInterruptedDownloads(this.filterRemovedDownloadItems(
+        dbItems.length > 0 ? dbItems : backupItems));
+      for (const item of persisted) {
+        if (!existingKeys.has(this.downloadKey(item.gid, item.site))) {
+          this.downloadItems.push(item);
+        }
+      }
       this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
-      this.publishSharedDownloadItems();
+      this.saveDownloadItems();
       this.downloadLabels = ensureDownloadDefaultLabel(dbLabels.length > 0 ? dbLabels : backupLabels, this.nowLabel());
       this.saveDownloadLabels();
       this.refreshDownloadManagerStatusFromState();
@@ -1889,10 +1979,11 @@ struct Index {
           readObjectNumber(item, 'remainingSeconds', -1),
           readObjectString(item, 'downloadDir', ''),
           readObjectString(item, 'error', ''),
-          parseDownloadPageErrorsFromObject(item)
+          parseDownloadPageErrorsFromObject(item),
+          readObjectString(item, 'imageQuality', '')
         ));
       }
-      return items.slice(0, 80);
+      return items;
     } catch (error) {
       return [];
     }
@@ -1908,24 +1999,34 @@ struct Index {
     if (defaultDir.length > 0 && dirs.indexOf(defaultDir) < 0) {
       dirs.push(defaultDir);
     }
-    let count = 0;
+    let count = -1;
     for (const dir of dirs) {
       try {
         if (!fileIo.accessSync(dir)) {
           continue;
         }
         const names = fileIo.listFileSync(dir);
-        let dirCount = 0;
+        const completed: Set<number> = new Set();
         for (const name of names) {
           const lower = name.toLowerCase();
           if (lower.endsWith('.tmp') || lower === DOWNLOAD_INFO_FILENAME) {
             continue;
           }
           if (READER_IMAGE_EXTENSIONS.some((extension: string) => lower.endsWith(extension))) {
-            dirCount++;
+            const stem = lower.substring(0, lower.lastIndexOf('.'));
+            const pageNumber = Number(stem);
+            if (!/^\d+$/.test(stem) || !Number.isInteger(pageNumber) || pageNumber <= 0 ||
+              (Math.max(item.total, item.pages) > 0 && pageNumber > Math.max(item.total, item.pages))) {
+              continue;
+            }
+            const stat = fileIo.statSync(`${dir}/${name}`);
+            if (stat.isFile() && stat.size > 0 && (!this.downloadUsesOriginalImage(item) ||
+              verifiedOriginalDownloadPath(dir, this.galleryDirectoryIdentity(item), pageNumber - 1).length > 0)) {
+              completed.add(pageNumber);
+            }
           }
         }
-        count = Math.max(count, dirCount);
+        count = Math.max(count, completed.size);
       } catch (error) {
       }
     }
@@ -1934,21 +2035,23 @@ struct Index {
 
   private reconcileDownloadItemsWithLocalFiles(items: DownloadQueueItem[]): DownloadQueueItem[] {
     const reconciled: DownloadQueueItem[] = [];
-    for (const item of items) {
+    for (const seed of items) {
+      const item = this.restoreExistingDownloadDirectory(seed);
+      if (item !== seed) {
+        this.scheduleDownloadItemPersist(item);
+      }
       if (item.status === DOWNLOAD_STATUS_DONE || item.status === DOWNLOAD_STATUS_DELETED) {
         reconciled.push(item);
         continue;
       }
       const localCount = this.downloadedFileCountForItem(item);
-      if (item.status === DOWNLOAD_STATUS_DOWNLOADING && localCount > item.downloaded) {
+      if (localCount >= 0 && localCount !== item.downloaded && !this.isDownloadItemRunning(item)) {
         const total = Math.max(item.total, item.pages, localCount);
-        const key = this.downloadKey(item.gid, item.site);
-        this.writeDownloadRuntimeHeartbeat(key, true, true);
         reconciled.push(this.toDownloadItem(
           item,
-          DOWNLOAD_STATUS_DOWNLOADING,
+          item.status,
           item.queuedAt,
-          `正在同步本地下载进度`,
+          item.lastAction,
           item.label,
           localCount,
           total,
@@ -1956,10 +2059,10 @@ struct Index {
           item.archiveUri,
           item.createdAt,
           this.nowLabel(),
-          localCount,
-          `${localCount}/${total}`,
-          item.speedBytesPerSecond,
-          item.remainingSeconds,
+          item.currentPage,
+          item.currentPageLabel,
+          0,
+          -1,
           item.downloadDir,
           item.error,
           item.pageErrors
@@ -1974,20 +2077,20 @@ struct Index {
   private recoverInterruptedDownloads(items: DownloadQueueItem[]): DownloadQueueItem[] {
     const recovered: DownloadQueueItem[] = [];
     for (const item of items) {
-      if (item.status === DOWNLOAD_STATUS_DOWNLOADING) {
+      if (item.status === DOWNLOAD_STATUS_DOWNLOADING || item.status === DOWNLOAD_STATUS_QUEUED) {
         const key = this.downloadKey(item.gid, item.site);
         const sharedItem = this.sharedDownloadItemByKey(key);
-        const runningInCurrentProcess = this.isDownloadKeyRunningInCurrentProcess(key);
+        const runningInCurrentProcess = this.isDownloadItemRunning(item) || this.isDownloadItemQueued(item);
         if (sharedItem && runningInCurrentProcess) {
           recovered.push(this.cloneDownloadItem(sharedItem));
           continue;
         }
         const lastAction = runningInCurrentProcess && !item.lastAction.startsWith('下载中断') ?
           item.lastAction :
-          (runningInCurrentProcess ? '正在下载' : '下载中断，点开始继续');
+          (runningInCurrentProcess ? '正在下载' : '下载中断，点继续恢复');
         recovered.push(this.toDownloadItem(
           item,
-          DOWNLOAD_STATUS_DOWNLOADING,
+          runningInCurrentProcess ? item.status : DOWNLOAD_STATUS_PAUSED,
           item.queuedAt,
           lastAction,
           item.label,
@@ -2013,16 +2116,23 @@ struct Index {
   }
 
   private async syncDownloadStateFromDatabase(recoverRunning: boolean, selectPreferredView: boolean = false): Promise<void> {
-    if (this.downloadWorkerRunning) {
+    if (this.downloadWorkerRunning || !this.localDao) {
       return;
     }
     const loadSerial = ++this.downloadStateLoadSerial;
     this.downloadStateLoading = true;
     try {
-      if (sharedDownloadItemsSnapshot.length > 0) {
+      const dbItems = sharedDownloadItemsInitialized ? [] : await this.loadDownloadItemsFromDatabase();
+      const dbLabels = await this.loadDownloadLabelsFromDatabase();
+      if (loadSerial !== this.downloadStateLoadSerial) {
+        return;
+      }
+      // Finish every asynchronous read before taking the latest runtime
+      // snapshot. Publishing a snapshot captured before a database await can
+      // erase a pause/start command or a task added from another page.
+      if (sharedDownloadItemsInitialized) {
         this.downloadItems = this.downloadItemsSource();
       } else {
-        const dbItems = await this.loadDownloadItemsFromDatabase();
         if (dbItems.length > 0) {
           const filteredDbItems = this.filterRemovedDownloadItems(dbItems);
           this.downloadItems = recoverRunning ? this.recoverInterruptedDownloads(filteredDbItems) : filteredDbItems;
@@ -2034,7 +2144,6 @@ struct Index {
         }
       }
       this.downloadItems = this.reconcileDownloadItemsWithLocalFiles(this.downloadItems);
-      const dbLabels = await this.loadDownloadLabelsFromDatabase();
       if (dbLabels.length > 0) {
         this.downloadLabels = ensureDownloadDefaultLabel(dbLabels, this.nowLabel());
       }
@@ -2121,15 +2230,31 @@ struct Index {
   }
 
   private ensureDownloadRuntimeStorageDefaults(): void {
-    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ITEMS_KEY, '[]');
-    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ACTIVE_KEY, '');
-    AppStorage.setOrCreate<boolean>(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, false);
-    AppStorage.setOrCreate<number>(DOWNLOAD_RUNTIME_REVISION_KEY, 0);
-    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, '[]');
-    AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY,
-      this.readString(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY, '[]'));
-    AppStorage.setOrCreate<number>(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY, 0);
-    AppStorage.setOrCreate<string>(DOWNLOAD_ROUTE_TARGET_STORAGE_KEY, '');
+    if (!AppStorage.has(DOWNLOAD_RUNTIME_ITEMS_KEY)) {
+      AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ITEMS_KEY, '[]');
+    }
+    if (!AppStorage.has(DOWNLOAD_RUNTIME_ACTIVE_KEY)) {
+      AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ACTIVE_KEY, '');
+    }
+    if (!AppStorage.has(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY)) {
+      AppStorage.setOrCreate<boolean>(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, false);
+    }
+    if (!AppStorage.has(DOWNLOAD_RUNTIME_REVISION_KEY)) {
+      AppStorage.setOrCreate<number>(DOWNLOAD_RUNTIME_REVISION_KEY, 0);
+    }
+    if (!AppStorage.has(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY)) {
+      AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, '[]');
+    }
+    if (!AppStorage.has(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY)) {
+      AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY,
+        this.readString(DOWNLOAD_RUNTIME_REMOVED_KEYS_KEY, '[]'));
+    }
+    if (!AppStorage.has(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY)) {
+      AppStorage.setOrCreate<number>(DOWNLOAD_ROUTE_EVENT_STORAGE_KEY, 0);
+    }
+    if (!AppStorage.has(DOWNLOAD_ROUTE_TARGET_STORAGE_KEY)) {
+      AppStorage.setOrCreate<string>(DOWNLOAD_ROUTE_TARGET_STORAGE_KEY, '');
+    }
   }
 
   private runtimeStringArray(key: string): string[] {
@@ -2168,15 +2293,8 @@ struct Index {
   }
 
   private publishDownloadRuntimeStorage(snapshot: DownloadQueueItem[] = sharedDownloadItemsSnapshot, force: boolean = false): void {
-    const localActiveKey = this.downloadActiveKey.length > 0 ? this.downloadActiveKey : sharedDownloadActiveKey;
-    const ownsDownloadRuntime = this.downloadWorkerRunning || sharedDownloadWorkerRunning || localActiveKey.length > 0;
-    if (!force && !ownsDownloadRuntime && this.downloadRuntimeWorkerRunning) {
-      return;
-    }
-    const activeKey = ownsDownloadRuntime ? localActiveKey : this.downloadRuntimeActiveKey;
-    const workerRunning = ownsDownloadRuntime ?
-      (this.downloadWorkerRunning || sharedDownloadWorkerRunning || localActiveKey.length > 0) :
-      this.downloadRuntimeWorkerRunning;
+    const workerRunning = sharedDownloadWorkerRunning;
+    const activeKey = workerRunning ? sharedDownloadActiveKey : '';
     AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ITEMS_KEY, JSON.stringify(snapshot));
     AppStorage.setOrCreate<string>(DOWNLOAD_RUNTIME_ACTIVE_KEY, activeKey);
     AppStorage.setOrCreate<boolean>(DOWNLOAD_RUNTIME_WORKER_RUNNING_KEY, workerRunning);
@@ -2230,13 +2348,13 @@ struct Index {
     }
     const nextVersion = (this.downloadPersistVersions.get(key) || 0) + 1;
     this.downloadPersistVersions.set(key, nextVersion);
-    const pending = this.downloadPersistQueue.then(async () => {
+    const pending = sharedDownloadPersistQueue.then(async () => {
       if (this.downloadPersistVersions.get(key) !== nextVersion || this.isDownloadKeyRemoved(key)) {
         return;
       }
       await this.upsertDownloadItemToDatabase(item);
     });
-    this.downloadPersistQueue = pending.catch(() => {
+    sharedDownloadPersistQueue = pending.catch(() => {
     });
   }
 
@@ -2247,10 +2365,10 @@ struct Index {
     if (!this.localDao) {
       return;
     }
-    const pending = this.downloadPersistQueue.then(async () => {
+    const pending = sharedDownloadPersistQueue.then(async () => {
       await this.deleteDownloadItemFromDatabase(item);
     });
-    this.downloadPersistQueue = pending.catch(() => {
+    sharedDownloadPersistQueue = pending.catch(() => {
     });
   }
 
@@ -3423,7 +3541,140 @@ struct Index {
   }
 
   private fileUri(path: string): string {
-    return path.length > 0 ? `file://${path}` : '';
+    const publicUri = publicDownloadFileUri(path);
+    return publicUri.length > 0 ? publicUri : (path.length > 0 ? `file://${path}` : '');
+  }
+
+  private async preparePublicDownloadDirectory(): Promise<boolean> {
+    this.downloadDirectoryPreparing = true;
+    this.downloadDirectoryStatus = '正在准备公共下载目录';
+    try {
+      const context = this.uiAbilityContext();
+      if (!context) {
+        throw new Error('无法取得当前应用上下文');
+      }
+      const directory = await getPublicDownloadDirectory(context);
+      this.downloadDirectoryPath = directory.path;
+      this.downloadDirectoryStatus = DOWNLOAD_DIRECTORY_DISPLAY_TEXT;
+      return true;
+    } catch (error) {
+      this.downloadDirectoryPath = '';
+      this.downloadDirectoryStatus = `公共下载目录不可用，请重试：${`${error}`.replace('Error: ', '')}`;
+      return false;
+    } finally {
+      this.downloadDirectoryPreparing = false;
+    }
+  }
+
+  private async openDownloadDirectoryInFileManager(): Promise<void> {
+    if (this.downloadDirectoryOpening) {
+      return;
+    }
+    this.downloadDirectoryOpening = true;
+    try {
+      const context = this.uiAbilityContext();
+      if (!context) {
+        throw new Error('无法取得当前应用上下文');
+      }
+      const directory = await openPublicDownloadDirectory(context);
+      this.downloadDirectoryPath = directory.path;
+      this.downloadDirectoryStatus = DOWNLOAD_DIRECTORY_DISPLAY_TEXT;
+    } catch (error) {
+      this.toast('无法打开下载目录，请重试');
+    } finally {
+      this.downloadDirectoryOpening = false;
+    }
+  }
+
+  private legacyGalleryDownloadDirs(gid: number, site: string, title: string): string[] {
+    const dirs: string[] = [];
+    const publicRoot = this.downloadRoot();
+    if (publicRoot.length > 0) {
+      dirs.push(`${publicRoot}/${site}-${gid}`);
+    }
+    const legacyRoot = this.legacyDownloadDirectoryPath.trim();
+    if (legacyRoot.length > 0) {
+      dirs.push(`${legacyRoot}/${site}-${gid}`);
+    }
+    const filesDir = this.abilityFilesDir();
+    if (filesDir.length > 0) {
+      const safeTitle = this.readerSafeSegment(title.length > 0 ? title : `${gid}`);
+      dirs.push(
+        `${filesDir}/${READER_DOWNLOAD_DIR_NAME}/${site}-${gid}`,
+        `${filesDir}/${READER_DOWNLOAD_DIR_NAME}/${gid}`,
+        `${filesDir}/${READER_DOWNLOAD_DIR_NAME}/${safeTitle}`,
+        `${filesDir}/download/${site}-${gid}`,
+        `${filesDir}/download/${gid}`
+      );
+    }
+    return dirs;
+  }
+
+  private galleryDirectoryIdentity(item: DownloadQueueItem): GalleryDirectoryIdentity {
+    return { gid: item.gid, site: item.site, token: item.token, title: item.title };
+  }
+
+  private reservedGalleryDownloadDirs(gid: number, site: string): string[] {
+    const key = this.downloadKey(gid, site);
+    return this.downloadItemsSource()
+      .filter((entry: DownloadQueueItem): boolean => this.downloadKey(entry.gid, entry.site) !== key)
+      .map((entry: DownloadQueueItem): string => entry.downloadDir.trim())
+      .filter((dir: string): boolean => dir.length > 0);
+  }
+
+  private restoreExistingDownloadDirectory(item: DownloadQueueItem, allowRunning: boolean = false): DownloadQueueItem {
+    const key = this.downloadKey(item.gid, item.site);
+    // Never move directories underneath page writers or outstanding requests.
+    if ((this.downloadActiveRequests.get(key) || []).length > 0 ||
+      (!allowRunning && this.isDownloadKeyRunningInCurrentProcess(key))) {
+      return item;
+    }
+    const reserved = this.reservedGalleryDownloadDirs(item.gid, item.site);
+    const identity = this.galleryDirectoryIdentity(item);
+    const stored = item.downloadDir.trim();
+    let existing = isGalleryDirectory(stored) ? stored : '';
+    if (existing.length === 0) {
+      const parents: string[] = [];
+      if (stored.lastIndexOf('/') > 0) {
+        parents.push(stored.substring(0, stored.lastIndexOf('/')));
+      }
+      const root = this.downloadRoot();
+      if (root.length > 0 && parents.indexOf(root) < 0) {
+        parents.push(root);
+      }
+      // The marker is written before rename, so a restart between rename and
+      // database persistence can recover the gallery's actual directory.
+      for (const parent of parents) {
+        existing = findGalleryDirectory(parent, identity, reserved);
+        if (existing.length > 0) {
+          break;
+        }
+      }
+    }
+    for (const dir of existing.length > 0 ? [] : this.legacyGalleryDownloadDirs(item.gid, item.site, item.title)) {
+      try {
+        if (reserved.indexOf(dir) >= 0 || !isGalleryDirectory(dir)) {
+          continue;
+        }
+        const names = fileIo.listFileSync(dir);
+        if (names.some((name: string): boolean =>
+          READER_IMAGE_EXTENSIONS.some((extension: string): boolean => name.toLowerCase().endsWith(extension)))) {
+          existing = dir;
+          break;
+        }
+      } catch (error) {
+      }
+    }
+    if (existing.length === 0 || reserved.indexOf(existing) >= 0) {
+      return item;
+    }
+    const actualDir = migrateGalleryDirectory(existing, identity, reserved);
+    if (actualDir === stored) {
+      return item;
+    }
+    const restored = this.cloneDownloadItem(item);
+    restored.downloadDir = actualDir;
+    return restored;
   }
 
   private readerCacheRoot(): string {
@@ -3542,34 +3793,36 @@ struct Index {
   }
 
   private readerCookieHeader(url: string): string {
-    const names: string[] = [];
-    const values: string[] = [];
-    this.appendReaderCookieSource(EhUrl.DOMAIN_FORUMS, names, values);
-    this.appendReaderCookieSource(EhUrl.DOMAIN_E, names, values);
-    if (this.siteMode === GallerySite.EX) {
-      this.appendReaderCookieSource(EhUrl.DOMAIN_EX, names, values);
-    }
-    this.appendReaderCookieSource(url, names, values);
-    if (this.siteMode === GallerySite.E && names.indexOf('nw') < 0) {
-      names.push('nw');
-      values.push('nw=1');
-    }
-    return values.join('; ');
+    return this.downloadCookieHeader(url, this.siteMode);
   }
 
   private readerDownloadedImageUri(pageIndex: number): string {
-    const filesDir = this.abilityFilesDir();
-    if (filesDir.length === 0 || this.nativeDetail.gid <= 0) {
+    if (this.nativeDetail.gid <= 0) {
       return '';
     }
-    const safeTitle = this.readerSafeSegment(this.nativeDetail.title.length > 0 ? this.nativeDetail.title : `${this.nativeDetail.gid}`);
-    const dirs: string[] = [
-      `${filesDir}/${READER_DOWNLOAD_DIR_NAME}/${this.siteMode}-${this.nativeDetail.gid}`,
-      `${filesDir}/${READER_DOWNLOAD_DIR_NAME}/${this.nativeDetail.gid}`,
-      `${filesDir}/${READER_DOWNLOAD_DIR_NAME}/${safeTitle}`,
-      `${filesDir}/download/${this.siteMode}-${this.nativeDetail.gid}`,
-      `${filesDir}/download/${this.nativeDetail.gid}`
-    ];
+    const dirs: string[] = [];
+    const identity: GalleryDirectoryIdentity = {
+      gid: this.nativeDetail.gid,
+      site: this.siteMode,
+      token: this.nativeDetail.token,
+      title: this.nativeDetail.title
+    };
+    const task = this.findDownloadItem(this.nativeDetail.gid, this.siteMode);
+    if (task) {
+      const taskDir = this.galleryDownloadDir(task);
+      if (taskDir.length > 0) {
+        dirs.push(taskDir);
+      }
+    }
+    const root = this.downloadRoot();
+    if (root.length > 0 && (!task || !isGalleryDirectory(task.downloadDir.trim()))) {
+      const namedDir = findGalleryDirectory(root, identity,
+        this.reservedGalleryDownloadDirs(identity.gid, identity.site));
+      if (namedDir.length > 0 && dirs.indexOf(namedDir) < 0) {
+        dirs.push(namedDir);
+      }
+    }
+    dirs.push(...this.legacyGalleryDownloadDirs(this.nativeDetail.gid, this.siteMode, this.nativeDetail.title));
     const oneBased = pageIndex + 1;
     const names: string[] = [];
     for (const extension of READER_IMAGE_EXTENSIONS) {
@@ -3578,11 +3831,18 @@ struct Index {
       names.push(`${oneBased}${extension}`);
     }
     for (const dir of dirs) {
+      const verified = verifiedOriginalDownloadPath(dir, identity, pageIndex);
+      if (verified.length > 0) {
+        return this.fileUri(verified);
+      }
       for (const name of names) {
         const path = `${dir}/${name}`;
         try {
           if (fileIo.accessSync(path)) {
-            return this.fileUri(path);
+            const stat = fileIo.statSync(path);
+            if (stat.isFile() && stat.size > 0) {
+              return this.fileUri(path);
+            }
           }
         } catch (error) {
         }
@@ -3932,6 +4192,8 @@ struct Index {
       throw new Error('阅读器缓存目录不可用');
     }
 
+    const requestUrl = page.originImageUrl.length > 0 && sourceUrl === page.originImageUrl ?
+      await NativeEhClient.fetchOriginalImageUrl(this.siteMode, page) : sourceUrl;
     const request = http.createHttp();
     const headers: Record<string, string> = {
       'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
@@ -3939,19 +4201,16 @@ struct Index {
       'User-Agent': 'Mozilla/5.0 (Phone; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36',
       'Referer': page.pageUrl
     };
-    const host = this.readerHostFromUrl(sourceUrl);
-    if (host.length > 0) {
-      headers['Host'] = host;
-    }
-    const cookie = this.readerCookieHeader(sourceUrl);
+    const cookie = this.readerCookieHeader(requestUrl);
     if (cookie.length > 0) {
       headers['Cookie'] = cookie;
     }
 
     try {
-      const response = await request.request(sourceUrl, {
+      const response = await request.request(requestUrl, {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        maxLimit: DOWNLOAD_IMAGE_RESPONSE_MAX_BYTES,
         usingCache: false,
         usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 30000,
@@ -4659,7 +4918,8 @@ struct Index {
   private toast(message: string): void {
     const options: promptAction.ShowToastOptions = {
       message,
-      duration: 1800
+      duration: 1800,
+      systemMaterial: IMMERSIVE_MENU_MATERIAL
     };
     try {
       this.getUIContext().getPromptAction().showToast(options);
@@ -5617,14 +5877,22 @@ struct Index {
     const nextTitle = this.pageTitle.trim().length > 0 ? this.pageTitle.trim() : nextUrl;
     const filtered = this.bookmarks.filter((item: BookmarkItem) => item.url !== nextUrl);
     const nextBookmark: BookmarkItem = { title: nextTitle, url: nextUrl };
-    this.bookmarks = [nextBookmark, ...filtered].slice(0, 24);
+    this.animateManagedListChange((): void => {
+      this.bookmarks = [nextBookmark, ...filtered].slice(0, 24);
+    });
     this.saveBookmarks();
     this.toast('书签已保存');
   }
 
   private removeBookmark(url: string): void {
-    this.bookmarks = this.bookmarks.filter((item: BookmarkItem) => item.url !== url);
+    this.animateManagedListChange((): void => {
+      this.bookmarks = this.bookmarks.filter((item: BookmarkItem) => item.url !== url);
+    });
     this.saveBookmarks();
+  }
+
+  private animateManagedListChange(action: () => void): void {
+    this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut }, action);
   }
 
   private importCookies(): void {
@@ -5770,6 +6038,7 @@ struct Index {
 
   private confirmClearLocalAccountCache(): void {
     const options: promptAction.ShowDialogOptions = {
+      systemMaterial: IMMERSIVE_DIALOG_MATERIAL,
       title: '删除本地账号缓存',
       message: '确定要删除本地保存的登录 Cookie 和账号状态吗？',
       buttons: [
@@ -7358,6 +7627,7 @@ struct Index {
       return;
     }
     const options: promptAction.ShowDialogOptions = {
+      systemMaterial: IMMERSIVE_DIALOG_MATERIAL,
       title: '清空历史记录',
       message: '确定要清空全部搜索历史记录吗？',
       buttons: [
@@ -7467,6 +7737,85 @@ struct Index {
     return '输入关键词';
   }
 
+  private resetSearchAdvancedPresentation(): void {
+    this.searchAdvancedContentMounted = this.searchAdvancedEnabled;
+    this.searchAdvancedContentOpacity = this.searchAdvancedEnabled ? 1 : 0;
+    this.searchAdvancedHeaderHeight = this.searchAdvancedEnabled ? 108 : 56;
+    this.searchAdvancedChipHeight = this.searchAdvancedEnabled ? 52 : 0;
+    this.searchAdvancedFieldsHeight = this.searchAdvancedEnabled ? 84 : 0;
+  }
+
+  private activateSearchAdvancedTransitions(): void {
+    this.searchAdvancedSheetActive = true;
+    this.searchAdvancedAnimationGeneration++;
+    this.searchAdvancedInputFocused = false;
+    this.resetSearchAdvancedPresentation();
+  }
+
+  private deactivateSearchAdvancedTransitions(): void {
+    this.searchAdvancedSheetActive = false;
+    this.searchAdvancedAnimationGeneration++;
+    this.searchAdvancedInputFocused = false;
+  }
+
+  private syncSearchAdvancedVisibility(): void {
+    const generation = ++this.searchAdvancedAnimationGeneration;
+    if (!this.searchAdvancedSheetActive || !this.searchFilterSheetVisible) {
+      this.resetSearchAdvancedPresentation();
+      return;
+    }
+    const visible = this.searchAdvancedEnabled;
+    if (!visible && this.searchAdvancedInputFocused) {
+      // Removing a focused input must not leave the keyboard attached to a
+      // hidden field. The switch remains mounted throughout the transition.
+      try {
+        this.getUIContext().getFocusController().requestFocus('search-advanced-switch');
+      } catch (error) {
+        try {
+          this.getUIContext().getFocusController().clearFocus();
+        } catch (focusError) {
+          // A focus service failure must not interrupt hiding the fields.
+        }
+      }
+      this.searchAdvancedInputFocused = false;
+    }
+    if (visible && !this.searchAdvancedContentMounted) {
+      this.searchAdvancedContentOpacity = 0;
+      this.searchAdvancedChipHeight = 0;
+      this.searchAdvancedFieldsHeight = 0;
+      this.searchAdvancedHeaderHeight = 56;
+      this.searchAdvancedContentMounted = true;
+    }
+    this.getUIContext().postFrameCallback(new SearchAdvancedFrameCallback((): void => {
+      if (!this.searchAdvancedSheetActive || !this.searchFilterSheetVisible ||
+        generation !== this.searchAdvancedAnimationGeneration) {
+        return;
+      }
+      this.animateSearchAdvancedVisibility(visible, generation);
+    }));
+  }
+
+  private animateSearchAdvancedVisibility(visible: boolean, generation: number): void {
+    this.getUIContext().animateTo({
+      duration: 200,
+      curve: Curve.EaseOut,
+      onFinish: (): void => {
+        if (!this.searchAdvancedSheetActive || !this.searchFilterSheetVisible ||
+          generation !== this.searchAdvancedAnimationGeneration) {
+          return;
+        }
+        if (!visible && !this.searchAdvancedEnabled) {
+          this.searchAdvancedContentMounted = false;
+        }
+      }
+    }, (): void => {
+      this.searchAdvancedContentOpacity = visible ? 1 : 0;
+      this.searchAdvancedHeaderHeight = visible ? 108 : 56;
+      this.searchAdvancedChipHeight = visible ? 52 : 0;
+      this.searchAdvancedFieldsHeight = visible ? 84 : 0;
+    });
+  }
+
   private toggleSearchFiltersExpanded(): void {
     if (this.activeSection !== NAV_SEARCH || this.nativeViewMode !== 'list') {
       return;
@@ -7520,6 +7869,17 @@ struct Index {
     return SEARCH_CATEGORY_OPTIONS.filter((option: SearchCategoryOption): boolean => {
       return !this.categorySelected(option.bit);
     });
+  }
+
+  private orderedSearchCategoryOptions(): SearchCategoryOption[] {
+    return [...this.selectedSearchCategoryOptions(), ...this.unselectedSearchCategoryOptions()];
+  }
+
+  private searchCategoryStartsGroup(bit: number): boolean {
+    const selected = this.selectedSearchCategoryOptions();
+    const unselected = this.unselectedSearchCategoryOptions();
+    return (selected.length > 0 && selected[0].bit === bit) ||
+      (unselected.length > 0 && unselected[0].bit === bit);
   }
 
   private animateSearchCategoryChange(action: () => void): void {
@@ -8911,13 +9271,15 @@ struct Index {
     remainingSeconds: number = -1,
     downloadDir: string = '',
     error: string = '',
-    pageErrors: DownloadPageError[] = []
+    pageErrors: DownloadPageError[] = [],
+    imageQuality: string = ''
   ): DownloadQueueItem {
     const normalizedStatus = this.normalizeDownloadStatus(status);
     const created = createdAt.length > 0 ? createdAt : (queuedAt.length > 0 ? queuedAt : this.nowLabel());
     const updated = updatedAt.length > 0 ? updatedAt : created;
     const normalizedTotal = total > 0 ? total : record.pages;
     const normalizedDownloaded = clampNumber(downloaded, 0, Math.max(0, normalizedTotal));
+    const savedQuality = imageQuality || (record as DownloadQueueItem).imageQuality || '';
     const item: DownloadQueueItem = {
       gid: record.gid,
       token: record.token,
@@ -8932,6 +9294,7 @@ struct Index {
       pages: record.pages,
       language: record.language,
       rating: record.rating,
+      imageQuality: savedQuality === 'original' || savedQuality === 'compressed' ? savedQuality : '',
       status: normalizedStatus,
       label: label.length > 0 ? label : DOWNLOAD_DEFAULT_LABEL,
       queuedAt: queuedAt.length > 0 ? queuedAt : created,
@@ -10608,24 +10971,34 @@ struct Index {
     if (!this.readerReadingFullscreen) {
       return;
     }
-    this.readerMenuVisible = !this.readerMenuVisible;
-    if (!this.readerMenuVisible) {
-      this.readerSettingsVisible = false;
-    }
+    this.animateReaderControls((): void => {
+      this.readerMenuVisible = !this.readerMenuVisible;
+      if (!this.readerMenuVisible) {
+        this.readerSettingsVisible = false;
+      }
+    });
     this.refreshReaderClockText();
   }
 
   private toggleReaderSettingsPanel(): void {
-    this.readerSettingsVisible = !this.readerSettingsVisible;
-    if (this.readerSettingsVisible) {
-      this.readerMenuVisible = true;
-    }
+    this.animateReaderControls((): void => {
+      this.readerSettingsVisible = !this.readerSettingsVisible;
+      if (this.readerSettingsVisible) {
+        this.readerMenuVisible = true;
+      }
+    });
+  }
+
+  private animateReaderControls(action: ReaderCommandHandler): void {
+    this.getUIContext().animateTo({ duration: 240, curve: Curve.EaseOut }, action);
   }
 
   private toggleReaderFullscreenSetting(): void {
-    this.readerReadingFullscreen = this.toggleReaderBoolean(READER_KEY_FULLSCREEN, this.readerReadingFullscreen);
-    this.readerSettingsVisible = false;
-    this.readerMenuVisible = !this.readerReadingFullscreen;
+    this.animateReaderControls((): void => {
+      this.readerReadingFullscreen = this.toggleReaderBoolean(READER_KEY_FULLSCREEN, this.readerReadingFullscreen);
+      this.readerSettingsVisible = false;
+      this.readerMenuVisible = !this.readerReadingFullscreen;
+    });
     if (this.nativeViewMode === 'reader') {
       void this.applyReaderWindowState();
     }
@@ -10694,7 +11067,9 @@ struct Index {
       url: this.nativeDetail.detailUrl
     };
     const filtered = this.bookmarks.filter((item: BookmarkItem) => item.url !== this.nativeDetail.detailUrl);
-    this.bookmarks = [nextBookmark, ...filtered].slice(0, 24);
+    this.animateManagedListChange((): void => {
+      this.bookmarks = [nextBookmark, ...filtered].slice(0, 24);
+    });
     this.saveBookmarks();
     this.toast('书签已保存');
   }
@@ -10871,22 +11246,30 @@ struct Index {
     this.nativeDetailRevision++;
   }
 
+  private animateDetailPanels(action: () => void): void {
+    this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseOut }, action);
+  }
+
   private openFavoritePanel(): void {
-    this.favoritePanelVisible = !this.favoritePanelVisible;
-    if (this.favoritePanelVisible) {
+    this.animateDetailPanels((): void => {
+      this.favoritePanelVisible = !this.favoritePanelVisible;
+      if (this.favoritePanelVisible) {
+        this.favoritePanelSlotDraft = this.favoriteQuickSlot();
+        this.ratingPanelVisible = false;
+        this.torrentPanelVisible = false;
+        this.archivePanelVisible = false;
+      }
+    });
+  }
+
+  private showFavoritePanel(): void {
+    this.animateDetailPanels((): void => {
+      this.favoritePanelVisible = true;
       this.favoritePanelSlotDraft = this.favoriteQuickSlot();
       this.ratingPanelVisible = false;
       this.torrentPanelVisible = false;
       this.archivePanelVisible = false;
-    }
-  }
-
-  private showFavoritePanel(): void {
-    this.favoritePanelVisible = true;
-    this.favoritePanelSlotDraft = this.favoriteQuickSlot();
-    this.ratingPanelVisible = false;
-    this.torrentPanelVisible = false;
-    this.archivePanelVisible = false;
+    });
   }
 
   private async applyFavoriteSlot(slot: number, rememberDefault: boolean): Promise<void> {
@@ -10916,7 +11299,9 @@ struct Index {
       if (rememberDefault || this.defaultFavoriteSlot !== normalizedSlot) {
         this.setDefaultFavoriteSlot(normalizedSlot);
       }
-      this.favoritePanelVisible = false;
+      this.animateDetailPanels((): void => {
+        this.favoritePanelVisible = false;
+      });
       this.detailActionStatus = `已收藏到 ${this.favoriteSlotName(normalizedSlot)}`;
       this.toast('收藏已更新');
     } catch (error) {
@@ -10977,13 +11362,15 @@ struct Index {
     if (!this.ensureDetailAccountCredential()) {
       return;
     }
-    this.selectedRating = this.nativeDetail.rating > 0 ? this.nativeDetail.rating : 3;
-    this.ratingPanelVisible = !this.ratingPanelVisible;
-    if (this.ratingPanelVisible) {
-      this.favoritePanelVisible = false;
-      this.torrentPanelVisible = false;
-      this.archivePanelVisible = false;
-    }
+    this.animateDetailPanels((): void => {
+      this.selectedRating = this.nativeDetail.rating > 0 ? this.nativeDetail.rating : 3;
+      this.ratingPanelVisible = !this.ratingPanelVisible;
+      if (this.ratingPanelVisible) {
+        this.favoritePanelVisible = false;
+        this.torrentPanelVisible = false;
+        this.archivePanelVisible = false;
+      }
+    });
   }
 
   private adjustSelectedRating(delta: number): void {
@@ -11009,7 +11396,9 @@ struct Index {
       this.nativeDetail.rating = result.rating;
       this.nativeDetail.ratingCount = result.ratingCount;
       this.nativeDetailRevision++;
-      this.ratingPanelVisible = false;
+      this.animateDetailPanels((): void => {
+        this.ratingPanelVisible = false;
+      });
       this.detailActionStatus = '评分已更新';
       this.toast('评分成功');
     } catch (error) {
@@ -11132,14 +11521,16 @@ struct Index {
       this.toast('没有 Torrent 入口');
       return;
     }
-    this.torrentPanelVisible = !this.torrentPanelVisible;
-    if (this.torrentPanelVisible) {
-      this.favoritePanelVisible = false;
-      this.ratingPanelVisible = false;
-      this.archivePanelVisible = false;
-      if (this.torrentItems.length === 0 && !this.torrentLoading) {
-        await this.loadTorrentList();
+    this.animateDetailPanels((): void => {
+      this.torrentPanelVisible = !this.torrentPanelVisible;
+      if (this.torrentPanelVisible) {
+        this.favoritePanelVisible = false;
+        this.ratingPanelVisible = false;
+        this.archivePanelVisible = false;
       }
+    });
+    if (this.torrentPanelVisible && this.torrentItems.length === 0 && !this.torrentLoading) {
+      await this.loadTorrentList();
     }
   }
 
@@ -11166,8 +11557,8 @@ struct Index {
   }
 
   private detailDownloadDir(name: string): string {
-    const filesDir = this.abilityFilesDir();
-    return filesDir.length > 0 ? `${filesDir}/${name}` : '';
+    const root = this.downloadRoot();
+    return root.length > 0 ? `${root}/${name}` : '';
   }
 
   private writeBinaryFile(path: string, data: ArrayBuffer): void {
@@ -11198,6 +11589,11 @@ struct Index {
   }
 
   private async downloadTorrentItem(item: NativeTorrentItem): Promise<void> {
+    if (!await this.preparePublicDownloadDirectory()) {
+      this.torrentStatus = this.downloadDirectoryStatus;
+      this.toast('公共下载目录不可用，请在下载设置中重试');
+      return;
+    }
     const dir = this.detailDownloadDir(DETAIL_TORRENT_DIR_NAME);
     if (dir.length === 0) {
       this.toast('下载目录不可用');
@@ -11225,14 +11621,16 @@ struct Index {
     if (!this.ensureDetailAccountCredential()) {
       return;
     }
-    this.archivePanelVisible = !this.archivePanelVisible;
-    if (this.archivePanelVisible) {
-      this.favoritePanelVisible = false;
-      this.ratingPanelVisible = false;
-      this.torrentPanelVisible = false;
-      if (this.archiveList.items.length === 0 && !this.archiveLoading) {
-        await this.loadArchiveList();
+    this.animateDetailPanels((): void => {
+      this.archivePanelVisible = !this.archivePanelVisible;
+      if (this.archivePanelVisible) {
+        this.favoritePanelVisible = false;
+        this.ratingPanelVisible = false;
+        this.torrentPanelVisible = false;
       }
+    });
+    if (this.archivePanelVisible && this.archiveList.items.length === 0 && !this.archiveLoading) {
+      await this.loadArchiveList();
     }
   }
 
@@ -11831,8 +12229,7 @@ struct Index {
   }
 
   private findDownloadItem(gid: number, site: string): DownloadQueueItem | undefined {
-    const index = this.findDownloadIndex(gid, site);
-    return index >= 0 ? this.downloadItems[index] : undefined;
+    return this.findDownloadItemByKey(this.downloadKey(gid, site));
   }
 
   private localDownloadItemByKey(key: string): DownloadQueueItem | undefined {
@@ -11915,22 +12312,7 @@ struct Index {
     if (key.length <= 0 || this.isDownloadKeyCancelled(key) || this.isDownloadKeyRemoved(key)) {
       return false;
     }
-    if (this.downloadWorkerRunning && this.downloadActiveKey === key) {
-      return true;
-    }
-    if (sharedDownloadWorkerRunning && sharedDownloadActiveKey === key) {
-      return true;
-    }
-    if (this.downloadRuntimeWorkerRunning && this.downloadRuntimeActiveKey === key) {
-      return true;
-    }
-    if (this.isDownloadRuntimeHeartbeatActiveForKey(key)) {
-      return true;
-    }
-    const sharedItem = this.sharedDownloadItemByKey(key);
-    return (this.downloadWorkerRunning || sharedDownloadWorkerRunning || this.downloadRuntimeWorkerRunning) &&
-      !!sharedItem &&
-      sharedItem.status === DOWNLOAD_STATUS_DOWNLOADING;
+    return sharedDownloadWorkerRunning && sharedDownloadActiveKey === key;
   }
 
   private latestDownloadItem(item: DownloadQueueItem): DownloadQueueItem {
@@ -11939,16 +12321,7 @@ struct Index {
   }
 
   private activeDownloadRuntimeKey(): string {
-    if (this.downloadActiveKey.length > 0) {
-      return this.downloadActiveKey;
-    }
-    if (sharedDownloadActiveKey.length > 0) {
-      return sharedDownloadActiveKey;
-    }
-    if (this.downloadRuntimeActiveKey.length > 0) {
-      return this.downloadRuntimeActiveKey;
-    }
-    return this.activeDownloadRuntimeKeyFromPreferences();
+    return sharedDownloadWorkerRunning ? sharedDownloadActiveKey : '';
   }
 
   private shouldUseSharedDownloadItem(sharedItem: DownloadQueueItem, localItem: DownloadQueueItem | undefined): boolean {
@@ -11971,37 +12344,18 @@ struct Index {
   }
 
   private downloadItemsSource(): DownloadQueueItem[] {
-    const itemsByKey: Map<string, DownloadQueueItem> = new Map<string, DownloadQueueItem>();
-    for (const item of this.downloadItems) {
-      const key = this.downloadKey(item.gid, item.site);
-      if (!this.isDownloadKeyRemoved(key)) {
-        itemsByKey.set(key, this.cloneDownloadItem(item));
-      }
-    }
-    for (const item of sharedDownloadItemsSnapshot) {
-      const key = this.downloadKey(item.gid, item.site);
-      if (this.isDownloadKeyRemoved(key)) {
-        continue;
-      }
-      const existing = itemsByKey.get(key);
-      if (this.shouldUseSharedDownloadItem(item, existing)) {
-        itemsByKey.set(key, this.cloneDownloadItem(item));
-      }
-    }
-    for (const item of this.runtimeDownloadItemsSnapshot()) {
-      const key = this.downloadKey(item.gid, item.site);
-      if (this.isDownloadKeyRemoved(key)) {
-        continue;
-      }
-      const existing = itemsByKey.get(key);
-      if (this.shouldUseSharedDownloadItem(item, existing)) {
-        itemsByKey.set(key, this.cloneDownloadItem(item));
-      }
-    }
+    // Runtime snapshots are authoritative across every routed Index instance.
+    // A second-resolution timestamp or a larger stale count cannot override a
+    // newer pause/start command from another page.
+    this.downloadRuntimeRevision;
+    this.downloadRuntimeItemsJson;
+    const snapshot = sharedDownloadItemsInitialized ? sharedDownloadItemsSnapshot : this.downloadItems;
     const items: DownloadQueueItem[] = [];
-    itemsByKey.forEach((item: DownloadQueueItem) => {
-      items.push(this.downloadDisplayItem(item));
-    });
+    for (const item of snapshot) {
+      if (!this.isDownloadKeyRemoved(this.downloadKey(item.gid, item.site))) {
+        items.push(this.downloadDisplayItem(this.cloneDownloadItem(item)));
+      }
+    }
     return items;
   }
 
@@ -12040,6 +12394,7 @@ struct Index {
       snapshot.push(this.cloneDownloadItem(item));
     }
     sharedDownloadItemsSnapshot = snapshot;
+    sharedDownloadItemsInitialized = true;
     this.publishDownloadRuntimeStorage(snapshot);
     this.bumpDownloadQueueRevision();
   }
@@ -12068,6 +12423,99 @@ struct Index {
       this.removeDownloadItem(existing);
       return;
     }
+    const generation = this.currentDownloadRunGeneration(key);
+    this.promptDownloadImageQuality(record, (imageQuality: string): void => {
+      if (this.currentDownloadRunGeneration(key) === generation) {
+        this.addGalleryDownload(record, imageQuality);
+      }
+    });
+  }
+
+  private promptDownloadImageQuality(record: LocalGalleryRecord, onSelected: (quality: string) => void): void {
+    const key = this.downloadKey(record.gid, record.site);
+    if (sharedDownloadQualityPromptKeys.has(key)) {
+      return;
+    }
+    sharedDownloadQualityPromptKeys.add(key);
+    let settled = false;
+    const finish = (): boolean => {
+      if (settled) {
+        return false;
+      }
+      settled = true;
+      sharedDownloadQualityPromptKeys.delete(key);
+      return true;
+    };
+    const selectQuality = (quality: string): void => {
+      if (finish()) {
+        onSelected(quality);
+      }
+    };
+    const options: AlertDialogParamWithOptions = {
+      systemMaterial: IMMERSIVE_DIALOG_MATERIAL,
+      title: '选择下载画质',
+      message: '',
+      buttonDirection: DialogButtonDirection.VERTICAL,
+      cancel: (): void => {
+        finish();
+      },
+      onWillDismiss: (action: DismissDialogAction): void => {
+        finish();
+        action.dismiss();
+      },
+      onDidDisappear: (): void => {
+        finish();
+      },
+      buttons: [
+        {
+          value: '原图',
+          style: DialogButtonStyle.HIGHLIGHT,
+          backgroundColor: '#C86B8C',
+          fontColor: '#FFFFFF',
+          defaultFocus: true,
+          action: (): void => {
+            selectQuality('original');
+          }
+        },
+        {
+          value: '压缩图',
+          style: DialogButtonStyle.DEFAULT,
+          fontColor: $r('sys.color.font_primary'),
+          action: (): void => {
+            selectQuality('compressed');
+          }
+        },
+        {
+          value: '取消',
+          style: DialogButtonStyle.DEFAULT,
+          fontColor: $r('sys.color.font_primary'),
+          action: (): void => {
+            finish();
+          }
+        }
+      ]
+    };
+    try {
+      this.getUIContext().showAlertDialog(options);
+    } catch (error) {
+      finish();
+    }
+  }
+
+  private requiresDownloadImageQuality(item: DownloadQueueItem): boolean {
+    return item.imageQuality !== 'original' && item.imageQuality !== 'compressed' &&
+      item.status !== DOWNLOAD_STATUS_DONE && item.status !== DOWNLOAD_STATUS_DELETED;
+  }
+
+  private downloadUsesOriginalImage(item: DownloadQueueItem): boolean {
+    return item.imageQuality === 'original';
+  }
+
+  private addGalleryDownload(record: LocalGalleryRecord, imageQuality: string): void {
+    const key = this.downloadKey(record.gid, record.site);
+    if (this.findDownloadItemByKey(key)) {
+      return;
+    }
     this.clearDownloadKeyRemoved(key);
     this.downloadCancelKeys.delete(key);
     sharedDownloadCancelKeys.delete(key);
@@ -12085,7 +12533,8 @@ struct Index {
       this.nowLabel(),
       this.nowLabel()
     );
-    this.downloadItems = [nextItem, ...this.downloadItems].slice(0, 80);
+    nextItem.imageQuality = imageQuality;
+    this.downloadItems = [nextItem, ...this.downloadItemsSource()];
     this.ensureDownloadLabelExists(nextItem.label);
     this.saveDownloadItems();
     this.libraryPanel = LIBRARY_DOWNLOADS;
@@ -12163,16 +12612,9 @@ struct Index {
   }
 
   private removeDownloadedFilesForItem(item: DownloadQueueItem): void {
-    const paths: string[] = [];
-    const storedDir = item.downloadDir.trim();
-    if (storedDir.length > 0) {
-      paths.push(storedDir);
-    }
-    const defaultDir = this.galleryDownloadDir(item);
-    if (defaultDir.length > 0 && paths.indexOf(defaultDir) < 0) {
-      paths.push(defaultDir);
-    }
-    for (const path of paths) {
+    const resolved = this.restoreExistingDownloadDirectory(item);
+    const path = this.galleryDownloadDir(resolved);
+    if (path.length > 0) {
       this.removePathRecursive(path);
     }
   }
@@ -12185,7 +12627,7 @@ struct Index {
     this.clearDownloadTransferProgress(current);
     this.cancelDownloadActiveRequests(key);
     this.markDownloadKeyRemoved(key);
-    this.downloadItems = this.downloadItems.filter((entry: DownloadQueueItem) =>
+    this.downloadItems = this.downloadItemsSource().filter((entry: DownloadQueueItem) =>
       !(entry.gid === current.gid && entry.site === current.site));
     sharedDownloadItemsSnapshot = sharedDownloadItemsSnapshot.filter((entry: DownloadQueueItem) =>
       this.downloadKey(entry.gid, entry.site) !== key);
@@ -12217,7 +12659,7 @@ struct Index {
     }
     const nextItems: DownloadQueueItem[] = [];
     let replaced = false;
-    for (const item of this.downloadItems) {
+    for (const item of this.downloadItemsSource()) {
       if (this.downloadKey(item.gid, item.site) === key) {
         nextItems.push(nextItem);
         replaced = true;
@@ -12348,6 +12790,11 @@ struct Index {
     }
     this.downloadActiveRequests.delete(key);
     for (const request of requests) {
+      const cancelSignal = sharedDownloadRequestCancelSignals.get(request);
+      sharedDownloadRequestCancelSignals.delete(request);
+      if (cancelSignal) {
+        cancelSignal();
+      }
       try {
         request.destroy();
       } catch (error) {
@@ -12409,9 +12856,14 @@ struct Index {
 
   private isDownloadItemRunning(item: DownloadQueueItem): boolean {
     const key = this.downloadKey(item.gid, item.site);
-    return item.status !== DOWNLOAD_STATUS_DONE &&
-      item.status !== DOWNLOAD_STATUS_DELETED &&
-      this.isDownloadKeyRunningInCurrentProcess(key);
+    return item.status === DOWNLOAD_STATUS_DOWNLOADING && this.isDownloadKeyRunningInCurrentProcess(key);
+  }
+
+  private isDownloadItemQueued(item: DownloadQueueItem): boolean {
+    const key = this.downloadKey(item.gid, item.site);
+    return item.status === DOWNLOAD_STATUS_QUEUED && sharedDownloadWorkerRunning &&
+      !this.isDownloadKeyCancelled(key) && !this.isDownloadKeyRemoved(key) &&
+      (sharedDownloadWaitKeys.indexOf(key) >= 0 || sharedDownloadStartRequestedKeys.has(key));
   }
 
   private activeDownloadItem(): DownloadQueueItem | undefined {
@@ -12423,21 +12875,7 @@ struct Index {
   }
 
   private downloadRuntimeActive(): boolean {
-    if (this.downloadNotificationItems().length <= 0) {
-      return false;
-    }
-    const localActive = this.downloadActiveKey.length > 0 && !this.isDownloadKeyRemoved(this.downloadActiveKey);
-    const sharedActive = sharedDownloadActiveKey.length > 0 && !this.isDownloadKeyRemoved(sharedDownloadActiveKey);
-    const storageActive = this.downloadRuntimeActiveKey.length > 0 && !this.isDownloadKeyRemoved(this.downloadRuntimeActiveKey);
-    const heartbeatActiveKey = this.activeDownloadRuntimeKeyFromPreferences();
-    const heartbeatActive = heartbeatActiveKey.length > 0 && !this.isDownloadKeyRemoved(heartbeatActiveKey);
-    return this.downloadWorkerRunning ||
-      localActive ||
-      sharedDownloadWorkerRunning ||
-      sharedActive ||
-      this.downloadRuntimeWorkerRunning ||
-      storageActive ||
-      heartbeatActive;
+    return sharedDownloadWorkerRunning && this.downloadNotificationItems().length > 0;
   }
 
   private shortDownloadNotificationText(text: string, limit: number): string {
@@ -12468,13 +12906,15 @@ struct Index {
   }
 
   private shouldPublishDownloadNotification(item: DownloadQueueItem): boolean {
-    if (item.status === DOWNLOAD_STATUS_DONE ||
-      item.status === DOWNLOAD_STATUS_DELETED ||
-      item.status === DOWNLOAD_STATUS_PAUSED) {
-      return false;
+    return item.status === DOWNLOAD_STATUS_DOWNLOADING && this.isDownloadItemRunning(item);
+  }
+
+  private currentDownloadNotificationItem(key: string, runGeneration?: number): DownloadQueueItem | undefined {
+    if (runGeneration !== undefined && this.currentDownloadRunGeneration(key) !== runGeneration) {
+      return undefined;
     }
-    const key = this.downloadKey(item.gid, item.site);
-    return this.isDownloadItemRunning(item) || this.activeDownloadRuntimeKey() === key;
+    const item = this.findDownloadItemByKey(key);
+    return item && this.shouldPublishDownloadNotification(item) ? item : undefined;
   }
 
   private downloadNotificationItems(): DownloadQueueItem[] {
@@ -12568,7 +13008,7 @@ struct Index {
 
   private async ensureDownloadNotificationPermission(): Promise<boolean> {
     try {
-      await notificationManager.addSlot(notificationManager.SlotType.SERVICE_INFORMATION);
+      await notificationManager.addSlot(notificationManager.SlotType.LIVE_VIEW);
     } catch (error) {
       hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download notification add slot failed: %{public}s', JSON.stringify(error));
     }
@@ -12595,9 +13035,16 @@ struct Index {
 
   private async publishDownloadNotificationForItem(item: DownloadQueueItem, force: boolean): Promise<void> {
     const key = this.downloadKey(item.gid, item.site);
-    const id = this.downloadNotificationIdForKey(key);
-    const label = this.downloadNotificationLabelForKey(key);
-    const stateKey = this.downloadNotificationStateKey(item);
+    const runGeneration = this.currentDownloadRunGeneration(key);
+    let current = this.currentDownloadNotificationItem(key, runGeneration);
+    if (!current || !sharedDownloadBackgroundRunning || sharedDownloadBackgroundNotificationId < 0) {
+      return;
+    }
+    const id = sharedDownloadBackgroundNotificationId;
+    const label = '';
+    sharedDownloadNotificationIds.set(key, id);
+    sharedDownloadNotificationLabels.set(key, label);
+    let stateKey = this.downloadNotificationStateKey(current);
     const now = Date.now();
     const lastAt = sharedDownloadNotificationLastAt.get(key) || 0;
     if (!force && stateKey === sharedDownloadNotificationStates.get(key)) {
@@ -12609,22 +13056,38 @@ struct Index {
     if (!(await this.ensureDownloadNotificationPermission())) {
       return;
     }
+    if (!this.currentDownloadNotificationItem(key, runGeneration)) {
+      await this.cancelDownloadNotificationByKey(key);
+      return;
+    }
     const agent = await this.createDownloadWantAgent(id);
-    const percent = this.downloadNotificationPercent(item);
-    const speed = item.speedBytesPerSecond > 0 ? ` · ${formatBytesPerSecond(item.speedBytesPerSecond)}` : '';
-    const remaining = item.remainingSeconds >= 0 ? ` · 剩余 ${formatRemainingSeconds(item.remainingSeconds)}` : '';
-    const detail = item.error.length > 0 ? item.error : (item.lastAction.length > 0 ? item.lastAction : '正在下载');
-    const title = this.downloadNotificationTitle(item);
-    const text = `${percent}% · ${this.downloadProgressText(item)}${speed}${remaining}`;
+    current = this.currentDownloadNotificationItem(key, runGeneration);
+    if (!current) {
+      await this.cancelDownloadNotificationByKey(key);
+      return;
+    }
+    stateKey = this.downloadNotificationStateKey(current);
+    const percent = this.downloadNotificationPercent(current);
+    const speed = current.speedBytesPerSecond > 0 ? ` · ${formatBytesPerSecond(current.speedBytesPerSecond)}` : '';
+    const remaining = current.remainingSeconds >= 0 ? ` · 剩余 ${formatRemainingSeconds(current.remainingSeconds)}` : '';
+    const detail = current.error.length > 0 ? current.error : (current.lastAction.length > 0 ? current.lastAction : '正在下载');
+    const title = this.downloadNotificationTitle(current);
+    const text = `${percent}% · ${this.downloadProgressText(current)}${speed}${remaining}`;
     const request: notificationManager.NotificationRequest = {
       id,
       label,
       content: {
-        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
-        normal: {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_SYSTEM_LIVE_VIEW,
+        systemLiveView: {
+          typeCode: 8,
           title,
           text,
-          additionalText: this.shortDownloadNotificationText(detail, 96)
+          additionalText: this.shortDownloadNotificationText(detail, 96),
+          progress: {
+            maxValue: this.downloadNotificationBase(current),
+            currentValue: this.downloadNotificationCurrent(current),
+            isPercentage: true
+          }
         }
       },
       template: {
@@ -12635,7 +13098,7 @@ struct Index {
           progressValue: percent
         }
       },
-      notificationSlotType: notificationManager.SlotType.SERVICE_INFORMATION,
+      notificationSlotType: notificationManager.SlotType.LIVE_VIEW,
       isOngoing: false,
       isUnremovable: false,
       tapDismissed: false,
@@ -12647,6 +13110,16 @@ struct Index {
     }
     try {
       await notificationManager.publish(request);
+      // A previous cleanup may have removed the handles while publish was awaiting the service.
+      sharedDownloadNotificationIds.set(key, id);
+      sharedDownloadNotificationLabels.set(key, label);
+      if (!this.currentDownloadNotificationItem(key, runGeneration)) {
+        if (!this.downloadRuntimeActive()) {
+          await this.stopDownloadBackgroundTask();
+        }
+        await this.cancelDownloadNotificationByKey(key);
+        return;
+      }
       sharedDownloadNotificationStates.set(key, stateKey);
       sharedDownloadNotificationLastAt.set(key, now);
     } catch (error) {
@@ -12658,9 +13131,41 @@ struct Index {
     const id = sharedDownloadNotificationIds.get(key);
     const label = sharedDownloadNotificationLabels.get(key);
     if (id !== undefined && label !== undefined) {
-      try {
-        await notificationManager.cancel(id, label);
-      } catch (error) {
+      if (sharedDownloadBackgroundRunning && id === sharedDownloadBackgroundNotificationId) {
+        // The shared system notification follows the current gallery until its background task stops.
+        if (!this.downloadRuntimeActive()) {
+          this.scheduleDownloadRuntimeCleanupRetry();
+        }
+        return;
+      } else {
+        try {
+          if (label.length > 0) {
+            await notificationManager.cancel(id, label);
+          } else {
+            await notificationManager.cancel(id);
+          }
+        } catch (error) {
+          let absent = false;
+          let cancelled = false;
+          try {
+            const notifications = await notificationManager.getActiveNotifications();
+            const existing = notifications.find((notification: notificationManager.NotificationRequest): boolean =>
+              notification.id === id && (label.length === 0 || (notification.label || '') === label));
+            absent = existing === undefined;
+            if (existing && label.length === 0 && existing.label) {
+              // Background-task notifications have a service-generated label, unlike progress-update requests.
+              sharedDownloadNotificationLabels.set(key, existing.label);
+              await notificationManager.cancel(id, existing.label);
+              cancelled = true;
+            }
+          } catch (queryError) {
+          }
+          if (!absent && !cancelled) {
+            hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download notification cancel failed: %{public}s', JSON.stringify(error));
+            this.scheduleDownloadRuntimeCleanupRetry();
+            return;
+          }
+        }
       }
     }
     sharedDownloadNotificationStates.delete(key);
@@ -12669,10 +13174,10 @@ struct Index {
     sharedDownloadNotificationLabels.delete(key);
   }
 
-  private async cancelStaleDownloadNotifications(activeKeys: string[]): Promise<void> {
+  private async cancelStaleDownloadNotifications(): Promise<void> {
     const knownKeys = Array.from(sharedDownloadNotificationIds.keys());
     for (const key of knownKeys) {
-      if (activeKeys.indexOf(key) < 0) {
+      if (!this.currentDownloadNotificationItem(key)) {
         await this.cancelDownloadNotificationByKey(key);
       }
     }
@@ -12684,102 +13189,281 @@ struct Index {
       await this.cancelAllDownloadNotifications();
       return;
     }
-    const activeKeys: string[] = [];
     for (const item of items) {
-      const key = this.downloadKey(item.gid, item.site);
-      activeKeys.push(key);
       await this.publishDownloadNotificationForItem(item, force);
     }
-    await this.cancelStaleDownloadNotifications(activeKeys);
+    await this.cancelStaleDownloadNotifications();
   }
 
   private async cancelAllDownloadNotifications(): Promise<void> {
     const knownKeys = Array.from(sharedDownloadNotificationIds.keys());
     for (const key of knownKeys) {
-      await this.cancelDownloadNotificationByKey(key);
+      if (!this.currentDownloadNotificationItem(key)) {
+        await this.cancelDownloadNotificationByKey(key);
+      }
+    }
+  }
+
+  private async recoverStaleDownloadNotifications(): Promise<void> {
+    if (sharedDownloadNotificationRecoveryChecked) {
+      return;
+    }
+    try {
+      const notifications = await notificationManager.getActiveNotifications();
+      for (const notification of notifications) {
+        const label = notification.label || '';
+        const legacyDownload = notification.groupName === DOWNLOAD_NOTIFICATION_GROUP &&
+          label.startsWith(DOWNLOAD_NOTIFICATION_LABEL_PREFIX);
+        const downloadLiveView = notification.content !== undefined &&
+          notification.content.notificationContentType === notificationManager.ContentType.NOTIFICATION_CONTENT_SYSTEM_LIVE_VIEW &&
+          notification.content.systemLiveView !== undefined && notification.content.systemLiveView.typeCode === 8 &&
+          (notification.groupName === DOWNLOAD_NOTIFICATION_GROUP || label.startsWith('bgmode_'));
+        if (notification.id === undefined || (!legacyDownload && !downloadLiveView)) {
+          continue;
+        }
+        if (downloadLiveView && sharedDownloadBackgroundRunning &&
+          notification.id === sharedDownloadBackgroundNotificationId) {
+          continue;
+        }
+        // Downloads now update the service-provided live notification; old app-created IDs are obsolete.
+        const key = `orphan:${notification.id}:${label}`;
+        sharedDownloadNotificationIds.set(key, notification.id);
+        sharedDownloadNotificationLabels.set(key, label);
+        await this.cancelDownloadNotificationByKey(key);
+      }
+      sharedDownloadNotificationRecoveryChecked = true;
+    } catch (error) {
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download notification recovery failed: %{public}s', JSON.stringify(error));
+      this.scheduleDownloadRuntimeCleanupRetry();
     }
   }
 
   private async startDownloadBackgroundTask(): Promise<void> {
-    if (this.downloadBackgroundRunning || this.downloadBackgroundStarting) {
+    if (!this.downloadRuntimeActive() || sharedDownloadBackgroundStarting) {
       return;
     }
-    this.downloadBackgroundStarting = true;
+    sharedDownloadBackgroundStarting = true;
     try {
-      const context = this.uiAbilityContext();
+      this.subscribeDownloadBackgroundCancellation();
+      const recoveredId = Array.from(sharedDownloadBackgroundTaskHandles.keys())[0];
+      const context = this.uiAbilityContext() || sharedDownloadBackgroundContext ||
+        sharedDownloadBackgroundTaskHandles.get(recoveredId);
       if (!context) {
+        if (sharedDownloadBackgroundRetiredIds.size > 0) {
+          this.scheduleDownloadRuntimeCleanupRetry();
+        }
+        return;
+      }
+      // Recover service-owned tasks before creating another task after a process restart.
+      if (!sharedDownloadBackgroundRecoveryChecked) {
+        await this.recoverDownloadBackgroundTasks(context);
+        if (!sharedDownloadBackgroundRecoveryChecked) {
+          return;
+        }
+      }
+      if (sharedDownloadBackgroundRetiredIds.size > 0) {
+        await this.stopDownloadBackgroundTask(true);
+        if (sharedDownloadBackgroundRetiredIds.size > 0) {
+          this.scheduleDownloadRuntimeCleanupRetry();
+          return;
+        }
+      }
+      if (!this.downloadRuntimeActive() || sharedDownloadBackgroundRunning) {
         return;
       }
       const agent = await this.createDownloadWantAgent();
-      if (!agent) {
+      if (!agent || !this.downloadRuntimeActive()) {
         return;
       }
-      let taskId = -1;
-      try {
-        const request = new backgroundTaskManager.ContinuousTaskRequest();
-        request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_DATA_TRANSFER];
-        request.combinedTaskNotification = true;
-        request.wantAgent = agent;
-        const notification: backgroundTaskManager.ContinuousTaskNotification =
-          await backgroundTaskManager.startBackgroundRunning(context, request);
-        taskId = notification.continuousTaskId === undefined ? -1 : notification.continuousTaskId;
-      } catch (requestError) {
-        const notification: backgroundTaskManager.ContinuousTaskNotification = await backgroundTaskManager.startBackgroundRunning(
-          context,
-          [DOWNLOAD_BACKGROUND_MODE],
-          agent
-        );
-        taskId = notification.continuousTaskId === undefined ? -1 : notification.continuousTaskId;
+      const request = new backgroundTaskManager.ContinuousTaskRequest();
+      request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_DATA_TRANSFER];
+      request.backgroundTaskSubmodes = [backgroundTaskManager.BackgroundTaskSubmode.SUBMODE_LIVE_VIEW_NOTIFICATION];
+      request.combinedTaskNotification = false;
+      request.wantAgent = agent;
+      sharedDownloadBackgroundPendingCancelIds.clear();
+      const notification: backgroundTaskManager.ContinuousTaskNotification =
+        await backgroundTaskManager.startBackgroundRunning(context, request);
+      sharedDownloadBackgroundTaskId = notification.continuousTaskId === undefined ? -1 : notification.continuousTaskId;
+      sharedDownloadBackgroundNotificationId = notification.notificationId;
+      sharedDownloadBackgroundContext = context;
+      sharedDownloadNotificationIds.set(`background:${sharedDownloadBackgroundTaskId}`, notification.notificationId);
+      sharedDownloadNotificationLabels.set(`background:${sharedDownloadBackgroundTaskId}`, '');
+      if (sharedDownloadBackgroundPendingCancelIds.has(sharedDownloadBackgroundTaskId)) {
+        sharedDownloadBackgroundPendingCancelIds.delete(sharedDownloadBackgroundTaskId);
+        this.refreshDownloadBackgroundHandle();
+        this.pauseAllDownloads();
+        this.downloadManagerStatus = '后台任务已停止，点继续恢复下载';
+        this.queueDownloadRuntimeStateSync(true);
+        return;
       }
-      this.downloadBackgroundRunning = true;
-      this.downloadBackgroundTaskId = taskId;
-      sharedDownloadBackgroundStopAttempted = false;
-      hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Download background task started: %{public}d', this.downloadBackgroundTaskId);
+      sharedDownloadBackgroundRunning = true;
+      if (sharedDownloadBackgroundTaskId >= 0) {
+        sharedDownloadBackgroundTaskHandles.set(sharedDownloadBackgroundTaskId, context);
+        sharedDownloadBackgroundNotificationIds.set(sharedDownloadBackgroundTaskId, notification.notificationId);
+        sharedDownloadBackgroundRetiredIds.delete(sharedDownloadBackgroundTaskId);
+      }
+      hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Download background task started: %{public}d', sharedDownloadBackgroundTaskId);
+      if (!this.downloadRuntimeActive()) {
+        await this.stopDownloadBackgroundTask();
+      }
     } catch (error) {
-      const code = `${(error as NativeReadableErrorInfo).code}`;
-      if (code === '9800005') {
-        this.downloadBackgroundRunning = true;
-        this.downloadBackgroundTaskId = -1;
-        sharedDownloadBackgroundStopAttempted = false;
-        hilog.info(DIAG_DOMAIN, DIAG_TAG, 'Download background task already running');
-        return;
-      }
       hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download background task start failed: %{public}s', JSON.stringify(error));
-      this.downloadBackgroundRunning = false;
-      this.downloadBackgroundTaskId = -1;
     } finally {
-      this.downloadBackgroundStarting = false;
+      sharedDownloadBackgroundStarting = false;
     }
   }
 
-  private async stopDownloadBackgroundTask(): Promise<void> {
-    const context = this.uiAbilityContext();
-    if (!context) {
-      this.downloadBackgroundRunning = false;
-      this.downloadBackgroundTaskId = -1;
+  private async recoverDownloadBackgroundTasks(context: common.UIAbilityContext): Promise<void> {
+    if (sharedDownloadBackgroundRecoveryChecked) {
       return;
     }
-    if (!this.downloadBackgroundRunning && sharedDownloadBackgroundStopAttempted) {
-      this.downloadBackgroundTaskId = -1;
-      return;
-    }
-    if (this.downloadBackgroundRunning || !sharedDownloadBackgroundStopAttempted) {
-      try {
-        if (this.downloadBackgroundTaskId > 0) {
-          await backgroundTaskManager.stopBackgroundRunning(context, this.downloadBackgroundTaskId);
-        } else {
-          await backgroundTaskManager.stopBackgroundRunning(context);
-        }
-      } catch (error) {
-        try {
-          await backgroundTaskManager.stopBackgroundRunning(context);
-        } catch (fallbackError) {
+    try {
+      const tasks = await backgroundTaskManager.getAllContinuousTasks(context, true);
+      for (const task of tasks) {
+        if (task.abilityName === APP_ABILITY_NAME && !task.isFromWebView &&
+          task.backgroundModes.indexOf(DOWNLOAD_BACKGROUND_MODE) >= 0 &&
+          task.wantAgentBundleName === APP_BUNDLE_NAME && task.wantAgentAbilityName === APP_ABILITY_NAME) {
+          sharedDownloadBackgroundTaskHandles.set(task.continuousTaskId, context);
+          sharedDownloadBackgroundNotificationIds.set(task.continuousTaskId, task.notificationId);
+          sharedDownloadBackgroundRetiredIds.add(task.continuousTaskId);
+          sharedDownloadNotificationIds.set(`background:${task.continuousTaskId}`, task.notificationId);
+          sharedDownloadNotificationLabels.set(`background:${task.continuousTaskId}`, '');
         }
       }
+      sharedDownloadBackgroundRecoveryChecked = true;
+    } catch (error) {
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download background recovery failed: %{public}s', JSON.stringify(error));
+      this.scheduleDownloadRuntimeCleanupRetry();
     }
-    this.downloadBackgroundRunning = false;
-    this.downloadBackgroundTaskId = -1;
-    sharedDownloadBackgroundStopAttempted = true;
+  }
+
+  private async stopDownloadBackgroundTask(force: boolean = false): Promise<void> {
+    if (!force && this.downloadRuntimeActive()) {
+      return;
+    }
+    const firstTaskId = Array.from(sharedDownloadBackgroundTaskHandles.keys())[0];
+    const context = sharedDownloadBackgroundContext || sharedDownloadBackgroundTaskHandles.get(firstTaskId) ||
+      this.uiAbilityContext();
+    if (!context) {
+      if (sharedDownloadBackgroundRunning || sharedDownloadBackgroundTaskHandles.size > 0 ||
+        !sharedDownloadBackgroundRecoveryChecked) {
+        this.scheduleDownloadRuntimeCleanupRetry();
+      }
+      return;
+    }
+    await this.recoverDownloadBackgroundTasks(context);
+    if (!sharedDownloadBackgroundRecoveryChecked || (!force && this.downloadRuntimeActive())) {
+      return;
+    }
+    const taskIds = Array.from(sharedDownloadBackgroundTaskHandles.keys());
+    for (const taskId of taskIds) {
+      if (force && !sharedDownloadBackgroundRetiredIds.has(taskId)) {
+        continue;
+      }
+      const ownerContext = sharedDownloadBackgroundTaskHandles.get(taskId);
+      if (!ownerContext || (!force && this.downloadRuntimeActive())) {
+        continue;
+      }
+      let stopped = false;
+      sharedDownloadBackgroundRetiredIds.add(taskId);
+      sharedDownloadBackgroundStoppingIds.add(taskId);
+      try {
+        await backgroundTaskManager.stopBackgroundRunning(ownerContext, taskId);
+        stopped = true;
+      } catch (error) {
+        // The stop API rejects for an already removed task. Verify absence, including suspended tasks.
+        try {
+          const tasks = await backgroundTaskManager.getAllContinuousTasks(ownerContext, true);
+          stopped = !tasks.some((task: backgroundTaskManager.ContinuousTaskInfo): boolean => task.continuousTaskId === taskId);
+        } catch (queryError) {
+          hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download background stop verification failed: %{public}s', JSON.stringify(queryError));
+        }
+        if (!stopped) {
+          hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download background stop failed: %{public}s', JSON.stringify(error));
+          this.scheduleDownloadRuntimeCleanupRetry();
+        }
+      } finally {
+        sharedDownloadBackgroundStoppingIds.delete(taskId);
+      }
+      if (stopped) {
+        sharedDownloadBackgroundTaskHandles.delete(taskId);
+        sharedDownloadBackgroundNotificationIds.delete(taskId);
+        sharedDownloadBackgroundRetiredIds.delete(taskId);
+      }
+    }
+    if (sharedDownloadBackgroundRunning && sharedDownloadBackgroundTaskId < 0) {
+      // A successful start without an ID can only be stopped through its original UIAbility.
+      try {
+        await backgroundTaskManager.stopBackgroundRunning(context);
+        sharedDownloadBackgroundRunning = false;
+      } catch (error) {
+        this.scheduleDownloadRuntimeCleanupRetry();
+        return;
+      }
+    }
+    this.refreshDownloadBackgroundHandle();
+  }
+
+  private refreshDownloadBackgroundHandle(): void {
+    const activeIds = Array.from(sharedDownloadBackgroundTaskHandles.keys())
+      .filter((taskId: number): boolean => !sharedDownloadBackgroundRetiredIds.has(taskId));
+    if (activeIds.length === 0) {
+      sharedDownloadBackgroundRunning = false;
+      sharedDownloadBackgroundTaskId = -1;
+      sharedDownloadBackgroundNotificationId = -1;
+      sharedDownloadBackgroundContext = undefined;
+    } else {
+      const taskId = activeIds[0];
+      sharedDownloadBackgroundRunning = true;
+      sharedDownloadBackgroundTaskId = taskId;
+      const notificationId = sharedDownloadBackgroundNotificationIds.get(taskId);
+      sharedDownloadBackgroundNotificationId = notificationId === undefined ? -1 : notificationId;
+      sharedDownloadBackgroundContext = sharedDownloadBackgroundTaskHandles.get(taskId);
+    }
+  }
+
+  private subscribeDownloadBackgroundCancellation(): void {
+    if (sharedDownloadBackgroundCancelSubscribed) {
+      return;
+    }
+    try {
+      backgroundTaskManager.on('continuousTaskCancel', (info: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
+        if (!sharedDownloadBackgroundTaskHandles.has(info.id)) {
+          if (sharedDownloadBackgroundStarting) {
+            sharedDownloadBackgroundPendingCancelIds.add(info.id);
+          }
+          return;
+        }
+        const requestedStop = sharedDownloadBackgroundStoppingIds.has(info.id);
+        const wasActive = info.id === sharedDownloadBackgroundTaskId && !sharedDownloadBackgroundRetiredIds.has(info.id);
+        sharedDownloadBackgroundTaskHandles.delete(info.id);
+        sharedDownloadBackgroundNotificationIds.delete(info.id);
+        sharedDownloadBackgroundRetiredIds.delete(info.id);
+        this.refreshDownloadBackgroundHandle();
+        if (!requestedStop && wasActive) {
+          // A system or notification action revokes the task; reflect it in the real download controls.
+          this.pauseAllDownloads();
+          this.downloadManagerStatus = '后台任务已停止，点继续恢复下载';
+          this.queueDownloadRuntimeStateSync(true);
+        }
+      });
+      sharedDownloadBackgroundCancelSubscribed = true;
+    } catch (error) {
+      hilog.warn(DIAG_DOMAIN, DIAG_TAG, 'Download background cancellation listener failed: %{public}s', JSON.stringify(error));
+    }
+  }
+
+  private scheduleDownloadRuntimeCleanupRetry(): void {
+    sharedDownloadRuntimeCleanupNeeded = true;
+    if (sharedDownloadRuntimeCleanupTimerId >= 0) {
+      return;
+    }
+    const delay = Math.min(1000 * Math.pow(2, sharedDownloadRuntimeCleanupRetryCount), 30000);
+    sharedDownloadRuntimeCleanupRetryCount = Math.min(sharedDownloadRuntimeCleanupRetryCount + 1, 5);
+    sharedDownloadRuntimeCleanupTimerId = Number(setTimeout(() => {
+      sharedDownloadRuntimeCleanupTimerId = -1;
+      this.queueDownloadRuntimeStateSync(true);
+    }, delay));
   }
 
   private refreshDownloadRuntimeState(force: boolean = false): void {
@@ -12788,36 +13472,48 @@ struct Index {
   }
 
   private queueDownloadRuntimeStateSync(force: boolean): void {
-    this.downloadRuntimeSyncPending = true;
-    this.downloadRuntimeSyncPendingForce = this.downloadRuntimeSyncPendingForce || force;
-    if (this.downloadRuntimeSyncInFlight) {
+    sharedDownloadRuntimeSyncPending = true;
+    sharedDownloadRuntimeSyncPendingForce = sharedDownloadRuntimeSyncPendingForce || force;
+    if (sharedDownloadRuntimeSyncInFlight) {
       return;
     }
-    this.downloadRuntimeSyncInFlight = true;
+    sharedDownloadRuntimeSyncInFlight = true;
     void this.drainDownloadRuntimeStateSync();
   }
 
   private async drainDownloadRuntimeStateSync(): Promise<void> {
     try {
-      while (this.downloadRuntimeSyncPending) {
-        const force = this.downloadRuntimeSyncPendingForce;
-        this.downloadRuntimeSyncPending = false;
-        this.downloadRuntimeSyncPendingForce = false;
+      while (sharedDownloadRuntimeSyncPending) {
+        const force = sharedDownloadRuntimeSyncPendingForce;
+        sharedDownloadRuntimeSyncPending = false;
+        sharedDownloadRuntimeSyncPendingForce = false;
+        sharedDownloadRuntimeCleanupNeeded = false;
         await this.syncDownloadRuntimeState(force);
+        if (!sharedDownloadRuntimeCleanupNeeded) {
+          if (sharedDownloadRuntimeCleanupTimerId >= 0) {
+            clearTimeout(sharedDownloadRuntimeCleanupTimerId);
+            sharedDownloadRuntimeCleanupTimerId = -1;
+          }
+          sharedDownloadRuntimeCleanupRetryCount = 0;
+        }
       }
     } finally {
-      this.downloadRuntimeSyncInFlight = false;
-      if (this.downloadRuntimeSyncPending) {
-        this.queueDownloadRuntimeStateSync(this.downloadRuntimeSyncPendingForce);
+      sharedDownloadRuntimeSyncInFlight = false;
+      if (sharedDownloadRuntimeSyncPending) {
+        this.queueDownloadRuntimeStateSync(sharedDownloadRuntimeSyncPendingForce);
       }
     }
   }
 
   private async syncDownloadRuntimeState(force: boolean): Promise<void> {
+    await this.recoverStaleDownloadNotifications();
     if (this.downloadRuntimeActive()) {
-      await this.publishDownloadNotifications(force);
       await this.startDownloadBackgroundTask();
-    } else {
+      if (this.downloadRuntimeActive()) {
+        await this.publishDownloadNotifications(force);
+      }
+    }
+    if (!this.downloadRuntimeActive()) {
       await this.stopDownloadBackgroundTask();
       await this.cancelAllDownloadNotifications();
     }
@@ -12876,6 +13572,27 @@ struct Index {
   }
 
   private startDownloadItem(item: DownloadQueueItem): void {
+    const current = this.findDownloadItem(item.gid, item.site);
+    if (!current || current.status === DOWNLOAD_STATUS_DONE || current.status === DOWNLOAD_STATUS_DELETED ||
+      this.isDownloadItemRunning(current) || this.isDownloadItemQueued(current)) {
+      return;
+    }
+    if (this.requiresDownloadImageQuality(current)) {
+      const key = this.downloadKey(item.gid, item.site);
+      const generation = this.currentDownloadRunGeneration(key);
+      this.promptDownloadImageQuality(current, (imageQuality: string): void => {
+        const latest = this.findDownloadItem(item.gid, item.site);
+        if (!latest || !this.requiresDownloadImageQuality(latest) ||
+          this.currentDownloadRunGeneration(key) !== generation) {
+          return;
+        }
+        const selected = this.cloneDownloadItem(latest);
+        selected.imageQuality = imageQuality;
+        this.replaceDownloadItem(selected);
+        this.startDownloadItem(selected);
+      });
+      return;
+    }
     const key = this.downloadKey(item.gid, item.site);
     this.bumpDownloadRunGeneration(key);
     this.downloadCancelKeys.delete(key);
@@ -12884,7 +13601,6 @@ struct Index {
     this.downloadStartRequestedKeys.add(key);
     sharedDownloadStartRequestedKeys.add(key);
     this.enqueueDownloadWaitKey(key);
-    const current = this.findDownloadItem(item.gid, item.site) || item;
     const runnable = this.toDownloadItem(
       current,
       DOWNLOAD_STATUS_QUEUED,
@@ -12940,7 +13656,10 @@ struct Index {
   }
 
   private pauseDownloadItem(item: DownloadQueueItem): void {
-    const current = this.latestDownloadItem(item);
+    const current = this.findDownloadItem(item.gid, item.site);
+    if (!current || (!this.isDownloadItemRunning(current) && !this.isDownloadItemQueued(current))) {
+      return;
+    }
     const key = this.downloadKey(current.gid, current.site);
     this.bumpDownloadRunGeneration(key);
     this.clearDownloadTransferProgress(current);
@@ -12977,13 +13696,45 @@ struct Index {
   }
 
   private startAllDownloads(): void {
+    const eligible = this.downloadItemsSource().filter((item: DownloadQueueItem) =>
+      item.status !== DOWNLOAD_STATUS_DONE && item.status !== DOWNLOAD_STATUS_DELETED &&
+      !this.isDownloadItemRunning(item) && !this.isDownloadItemQueued(item));
+    const generations: Map<string, number> = new Map();
+    for (const item of eligible) {
+      const key = this.downloadKey(item.gid, item.site);
+      generations.set(key, this.currentDownloadRunGeneration(key));
+    }
+    const unselected = eligible.filter((item: DownloadQueueItem) => this.requiresDownloadImageQuality(item));
+    if (unselected.length > 0) {
+      this.promptDownloadImageQuality(unselected[0], (imageQuality: string): void => {
+        for (const item of unselected) {
+          const latest = this.findDownloadItem(item.gid, item.site);
+          const key = this.downloadKey(item.gid, item.site);
+          if (latest && this.requiresDownloadImageQuality(latest) &&
+            this.currentDownloadRunGeneration(key) === generations.get(key)) {
+            const selected = this.cloneDownloadItem(latest);
+            selected.imageQuality = imageQuality;
+            this.replaceDownloadItem(selected);
+          }
+        }
+        this.startDownloadItems(generations);
+      });
+      return;
+    }
+    this.startDownloadItems(generations);
+  }
+
+  private startDownloadItems(generations: Map<string, number>): void {
     const nextItems: DownloadQueueItem[] = [];
     for (const item of this.downloadItemsSource()) {
-      if (item.status === DOWNLOAD_STATUS_DONE || this.isDownloadItemRunning(item)) {
+      const key = this.downloadKey(item.gid, item.site);
+      if (item.status === DOWNLOAD_STATUS_DONE || item.status === DOWNLOAD_STATUS_DELETED ||
+        !generations.has(key) || this.currentDownloadRunGeneration(key) !== generations.get(key) ||
+        this.requiresDownloadImageQuality(item) ||
+        this.isDownloadItemRunning(item) || this.isDownloadItemQueued(item)) {
         nextItems.push(item);
         continue;
       }
-      const key = this.downloadKey(item.gid, item.site);
       this.bumpDownloadRunGeneration(key);
       this.downloadCancelKeys.delete(key);
       sharedDownloadCancelKeys.delete(key);
@@ -13021,7 +13772,7 @@ struct Index {
   private pauseAllDownloads(): void {
     const nextItems: DownloadQueueItem[] = [];
     for (const item of this.downloadItemsSource()) {
-      if (item.status === DOWNLOAD_STATUS_DONE) {
+      if (!this.isDownloadItemRunning(item) && !this.isDownloadItemQueued(item)) {
         nextItems.push(item);
         continue;
       }
@@ -13123,6 +13874,7 @@ struct Index {
       return;
     }
     const options: promptAction.ShowDialogOptions = {
+      systemMaterial: IMMERSIVE_DIALOG_MATERIAL,
       title: '清空下载内容',
       message: `确定要删除全部 ${count} 个下载任务和本地文件吗？`,
       buttons: [
@@ -13161,11 +13913,6 @@ struct Index {
         return item;
       }
     }
-    for (const item of this.downloadItemsSource()) {
-      if (item.status === DOWNLOAD_STATUS_QUEUED) {
-        return item;
-      }
-    }
     return undefined;
   }
 
@@ -13181,11 +13928,6 @@ struct Index {
       if (item.status === DOWNLOAD_STATUS_QUEUED ||
         this.downloadStartRequestedKeys.has(key) ||
         sharedDownloadStartRequestedKeys.has(key)) {
-        return true;
-      }
-    }
-    for (const item of this.downloadItemsSource()) {
-      if (item.status === DOWNLOAD_STATUS_QUEUED) {
         return true;
       }
     }
@@ -13243,61 +13985,100 @@ struct Index {
     return true;
   }
 
-  private async fetchDownloadDetail(item: DownloadQueueItem): Promise<NativeGalleryDetail> {
-    const summary = this.toNativeSummary(item);
-    return await NativeEhClient.fetchGalleryDetail(item.site, summary);
+  private createDownloadRequestControl(item: DownloadQueueItem, runGeneration: number): NativeRequestControl {
+    const key = this.downloadKey(item.gid, item.site);
+    let cancelRequest: () => void = (): void => {};
+    const cancelled = new Promise<void>((resolve): void => {
+      cancelRequest = resolve;
+    });
+    return {
+      cancelled,
+      onStart: (request: http.HttpRequest): void => {
+        this.assertDownloadRunActive(item, runGeneration);
+        this.registerDownloadActiveRequest(key, request);
+        sharedDownloadRequestCancelSignals.set(request, cancelRequest);
+      },
+      onFinish: (request: http.HttpRequest): void => {
+        this.unregisterDownloadActiveRequest(key, request);
+        sharedDownloadRequestCancelSignals.delete(request);
+      },
+      isCancelled: (): boolean => this.shouldStopDownload(item, runGeneration)
+    };
   }
 
-  private async collectDownloadPageUrls(site: string, detail: NativeGalleryDetail): Promise<string[]> {
+  private async fetchDownloadDetail(item: DownloadQueueItem, runGeneration: number): Promise<NativeGalleryDetail> {
+    const summary = this.toNativeSummary(item);
+    return await NativeEhClient.fetchGalleryDetail(item.site, summary,
+      this.createDownloadRequestControl(item, runGeneration));
+  }
+
+  private async collectDownloadPageUrls(item: DownloadQueueItem, detail: NativeGalleryDetail,
+    runGeneration: number): Promise<string[]> {
+    this.assertDownloadRunActive(item, runGeneration);
+    const site = item.site;
     const cacheKey = `${site}-${detail.gid}-${detail.token}`;
     const cached = this.downloadPageUrlCache.get(cacheKey);
-    if (cached && cached.length > 0) {
+    if (cached && cached.length > 0 && cached.length >= detail.pages &&
+      cached.every((url: string): boolean => url.length > 0)) {
       return cached;
     }
     const positions: Map<number, string> = new Map();
     let previewPages = Math.max(1, detail.previewPageCount);
     for (let pageIndex = 0; pageIndex < previewPages; pageIndex++) {
-      const page = await NativeEhClient.fetchGalleryPreviewPage(site, detail.detailUrl, pageIndex);
+      this.assertDownloadRunActive(item, runGeneration);
+      const page = await NativeEhClient.fetchGalleryPreviewPage(site, detail.detailUrl, pageIndex,
+        this.createDownloadRequestControl(item, runGeneration));
+      this.assertDownloadRunActive(item, runGeneration);
       previewPages = Math.max(previewPages, page.pageCount);
       for (const item of page.items) {
-        if (item.pageUrl.length > 0) {
+        if (item.pageUrl.length > 0 && Number.isInteger(item.position) && item.position >= 0) {
           positions.set(item.position, item.pageUrl);
         }
       }
     }
-    const keys = Array.from(positions.keys()).sort((a: number, b: number) => a - b);
-    const urls: string[] = [];
-    for (const key of keys) {
-      const url = positions.get(key);
-      if (url && url.length > 0) {
-        urls.push(url);
-      }
+    const keys = Array.from(positions.keys());
+    let pageCount = Math.max(0, detail.pages);
+    for (const position of keys) {
+      pageCount = Math.max(pageCount, position + 1);
     }
-    this.downloadPageUrlCache.set(cacheKey, urls);
+    const urls: string[] = [];
+    for (let position = 0; position < pageCount; position++) {
+      // Preserve page numbers when a preview page has missing links.
+      urls.push(positions.get(position) || '');
+    }
+    if (urls.length > 0 && urls.every((url: string): boolean => url.length > 0)) {
+      this.downloadPageUrlCache.set(cacheKey, urls);
+    } else {
+      // A retry must fetch missing links again instead of caching a hole forever.
+      this.downloadPageUrlCache.delete(cacheKey);
+    }
     return urls;
   }
 
   private downloadRoot(): string {
-    const custom = this.downloadDirectoryPath.trim();
-    if (custom.length > 0) {
-      return custom;
-    }
-    const filesDir = this.abilityFilesDir();
-    return filesDir.length > 0 ? `${filesDir}/${READER_DOWNLOAD_DIR_NAME}` : '';
+    return this.downloadDirectoryPath.trim();
   }
 
   private galleryDownloadDir(item: DownloadQueueItem): string {
+    const storedDir = item.downloadDir.trim();
+    if (storedDir.length > 0) {
+      return storedDir;
+    }
     const root = this.downloadRoot();
     if (root.length === 0) {
       return '';
     }
-    return `${root}/${item.site}-${item.gid}`;
+    return chooseGalleryDirectory(root, this.galleryDirectoryIdentity(item),
+      this.reservedGalleryDownloadDirs(item.gid, item.site));
   }
 
   private existingDownloadPath(item: DownloadQueueItem, pageIndex: number): string {
     const dir = this.galleryDownloadDir(item);
     if (dir.length === 0) {
       return '';
+    }
+    if (this.downloadUsesOriginalImage(item)) {
+      return verifiedOriginalDownloadPath(dir, this.galleryDirectoryIdentity(item), pageIndex);
     }
     const oneBased = pageIndex + 1;
     const names: string[] = [];
@@ -13310,7 +14091,10 @@ struct Index {
       const path = `${dir}/${name}`;
       try {
         if (fileIo.accessSync(path)) {
-          return path;
+          const stat = fileIo.statSync(path);
+          if (stat.isFile() && stat.size > 0) {
+            return path;
+          }
         }
       } catch (error) {
       }
@@ -13320,8 +14104,32 @@ struct Index {
 
   private downloadTargetPath(item: DownloadQueueItem, pageIndex: number, sourceUrl: string): string {
     const dir = this.galleryDownloadDir(item);
+    if (dir.length === 0) {
+      return '';
+    }
     const pageName = `${pageIndex + 1}`.padStart(8, '0');
     return `${dir}/${pageName}${this.readerImageExtensionFromUrl(sourceUrl)}`;
+  }
+
+  private removeReplacedDownloadPageFiles(pageIndex: number, keptPath: string): void {
+    const dir = keptPath.substring(0, keptPath.lastIndexOf('/'));
+    try {
+      for (const name of fileIo.listFileSync(dir)) {
+        const dot = name.lastIndexOf('.');
+        const stem = dot > 0 ? name.substring(0, dot) : '';
+        if (!/^\d+$/.test(stem) || Number(stem) !== pageIndex + 1 ||
+          READER_IMAGE_EXTENSIONS.indexOf(name.substring(dot).toLowerCase()) < 0) {
+          continue;
+        }
+        const path = `${dir}/${name}`;
+        if (path !== keptPath && fileIo.statSync(path).isFile()) {
+          fileIo.unlinkSync(path);
+        }
+      }
+    } catch (error) {
+      // The verified page remains the reader's first choice even if an old
+      // format cannot be removed from the public directory.
+    }
   }
 
   private appendDownloadCookieSource(url: string, names: string[], values: string[]): void {
@@ -13331,13 +14139,18 @@ struct Index {
   private downloadCookieHeader(url: string, site: string): string {
     const names: string[] = [];
     const values: string[] = [];
-    this.appendDownloadCookieSource(EhUrl.DOMAIN_FORUMS, names, values);
-    this.appendDownloadCookieSource(EhUrl.DOMAIN_E, names, values);
-    if (site === GallerySite.EX) {
-      this.appendDownloadCookieSource(EhUrl.DOMAIN_EX, names, values);
+    const host = this.readerHostFromUrl(url).toLowerCase();
+    const galleryHost = host === 'e-hentai.org' || host.endsWith('.e-hentai.org') ||
+      host === 'exhentai.org' || host.endsWith('.exhentai.org');
+    if (galleryHost) {
+      this.appendDownloadCookieSource(EhUrl.DOMAIN_FORUMS, names, values);
+      this.appendDownloadCookieSource(EhUrl.DOMAIN_E, names, values);
+      if (site === GallerySite.EX) {
+        this.appendDownloadCookieSource(EhUrl.DOMAIN_EX, names, values);
+      }
     }
     this.appendDownloadCookieSource(url, names, values);
-    if (site === GallerySite.E && names.indexOf('nw') < 0) {
+    if (galleryHost && site === GallerySite.E && names.indexOf('nw') < 0) {
       names.push('nw');
       values.push('nw=1');
     }
@@ -13398,53 +14211,66 @@ struct Index {
   }
 
   private async downloadImageFile(
-    taskKey: string,
-    site: string,
+    item: DownloadQueueItem,
+    runGeneration: number,
     sourceUrl: string,
     referer: string,
     targetPath: string,
-    onProgress?: DownloadProgressCallback
+    onProgress?: DownloadProgressCallback,
+    originalPage?: NativeGalleryImagePage
   ): Promise<DownloadPageResult> {
+    this.assertDownloadRunActive(item, runGeneration);
     const dir = targetPath.substring(0, targetPath.lastIndexOf('/'));
     if (sourceUrl.length === 0 || targetPath.length === 0 || !this.ensureLocalDirectory(dir)) {
       throw new Error('下载目录不可用');
     }
+    this.assertDownloadRunActive(item, runGeneration);
     const request = http.createHttp();
+    const control = this.createDownloadRequestControl(item, runGeneration);
+    const tempPath = `${targetPath}.tmp`;
+    let tempFileAttempted = false;
+    let committed = false;
     const headers: Record<string, string> = {
-      'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'User-Agent': NativeEhClient.USER_AGENT,
+      'Accept': NativeEhClient.DOWNLOAD_ACCEPT,
+      'Accept-Language': NativeEhClient.DOWNLOAD_ACCEPT_LANGUAGE,
+      'User-Agent': NativeEhClient.DOWNLOAD_USER_AGENT,
       'Referer': referer
     };
-    const host = this.readerHostFromUrl(sourceUrl);
-    if (host.length > 0) {
-      headers['Host'] = host;
-    }
-    const cookie = this.downloadCookieHeader(sourceUrl, site);
+    const cookie = this.downloadCookieHeader(sourceUrl, item.site);
     if (cookie.length > 0) {
       headers['Cookie'] = cookie;
     }
     const progressCallback = (progress: http.DataReceiveProgressInfo): void => {
-      if (onProgress) {
+      if (!this.shouldStopDownload(item, runGeneration) && onProgress) {
         onProgress(progress.receiveSize, progress.totalSize);
       }
     };
-    this.registerDownloadActiveRequest(taskKey, request);
     try {
+      this.assertDownloadRunActive(item, runGeneration);
+      control.onStart(request);
       if (onProgress) {
         request.on('dataReceiveProgress', progressCallback);
       }
-      const response = await request.request(sourceUrl, {
+      this.assertDownloadRunActive(item, runGeneration);
+      const responsePromise = request.request(sourceUrl, {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        maxLimit: DOWNLOAD_IMAGE_RESPONSE_MAX_BYTES,
         usingCache: false,
         usingProxy: AppNetworkProxy.requestProxy(),
         readTimeout: 45000,
         connectTimeout: 15000,
         header: headers
       });
+      const response = control.cancelled ? await Promise.race([
+        responsePromise,
+        control.cancelled.then((): http.HttpResponse => {
+          throw new Error('下载任务已取消');
+        })
+      ]) : await responsePromise;
+      this.assertDownloadRunActive(item, runGeneration);
       const code = Number(response.responseCode);
-      if (code < 200 || code >= 400) {
+      if (code < 200 || code >= 300) {
         throw new Error(`HTTP ${code}`);
       }
       const result = response.result;
@@ -13452,11 +14278,81 @@ struct Index {
       if (data.byteLength <= 0) {
         throw new Error('图片响应为空');
       }
-      const tempPath = `${targetPath}.tmp`;
+      const responseHeaders = response.header as Record<string, string>;
+      let contentType = '';
+      let contentEncoding = '';
+      let contentLength = '';
+      for (const headerName of Object.keys(responseHeaders)) {
+        const value = `${responseHeaders[headerName]}`.trim().toLowerCase();
+        if (headerName.toLowerCase() === 'content-type') {
+          contentType = value;
+        } else if (headerName.toLowerCase() === 'content-encoding') {
+          contentEncoding = value;
+        } else if (headerName.toLowerCase() === 'content-length') {
+          contentLength = value;
+        }
+      }
+      const bytes = new Uint8Array(data);
+      let responsePrefix = '';
+      for (let index = 0; index < Math.min(bytes.length, 512); index++) {
+        responsePrefix += String.fromCharCode(bytes[index]);
+      }
+      if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml') ||
+        /^\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(responsePrefix)) {
+        throw new Error('图片响应为 HTML 页面');
+      }
+      if (contentType.startsWith('text/') || contentType.includes('application/json')) {
+        throw new Error('图片响应为错误文本');
+      }
+      if ((contentEncoding.length === 0 || contentEncoding === 'identity') && /^\d+$/.test(contentLength) &&
+        Number(contentLength) !== data.byteLength) {
+        throw new Error('图片响应长度不完整');
+      }
+      if (originalPage && (originalPage.originalWidth || 0) > 0 && (originalPage.originalHeight || 0) > 0) {
+        let source: image.ImageSource | undefined = undefined;
+        let info: image.ImageInfo | undefined = undefined;
+        try {
+          source = image.createImageSource(data);
+          info = await source.getImageInfo();
+        } catch (error) {
+          // Android saves the original bytes without requiring a platform
+          // decoder. Unsupported image formats must remain downloadable.
+          this.assertDownloadRunActive(item, runGeneration);
+        } finally {
+          if (source) {
+            try {
+              await source.release();
+            } catch (error) {
+            }
+          }
+        }
+        this.assertDownloadRunActive(item, runGeneration);
+        if (info && (info.size.width !== originalPage.originalWidth || info.size.height !== originalPage.originalHeight)) {
+          throw new Error(`原图尺寸不匹配（需要 ${originalPage.originalWidth}×${originalPage.originalHeight}，` +
+            `收到 ${info.size.width}×${info.size.height}）`);
+        }
+      }
+      this.assertDownloadRunActive(item, runGeneration);
       let file: fileIo.File | undefined = undefined;
       try {
+        tempFileAttempted = true;
         file = fileIo.openSync(tempPath, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-        fileIo.writeSync(file.fd, data);
+        let writtenTotal = 0;
+        while (writtenTotal < data.byteLength) {
+          this.assertDownloadRunActive(item, runGeneration);
+          const remaining = writtenTotal === 0 ? data : data.slice(writtenTotal);
+          const written = fileIo.writeSync(file.fd, remaining, { length: remaining.byteLength });
+          if (!Number.isInteger(written) || written <= 0 || written > remaining.byteLength) {
+            throw new Error('图片文件写入不完整');
+          }
+          writtenTotal += written;
+        }
+        const stat = fileIo.statSync(file.fd);
+        if (!stat.isFile() || stat.size !== data.byteLength) {
+          throw new Error('图片文件长度不完整');
+        }
+        fileIo.closeSync(file);
+        file = undefined;
       } finally {
         if (file) {
           try {
@@ -13465,17 +14361,11 @@ struct Index {
           }
         }
       }
-      try {
-        if (fileIo.accessSync(targetPath)) {
-          fileIo.unlinkSync(targetPath);
-        }
-      } catch (error) {
-      }
-      try {
-        fileIo.renameSync(tempPath, targetPath);
-      } catch (renameError) {
-        throw new Error(`${renameError}`);
-      }
+      this.assertDownloadRunActive(item, runGeneration);
+      // Commit a complete page in the same directory; keep any previous page
+      // intact if writing, cancellation, or the atomic rename fails.
+      fileIo.renameSync(tempPath, targetPath);
+      committed = true;
       return {
         path: targetPath,
         bytes: data.byteLength,
@@ -13485,7 +14375,13 @@ struct Index {
       const message = `${error}`;
       throw new Error(message.length > 0 ? message : '图片下载失败');
     } finally {
-      this.unregisterDownloadActiveRequest(taskKey, request);
+      if (tempFileAttempted && !committed) {
+        try {
+          fileIo.unlinkSync(tempPath);
+        } catch (cleanupError) {
+        }
+      }
+      control.onFinish(request);
       if (onProgress) {
         try {
           request.off('dataReceiveProgress', progressCallback);
@@ -13503,25 +14399,52 @@ struct Index {
     item: DownloadQueueItem,
     pageUrl: string,
     pageIndex: number,
+    runGeneration: number,
     onProgress?: DownloadProgressCallback
   ): Promise<DownloadPageResult> {
-    const page = await NativeEhClient.fetchReaderPage(item.site, pageUrl);
-    const sourceUrl = this.downloadUseOriginImage && page.originImageUrl.length > 0 ? page.originImageUrl : page.imageUrl;
+    this.assertDownloadRunActive(item, runGeneration);
+    if (item.imageQuality !== 'original' && item.imageQuality !== 'compressed') {
+      throw new Error('请先选择下载画质');
+    }
+    const page = await NativeEhClient.fetchReaderPage(item.site, pageUrl, '',
+      this.createDownloadRequestControl(item, runGeneration));
+    this.assertDownloadRunActive(item, runGeneration);
+    const original = this.downloadUsesOriginalImage(item);
+    const sourceUrl = original && page.originImageUrl.length > 0 ?
+      await NativeEhClient.fetchOriginalImageUrl(item.site, page,
+        this.createDownloadRequestControl(item, runGeneration)) : page.imageUrl;
+    this.assertDownloadRunActive(item, runGeneration);
     const targetPath = this.downloadTargetPath(item, pageIndex, sourceUrl);
-    return await this.downloadImageFile(this.downloadKey(item.gid, item.site), item.site, sourceUrl, page.pageUrl, targetPath, onProgress);
+    this.assertDownloadRunActive(item, runGeneration);
+    const result = await this.downloadImageFile(item, runGeneration, sourceUrl, page.pageUrl, targetPath,
+      onProgress, original ? page : undefined);
+    this.assertDownloadRunActive(item, runGeneration);
+    if (original) {
+      const dir = result.path.substring(0, result.path.lastIndexOf('/'));
+      if (!recordOriginalDownloadPage(dir, this.galleryDirectoryIdentity(item), pageIndex, result)) {
+        throw new Error('无法保存原图校验记录');
+      }
+      this.removeReplacedDownloadPageFiles(pageIndex, result.path);
+    }
+    return result;
   }
 
   private async downloadPageWithRetry(
     item: DownloadQueueItem,
     pageUrl: string,
     pageIndex: number,
+    runGeneration: number,
     onProgress?: DownloadProgressCallback
   ): Promise<DownloadPageResult> {
     let lastError = '';
     for (let attempt = 0; attempt <= DOWNLOAD_PAGE_RETRY_LIMIT; attempt++) {
+      this.assertDownloadRunActive(item, runGeneration);
       try {
-        return await this.downloadSinglePage(item, pageUrl, pageIndex, onProgress);
+        const result = await this.downloadSinglePage(item, pageUrl, pageIndex, runGeneration, onProgress);
+        this.assertDownloadRunActive(item, runGeneration);
+        return result;
       } catch (error) {
+        this.assertDownloadRunActive(item, runGeneration);
         lastError = `${error}`;
       }
     }
@@ -13536,14 +14459,21 @@ struct Index {
     if (this.currentDownloadRunGeneration(key) !== runGeneration) {
       return true;
     }
-    if (this.downloadCancelKeys.has(key) || sharedDownloadCancelKeys.has(key)) {
+    if (this.isDownloadKeyCancelled(key)) {
       return true;
     }
     const current = this.findDownloadItem(item.gid, item.site);
     if (!current) {
       return true;
     }
-    return current.status === DOWNLOAD_STATUS_PAUSED || current.status === DOWNLOAD_STATUS_DELETED;
+    return current.status === DOWNLOAD_STATUS_PAUSED || current.status === DOWNLOAD_STATUS_DELETED ||
+      current.status === DOWNLOAD_STATUS_DONE;
+  }
+
+  private assertDownloadRunActive(item: DownloadQueueItem, runGeneration: number): void {
+    if (this.shouldStopDownload(item, runGeneration)) {
+      throw new Error('下载任务已取消');
+    }
   }
 
   private async runGalleryDownload(seed: DownloadQueueItem, runGeneration: number): Promise<void> {
@@ -13575,10 +14505,29 @@ struct Index {
     );
 
     try {
-      const detail = await this.fetchDownloadDetail(item);
+      item = this.findDownloadItem(seed.gid, seed.site) || item;
+      item = this.restoreExistingDownloadDirectory(item);
+      if (!await this.preparePublicDownloadDirectory() && item.downloadDir.trim().length === 0) {
+        throw new Error(this.downloadDirectoryStatus);
+      }
       item = this.findDownloadItem(seed.gid, seed.site) || item;
       if (this.shouldStopDownload(item, runGeneration)) {
-        this.downloadManagerStatus = '下载器已暂停';
+        return;
+      }
+      // Fix the task's actual directory before network/page workers begin.
+      const resolved = this.restoreExistingDownloadDirectory(item, true);
+      item = this.cloneDownloadItem(resolved);
+      item.downloadDir = this.galleryDownloadDir(resolved);
+      if (item.downloadDir.length === 0 || !this.ensureLocalDirectory(item.downloadDir)) {
+        throw new Error('下载目录不可用');
+      }
+      if (!writeGalleryDirectoryIdentity(item.downloadDir, this.galleryDirectoryIdentity(item))) {
+        throw new Error('无法保存画廊目录信息');
+      }
+      this.replaceDownloadItem(item);
+      const detail = await this.fetchDownloadDetail(item, runGeneration);
+      item = this.findDownloadItem(seed.gid, seed.site) || item;
+      if (this.shouldStopDownload(item, runGeneration)) {
         return;
       }
       const detailRecord: LocalGalleryRecord = {
@@ -13614,14 +14563,17 @@ struct Index {
         -1,
         item.downloadDir,
         '',
-        item.pageErrors
+        item.pageErrors,
+        item.imageQuality || ''
       );
+      // Detail titles may be fuller than the list title. Rename before any
+      // page worker obtains its target path, then freeze that path for the run.
+      item = this.restoreExistingDownloadDirectory(item, true);
       this.replaceDownloadItem(item);
 
-      const pageUrls = await this.collectDownloadPageUrls(item.site, detail);
+      const pageUrls = await this.collectDownloadPageUrls(item, detail, runGeneration);
       item = this.findDownloadItem(seed.gid, seed.site) || item;
       if (this.shouldStopDownload(item, runGeneration)) {
-        this.downloadManagerStatus = '下载器已暂停';
         return;
       }
       const total = Math.max(item.total, detail.pages, pageUrls.length);
@@ -13634,47 +14586,36 @@ struct Index {
       }
       this.writeDownloadMetadata(item, dir);
 
-      let downloaded = 0;
-      const pageErrors: DownloadPageError[] = [];
-      let failedCount = Math.max(0, total - pageUrls.length);
-      if (failedCount > 0) {
-        pageErrors.push({
-          page: pageUrls.length + 1,
-          message: `缺少 ${failedCount} 个下载页链接`,
-          updatedAt: this.nowLabel()
-        });
-        this.updateDownloadProgress(
-          item,
-          DOWNLOAD_STATUS_DOWNLOADING,
-          downloaded,
-          total,
-          failedCount,
-          '下载页链接不完整',
-          item.currentPage,
-          0,
-          -1,
-          dir,
-          pageErrors[0].message,
-          pageErrors
-        );
+      const completedPages: Set<number> = new Set();
+      for (let index = 0; index < total; index++) {
+        if (this.existingDownloadPath(item, index).length > 0) {
+          completedPages.add(index);
+        }
       }
+      let downloaded = completedPages.size;
+      const pageErrors: DownloadPageError[] = [];
+      let failedCount = 0;
+      this.updateDownloadProgress(item, DOWNLOAD_STATUS_DOWNLOADING, downloaded, total, 0,
+        '已检查本地文件，正在继续下载', 0, 0, -1, dir, '', []);
       let lastSpeed = 0;
       let nextPageIndex = 0;
       const runPageWorker = async (): Promise<void> => {
         while (true) {
           const index = nextPageIndex;
           nextPageIndex++;
-          if (index >= pageUrls.length) {
+          if (index >= total) {
             return;
           }
           item = this.findDownloadItem(seed.gid, seed.site) || item;
           if (this.shouldStopDownload(item, runGeneration)) {
-            this.downloadManagerStatus = '下载器已暂停';
             return;
           }
           const existingPath = this.existingDownloadPath(item, index);
           if (existingPath.length > 0) {
-            downloaded++;
+            if (!completedPages.has(index)) {
+              completedPages.add(index);
+              downloaded++;
+            }
             this.updateDownloadProgress(
               item,
               DOWNLOAD_STATUS_DOWNLOADING,
@@ -13690,6 +14631,9 @@ struct Index {
               pageErrors
             );
             continue;
+          }
+          if (completedPages.delete(index)) {
+            downloaded--;
           }
           const startedAt = Date.now();
           let lastProgressAt = 0;
@@ -13757,14 +14701,17 @@ struct Index {
             );
           };
           try {
-            const result = await this.downloadPageWithRetry(item, pageUrls[index], index, onPageProgress);
+            if (!pageUrls[index]) {
+              throw new Error(`未获取到第 ${index + 1} 页的下载链接`);
+            }
+            const result = await this.downloadPageWithRetry(item, pageUrls[index], index, runGeneration, onPageProgress);
             item = this.findDownloadItem(seed.gid, seed.site) || item;
             this.clearDownloadPageTransferFraction(item, index);
             if (this.shouldStopDownload(item, runGeneration)) {
-              this.downloadManagerStatus = '下载器已暂停';
               return;
             }
-            downloaded++;
+            completedPages.add(index);
+            downloaded = completedPages.size;
             const elapsedSeconds = Math.max(1, (Date.now() - startedAt) / 1000);
             lastSpeed = Math.round(result.bytes / elapsedSeconds);
             const remainingPages = Math.max(0, total - downloaded - failedCount);
@@ -13787,7 +14734,6 @@ struct Index {
             item = this.findDownloadItem(seed.gid, seed.site) || item;
             this.clearDownloadPageTransferFraction(item, index);
             if (this.shouldStopDownload(item, runGeneration)) {
-              this.downloadManagerStatus = '下载器已暂停';
               return;
             }
             failedCount++;
@@ -13823,13 +14769,13 @@ struct Index {
 
       item = this.findDownloadItem(seed.gid, seed.site) || item;
       if (this.shouldStopDownload(item, runGeneration)) {
-        this.downloadManagerStatus = '下载器已暂停';
         return;
       }
 
       item = this.findDownloadItem(seed.gid, seed.site) || item;
       const finalFailedCount = Math.max(failedCount, Math.max(0, total - downloaded));
       if (finalFailedCount > 0) {
+        const firstFailure = pageErrors.find((pageError: DownloadPageError): boolean => pageError.message.length > 0);
         this.updateDownloadProgress(
           item,
           DOWNLOAD_STATUS_FAILED,
@@ -13841,7 +14787,7 @@ struct Index {
           0,
           -1,
           dir,
-          `${finalFailedCount} 页失败`,
+          `${finalFailedCount} 页失败${firstFailure ? `：${firstFailure.message}` : ''}`,
           pageErrors
         );
       } else {
@@ -13864,7 +14810,6 @@ struct Index {
     } catch (error) {
       item = this.findDownloadItem(seed.gid, seed.site) || item;
       if (this.shouldStopDownload(item, runGeneration)) {
-        this.downloadManagerStatus = '下载器已暂停';
         return;
       }
       const message = `${error}`;
@@ -13884,14 +14829,23 @@ struct Index {
       );
     } finally {
       this.clearDownloadTransferProgress(seed);
-      this.downloadCancelKeys.delete(key);
-      sharedDownloadCancelKeys.delete(key);
-      this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, false);
+      if (this.currentDownloadRunGeneration(key) === runGeneration) {
+        this.downloadCancelKeys.delete(key);
+        sharedDownloadCancelKeys.delete(key);
+        this.updateRuntimeStringArray(DOWNLOAD_RUNTIME_CANCEL_KEYS_KEY, key, false);
+      }
       if (this.downloadActiveKey === key) {
         this.downloadActiveKey = '';
       }
       if (sharedDownloadActiveKey === key) {
         sharedDownloadActiveKey = '';
+      }
+      const completedRunItem = this.findDownloadItem(seed.gid, seed.site);
+      if (completedRunItem && completedRunItem.status !== DOWNLOAD_STATUS_DELETED) {
+        const restored = this.restoreExistingDownloadDirectory(completedRunItem);
+        if (restored !== completedRunItem) {
+          this.replaceDownloadItem(restored);
+        }
       }
       this.publishDownloadRuntimeStorage();
       this.refreshDownloadRuntimeState(true);
@@ -13900,7 +14854,7 @@ struct Index {
 
   private exportDownloadCsv(): void {
     const lines = [DOWNLOAD_INFO_HEADER];
-    for (const item of this.downloadItems) {
+    for (const item of this.downloadItemsSource()) {
       lines.push(this.downloadCsvLine(item));
     }
     this.downloadImportExportText = lines.join('\n');
@@ -13962,18 +14916,23 @@ struct Index {
       this.toast('没有可导入的下载记录');
       return;
     }
-    const existingKeys = this.downloadItems.map((item: DownloadQueueItem) => this.downloadKey(item.gid, item.site));
-    const merged = [...this.downloadItems];
+    const source = this.downloadItemsSource();
+    const existingKeys: Set<string> = new Set(source.map((item: DownloadQueueItem) => this.downloadKey(item.gid, item.site)));
+    const merged = [...source];
+    let importedCount = 0;
     for (const item of imported) {
-      if (existingKeys.indexOf(this.downloadKey(item.gid, item.site)) >= 0) {
+      const key = this.downloadKey(item.gid, item.site);
+      if (existingKeys.has(key)) {
         continue;
       }
-      this.clearDownloadKeyRemoved(this.downloadKey(item.gid, item.site));
+      existingKeys.add(key);
+      this.clearDownloadKeyRemoved(key);
       merged.unshift(item);
+      importedCount++;
     }
-    this.downloadItems = merged.slice(0, 120);
+    this.downloadItems = merged;
     this.saveDownloadItems();
-    this.toast(`已导入 ${imported.length} 个下载`);
+    this.toast(`已导入 ${importedCount} 个下载`);
   }
 
   private clearHistory(): void {
@@ -13986,6 +14945,7 @@ struct Index {
       return;
     }
     const options: promptAction.ShowDialogOptions = {
+      systemMaterial: IMMERSIVE_DIALOG_MATERIAL,
       title: '清空历史',
       message: '确定要清空全部浏览历史吗？',
       buttons: [
@@ -14107,13 +15067,16 @@ struct Index {
     if (item.status === DOWNLOAD_STATUS_DOWNLOADING && !this.isDownloadItemRunning(item)) {
       return '已中断';
     }
+    if (item.status === DOWNLOAD_STATUS_QUEUED && !this.isDownloadItemQueued(item)) {
+      return '待开始';
+    }
     return this.downloadStatusLabel(item.status);
   }
 
   private downloadStatusColor(status: string): string {
     switch (status) {
       case DOWNLOAD_STATUS_DOWNLOADING:
-        return '#1976D2';
+        return '#C86B8C';
       case DOWNLOAD_STATUS_PAUSED:
         return '#7C6470';
       case DOWNLOAD_STATUS_FAILED:
@@ -14599,6 +15562,13 @@ struct Index {
     return this.activeSection === NAV_LIBRARY && this.myPage === MY_PAGE_DOWNLOADS && !this.hasVisibleNativeSubPage();
   }
 
+  private shouldShowTopListTitleSegment(): boolean {
+    return this.activeSection === NAV_HOME && this.homePage === HOME_PAGE_TOP &&
+      this.myPage === MY_PAGE_MAIN && this.nativeViewMode === 'list' &&
+      !this.shouldShowNativeTitleBarBack() && !this.shouldShowNativeRouteLoading() &&
+      this.canUseNativeSite(this.siteMode) && this.topListDetail.groups.length > 0;
+  }
+
   private shouldShowSearchTitleBarInput(): boolean {
     return this.activeSection === NAV_SEARCH && this.nativeViewMode === 'list';
   }
@@ -14811,9 +15781,7 @@ struct Index {
 
   private titleBarStyleOptions(): TitleBarStyleOptions {
     const isPrimaryTitlePage = this.isPrimaryTitlePage();
-    const useDefaultMaterialBackground = this.shouldShowSearchTitleBarInput();
     const maskExtraHeight = isPrimaryTitlePage ? TITLE_BAR_GRADIENT_MASK_EXTRA_HEIGHT : 0;
-    const backgroundColor = isPrimaryTitlePage ? 'rgba(255,255,255,0.92)' : '#FFFFFF';
     return {
       scrollEffectOpts: {
         enableScrollEffect: true,
@@ -14821,11 +15789,7 @@ struct Index {
         enableRefreshOffsetChange: true
       },
       originalStyle: {
-        backgroundStyle: useDefaultMaterialBackground ? {
-          maskExtraHeight,
-          blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
-        } : {
-          backgroundColor,
+        backgroundStyle: {
           maskExtraHeight,
           blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
         },
@@ -14845,11 +15809,7 @@ struct Index {
         }
       },
       scrollEffectStyle: {
-        backgroundStyle: useDefaultMaterialBackground ? {
-          maskExtraHeight,
-          blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
-        } : {
-          backgroundColor: '#FFFFFF',
+        backgroundStyle: {
           maskExtraHeight,
           blurRadius: TITLE_BAR_GRADIENT_BLUR_RADIUS
         },
@@ -14870,8 +15830,8 @@ struct Index {
       },
       blurStrategy: BlurStrategy.ENABLE,
       systemMaterialEffect: {
-        materialType: this.titleBarMaterialType,
-        materialLevel: this.customMaterialLevel
+        materialType: hdsMaterial.MaterialType.ADAPTIVE,
+        materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
       }
     };
   }
@@ -14951,6 +15911,25 @@ struct Index {
         enableComponentSafeArea: false
       };
     }
+    if (this.shouldShowTopListTitleSegment()) {
+      return {
+        content: {
+          title: {
+            mainTitle: this.currentNavigationTitle()
+          },
+          menu: this.currentNavigationMenuContent(),
+          bottomBuilder: {
+            builder: (): void => {
+              this.TopListTitleBarSegment();
+            },
+            height: DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT
+          }
+        },
+        style: this.titleBarStyleOptions(),
+        avoidLayoutSafeArea: true,
+        enableComponentSafeArea: false
+      };
+    }
     return {
       content: {
         title: {
@@ -14965,7 +15944,8 @@ struct Index {
   }
 
   private pageContentStartOffset(): number {
-    let titleBarBottomInset = this.shouldShowDownloadTitleSegment() ? DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT : 0;
+    let titleBarBottomInset = this.shouldShowDownloadTitleSegment() || this.shouldShowTopListTitleSegment() ?
+      DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT : 0;
     if (this.shouldShowSearchTitleBarInput()) {
       titleBarBottomInset = SEARCH_TITLE_BAR_BOTTOM_HEIGHT;
     }
@@ -14993,7 +15973,7 @@ struct Index {
     if (this.pageViewportHeight <= 1) {
       return 360;
     }
-    return Math.max(240, Math.floor(this.pageViewportHeight * 0.78) - 84);
+    return Math.max(160, Math.floor(this.pageViewportHeight * 0.5) - 84);
   }
 
   @Builder
@@ -16135,12 +17115,24 @@ struct Index {
         .fontColor('#6F5964')
         .padding(10)
         .backgroundColor('#FFF8E1')
-        .borderRadius(8);
+        .borderRadius(8)
+        .transition(feedbackTransition());
     }
   }
 
   @Builder
   private HomeGalleryRoute(): void {
+    ContentTransition({
+      changeKey: `${this.homePage}:${this.siteMode}`,
+      animateOnAppear: false,
+      content: (): void => {
+        this.HomeGalleryRouteContent();
+      }
+    });
+  }
+
+  @Builder
+  private HomeGalleryRouteContent(): void {
     Column({ space: 12 }) {
       this.LocalFilterStatusCard(this.homeFilteredCount);
       HomeGalleryPage({
@@ -16609,6 +17601,16 @@ struct Index {
 
   @Builder
   private DownloadTitleBarSegment(): void {
+    ImmersiveTitleSurface({
+      surfaceHeight: DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT,
+      content: (): void => {
+        this.DownloadTitleBarSegmentContent();
+      }
+    });
+  }
+
+  @Builder
+  private DownloadTitleBarSegmentContent(): void {
     Column() {
       SegmentButton({
         options: this.downloadViewSegmentOptions,
@@ -16617,7 +17619,40 @@ struct Index {
           this.setDownloadViewModeByIndex(index);
         }
       })
-        .width('100%');
+        .width('100%')
+        .shadow({ radius: 0 });
+    }
+    .width('100%')
+    .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: 6, bottom: 8 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center);
+  }
+
+  @Builder
+  private TopListTitleBarSegment(): void {
+    ImmersiveTitleSurface({
+      surfaceHeight: DOWNLOAD_TITLE_BAR_BOTTOM_HEIGHT,
+      content: (): void => {
+        this.TopListTitleBarSegmentContent();
+      }
+    });
+  }
+
+  @Builder
+  private TopListTitleBarSegmentContent(): void {
+    Column() {
+      SegmentButton({
+        options: this.topListPeriodSegmentOptions,
+        selectedIndexes: $topListPeriodSelectedIndexes,
+        onItemClicked: (index: number): void => {
+          this.topListPeriodSelectedIndexes = [index];
+          this.syncTopListPeriodSelectedIndex();
+          this.loadCurrentTopListGalleryPeriod();
+        }
+      })
+        .width('100%')
+        .enabled(!this.topListLoading)
+        .shadow({ radius: 0 });
     }
     .width('100%')
     .padding({ left: PAGE_SIDE_GUTTER, right: PAGE_SIDE_GUTTER, top: 6, bottom: 8 })
@@ -16627,6 +17662,16 @@ struct Index {
 
   @Builder
   private SearchTitleBarBottom(): void {
+    ImmersiveTitleSurface({
+      surfaceHeight: SEARCH_TITLE_BAR_BOTTOM_HEIGHT,
+      content: (): void => {
+        this.SearchTitleBarBottomContent();
+      }
+    });
+  }
+
+  @Builder
+  private SearchTitleBarBottomContent(): void {
     Column() {
       this.SearchInputBar();
     }
@@ -16645,7 +17690,9 @@ struct Index {
     .width('100%')
     .height(SEARCH_INPUT_BAR_HEIGHT)
     .enterKeyType(EnterKeyType.Search)
-    .backgroundColor($r('sys.color.comp_background_tertiary'))
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(IMMERSIVE_SEARCH_FIELD_MATERIAL)
+    .shadow({ radius: 0 })
     .searchIcon({ size: 18, color: $r('sys.color.icon_primary') })
     .cancelButton({ style: CancelButtonStyle.INPUT })
     .fontColor($r('sys.color.font_primary'))
@@ -17026,6 +18073,24 @@ struct Index {
 
   @Builder
   private SearchSuggestionOverlayContent(): void {
+    ContentTransition({
+      changeKey: this.searchSuggestionContentChangeKey(),
+      animateOnAppear: false,
+      content: (): void => {
+        this.SearchSuggestionOverlayGroups();
+      }
+    });
+  }
+
+  private searchSuggestionContentChangeKey(): string {
+    if (this.shouldShowSearchHistoryOverlay()) {
+      return 'history';
+    }
+    return `completion:${this.searchHistorySuggestions.length > 0}:${this.tagSuggestions.length > 0}`;
+  }
+
+  @Builder
+  private SearchSuggestionOverlayGroups(): void {
     if (this.shouldShowSearchHistoryOverlay()) {
       Column({ space: 8 }) {
         this.SearchHistoryPanelHeader();
@@ -17088,7 +18153,6 @@ struct Index {
           .backgroundColor('#FFFFFF')
           .borderRadius(12)
           .border({ width: 1, color: '#E8C8D6' })
-          .shadow(ShadowStyle.OUTER_DEFAULT_SM)
           .alignItems(HorizontalAlign.Start);
 
           if (this.searchSuggestionOverlayBottomSpacerHeight() > 0) {
@@ -17327,7 +18391,8 @@ struct Index {
               }, (item: TagTranslationSuggestion) => `watch-suggest:${item.key}`);
             }
             .width('100%')
-            .alignItems(HorizontalAlign.Start);
+            .alignItems(HorizontalAlign.Start)
+            .transition(feedbackTransition());
           }
         }
         .width('100%')
@@ -17407,59 +18472,38 @@ struct Index {
 
   @Builder
   private SearchFilterCategoryGroups(): void {
-    ForEach([`${this.searchCategoryMask}`], (_key: string) => {
-      Column({ space: 10 }) {
-        Text('分类')
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor('#2B2027');
-
-        Column({ space: 6 }) {
-          Text('选中分类')
-            .fontSize(12)
-            .fontColor('#7C6470');
-          if (this.selectedSearchCategoryOptions().length > 0) {
-            this.SelectedSearchCategoryWrap();
-          } else {
-            Text('至少选择一个分类')
-              .fontSize(12)
-              .fontColor('#B42318')
-              .padding({ left: 10, right: 10, top: 7, bottom: 7 })
-              .backgroundColor('#FFF3F2')
-              .borderRadius(8);
-          }
-        }
-        .width('100%')
-        .alignItems(HorizontalAlign.Start);
-
-        if (this.unselectedSearchCategoryOptions().length > 0) {
-          Column({ space: 6 }) {
-            Text('未选中分类')
-              .fontSize(12)
-              .fontColor('#7C6470');
-            this.UnselectedSearchCategoryWrap();
-          }
-          .width('100%')
-          .alignItems(HorizontalAlign.Start);
-        }
+    Column({ space: 10 }) {
+      Text('分类')
+        .fontSize(14)
+        .fontWeight(FontWeight.Medium)
+        .fontColor('#2B2027');
+      if (this.selectedSearchCategoryOptions().length === 0) {
+        Text('至少选择一个分类')
+          .fontSize(12)
+          .fontColor('#B42318')
+          .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+          .backgroundColor('#FFF3F2')
+          .borderRadius(8)
+          .transition(feedbackTransition());
       }
-      .width('100%')
-      .alignItems(HorizontalAlign.Start);
-    }, (key: string) => key);
-  }
-
-  @Builder
-  private SelectedSearchCategoryWrap(): void {
-    Flex({ wrap: FlexWrap.Wrap }) {
-      ForEach(SEARCH_CATEGORY_OPTIONS, (option: SearchCategoryOption) => {
-        if (this.categorySelected(option.bit)) {
+      // Keep every category under one parent with an immutable bit key. The
+      // animateTo transaction can now move existing buttons between groups.
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(this.orderedSearchCategoryOptions(), (option: SearchCategoryOption) => {
+          if (this.searchCategoryStartsGroup(option.bit)) {
+            Text(this.categorySelected(option.bit) ? '选中分类' : '未选中分类')
+              .width('100%')
+              .fontSize(12)
+              .fontColor('#7C6470')
+              .margin({ bottom: 6 });
+          }
           Button(option.label)
             .height(28)
             .padding({ left: 12, right: 12 })
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#C86B8C')
+            .fontColor(this.categorySelected(option.bit) ? '#FFFFFF' : '#2B2027')
+            .backgroundColor(this.categorySelected(option.bit) ? '#C86B8C' : '#F3E3EA')
             .borderRadius(14)
             .margin({ right: 8, bottom: 8 })
             .onClick(() => {
@@ -17467,35 +18511,12 @@ struct Index {
                 this.toggleSearchCategoryFromSheet(option.bit);
               });
             });
-        }
-      }, (option: SearchCategoryOption) => `selected:${option.bit}`);
+        }, (option: SearchCategoryOption) => `category:${option.bit}`);
+      }
+      .width('100%');
     }
-    .width('100%');
-  }
-
-  @Builder
-  private UnselectedSearchCategoryWrap(): void {
-    Flex({ wrap: FlexWrap.Wrap }) {
-      ForEach(SEARCH_CATEGORY_OPTIONS, (option: SearchCategoryOption) => {
-        if (!this.categorySelected(option.bit)) {
-          Button(option.label)
-            .height(28)
-            .padding({ left: 12, right: 12 })
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#2B2027')
-            .backgroundColor('#F3E3EA')
-            .borderRadius(14)
-            .margin({ right: 8, bottom: 8 })
-            .onClick(() => {
-              this.animateSearchCategoryChange(() => {
-                this.toggleSearchCategoryFromSheet(option.bit);
-              });
-            });
-        }
-      }, (option: SearchCategoryOption) => `unselected:${option.bit}`);
-    }
-    .width('100%');
+    .width('100%')
+    .alignItems(HorizontalAlign.Start);
   }
 
   @Builder
@@ -17561,6 +18582,83 @@ struct Index {
 
   @Builder
   private SearchFilterSheetContent(): void {
+    Column() {
+      ImmersiveTitleSurface({
+        surfaceHeight: this.searchAdvancedHeaderHeight,
+        content: (): void => {
+          this.SearchAdvancedTitleBar();
+        }
+      });
+      this.SearchFilterSheetBody();
+    }
+    .width('100%')
+    .height('100%')
+    .onAppear(() => {
+      this.activateSearchAdvancedTransitions();
+    })
+    .onDisAppear(() => {
+      this.deactivateSearchAdvancedTransitions();
+    });
+  }
+
+  @Builder
+  private SearchAdvancedTitleBar(): void {
+    Column() {
+      Row({ space: 8 }) {
+        Text('高级参数')
+          .layoutWeight(1)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_primary'));
+        Toggle({ type: ToggleType.Switch, isOn: this.searchAdvancedEnabled })
+          .id('search-advanced-switch')
+          .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+          .onChange((isOn: boolean) => {
+            this.searchAdvancedEnabled = isOn;
+          });
+      }
+      .width('100%')
+      .height(40)
+      .alignItems(VerticalAlign.Center);
+
+      Column() {
+        if (this.searchAdvancedContentMounted) {
+          ChipGroup({
+            items: this.searchAdvancedFlagChipItems(),
+            itemStyle: {
+              size: ChipSize.SMALL,
+              backgroundColor: Color.Transparent,
+              fontColor: $r('sys.color.font_primary'),
+              selectedBackgroundColor: Color.Transparent,
+              selectedFontColor: $r('sys.color.ohos_id_color_text_primary_contrary')
+            },
+            backgroundSystemMaterial: IMMERSIVE_SEGMENT_MATERIAL,
+            selectedBackgroundSystemMaterial: IMMERSIVE_SEARCH_CHIP_SELECTED_MATERIAL,
+            selectedIndexes: this.selectedSearchAdvancedFlagIndexes(),
+            multiple: true,
+            chipGroupSpace: { itemSpace: 8, startSpace: 0, endSpace: 0 },
+            chipGroupPadding: { top: 2, bottom: 2 },
+            onChange: (indexes: number[]) => {
+              this.applySelectedSearchAdvancedFlagIndexes(indexes);
+            }
+          })
+            .width('100%')
+            .height(44)
+            .margin({ top: 8 });
+        }
+      }
+      .width('100%')
+      .height(this.searchAdvancedChipHeight)
+      .opacity(this.searchAdvancedContentOpacity)
+      .enabled(this.searchAdvancedEnabled)
+      .clip(!this.searchAdvancedEnabled);
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 });
+  }
+
+  @Builder
+  private SearchFilterSheetBody(): void {
     Scroll() {
       Column({ space: 12 }) {
         this.SearchFilterQuickSearches();
@@ -17580,19 +18678,18 @@ struct Index {
                     .fontWeight(FontWeight.Medium)
                     .fontColor('#2B2027');
                   Select(this.searchModeSelectOptions())
+                    .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+                    .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
                     .selected(this.searchModeSelectedIndex())
                     .value(this.searchModeLabel(this.searchMode))
                     .width('100%')
                     .height(36)
-                    .backgroundColor('#F8F8F8')
                     .font({ size: 13 })
-                    .fontColor('#2B2027')
-                    .selectedOptionBgColor('#C86B8C')
+                    .fontColor($r('sys.color.font_primary'))
                     .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-                    .selectedOptionFontColor('#FFFFFF')
+                    .selectedOptionFontColor($r('sys.color.font_primary'))
                     .optionFont({ size: 13 })
-                    .optionBgColor('#FFFFFF')
-                    .optionFontColor('#2B2027')
+                    .optionFontColor($r('sys.color.font_primary'))
                     .onSelect((index: number, _value: string) => {
                       this.applySearchModeByIndex(index);
                     });
@@ -17602,92 +18699,84 @@ struct Index {
 
                 this.SearchFilterCategoryGroups();
 
-                Column({ space: 8 }) {
-                  Row({ space: 8 }) {
-                    Text('高级参数')
-                      .layoutWeight(1)
-                      .fontSize(14)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor('#2B2027');
-                    Toggle({ type: ToggleType.Switch, isOn: this.searchAdvancedEnabled })
-                      .selectedColor('#C86B8C')
-                      .onChange((isOn: boolean) => {
-                        this.searchAdvancedEnabled = isOn;
-                      });
-                  }
-                  .width('100%')
-                  .alignItems(VerticalAlign.Center);
-
-                  if (this.searchAdvancedEnabled) {
-                    ChipGroup({
-                      items: this.searchAdvancedFlagChipItems(),
-                      itemStyle: {
-                        size: ChipSize.SMALL,
-                        backgroundColor: '#F3E3EA',
-                        fontColor: '#2B2027',
-                        selectedBackgroundColor: '#C86B8C',
-                        selectedFontColor: '#FFFFFF'
-                      },
-                      selectedIndexes: this.selectedSearchAdvancedFlagIndexes(),
-                      multiple: true,
-                      chipGroupSpace: { itemSpace: 8, startSpace: 0, endSpace: 0 },
-                      chipGroupPadding: { top: 2, bottom: 2 },
-                      onChange: (indexes: number[]) => {
-                        this.applySelectedSearchAdvancedFlagIndexes(indexes);
+                Column() {
+                  if (this.searchAdvancedContentMounted) {
+                    Column({ space: 8 }) {
+                      Row({ space: 10 }) {
+                        Text('分数筛选')
+                          .width(64)
+                          .fontSize(13)
+                          .fontColor('#6F5964');
+                        TextInput({ text: this.searchMinRating, placeholder: '最低评分 2-5' })
+                          .layoutWeight(1)
+                          .height(38)
+                          .backgroundColor('#F8F8F8')
+                          .borderRadius(10)
+                          .fontSize(13)
+                          .caretColor('#A85474')
+                          .onFocus(() => {
+                            this.searchAdvancedInputFocused = true;
+                          })
+                          .onBlur(() => {
+                            this.searchAdvancedInputFocused = false;
+                          })
+                          .onChange((value: string) => {
+                            this.searchMinRating = value;
+                          });
                       }
-                    })
-                      .width('100%');
+                      .width('100%')
+                      .alignItems(VerticalAlign.Center);
 
-                    Row({ space: 10 }) {
-                      Text('分数筛选')
-                        .width(64)
-                        .fontSize(13)
-                        .fontColor('#6F5964');
-                      TextInput({ text: this.searchMinRating, placeholder: '最低评分 2-5' })
-                        .layoutWeight(1)
-                        .height(38)
-                        .backgroundColor('#F8F8F8')
-                        .borderRadius(10)
-                        .fontSize(13)
-                        .caretColor('#A85474')
-                        .onChange((value: string) => {
-                          this.searchMinRating = value;
-                        });
+                      Row({ space: 10 }) {
+                        Text('页数筛选')
+                          .width(64)
+                          .fontSize(13)
+                          .fontColor('#6F5964');
+                        TextInput({ text: this.searchPageFrom, placeholder: '页数从' })
+                          .layoutWeight(1)
+                          .height(38)
+                          .backgroundColor('#F8F8F8')
+                          .borderRadius(10)
+                          .fontSize(13)
+                          .caretColor('#A85474')
+                          .onFocus(() => {
+                            this.searchAdvancedInputFocused = true;
+                          })
+                          .onBlur(() => {
+                            this.searchAdvancedInputFocused = false;
+                          })
+                          .onChange((value: string) => {
+                            this.searchPageFrom = value;
+                          });
+                        TextInput({ text: this.searchPageTo, placeholder: '页数到' })
+                          .layoutWeight(1)
+                          .height(38)
+                          .backgroundColor('#F8F8F8')
+                          .borderRadius(10)
+                          .fontSize(13)
+                          .caretColor('#A85474')
+                          .onFocus(() => {
+                            this.searchAdvancedInputFocused = true;
+                          })
+                          .onBlur(() => {
+                            this.searchAdvancedInputFocused = false;
+                          })
+                          .onChange((value: string) => {
+                            this.searchPageTo = value;
+                          });
+                      }
+                      .width('100%')
+                      .alignItems(VerticalAlign.Center);
                     }
                     .width('100%')
-                    .alignItems(VerticalAlign.Center);
-
-                    Row({ space: 10 }) {
-                      Text('页数筛选')
-                        .width(64)
-                        .fontSize(13)
-                        .fontColor('#6F5964');
-                      TextInput({ text: this.searchPageFrom, placeholder: '页数从' })
-                        .layoutWeight(1)
-                        .height(38)
-                        .backgroundColor('#F8F8F8')
-                        .borderRadius(10)
-                        .fontSize(13)
-                        .caretColor('#A85474')
-                        .onChange((value: string) => {
-                          this.searchPageFrom = value;
-                        });
-                      TextInput({ text: this.searchPageTo, placeholder: '页数到' })
-                        .layoutWeight(1)
-                        .height(38)
-                        .backgroundColor('#F8F8F8')
-                        .borderRadius(10)
-                        .fontSize(13)
-                        .caretColor('#A85474')
-                        .onChange((value: string) => {
-                          this.searchPageTo = value;
-                        });
-                    }
-                    .width('100%')
-                    .alignItems(VerticalAlign.Center);
+                    .height(84);
                   }
                 }
                 .width('100%')
+                .height(this.searchAdvancedFieldsHeight)
+                .opacity(this.searchAdvancedContentOpacity)
+                .enabled(this.searchAdvancedEnabled)
+                .clip(true)
                 .alignItems(HorizontalAlign.Start);
 
                 Row({ space: 8 }) {
@@ -17729,7 +18818,7 @@ struct Index {
       .alignItems(HorizontalAlign.Start);
     }
     .width('100%')
-    .height('100%')
+    .layoutWeight(1)
     .scrollBar(BarState.Auto)
     .edgeEffect(EdgeEffect.Spring);
   }
@@ -17795,7 +18884,10 @@ struct Index {
       })
       .bindSheet($$this.searchFilterSheetVisible, this.SearchFilterSheetContent(), {
         mode: SheetMode.OVERLAY,
-        height: '78%',
+        height: SheetSize.MEDIUM,
+        detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+        scrollSizeMode: ScrollSizeMode.CONTINUOUS,
+        systemMaterial: IMMERSIVE_SHEET_MATERIAL,
         dragBar: true,
         showClose: true,
         preferType: SheetType.BOTTOM,
@@ -18593,19 +19685,18 @@ struct Index {
           void this.handleFavoriteSquareClick();
         });
       Select(this.favoritePanelSelectOptions())
+        .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+        .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
         .selected(this.favoritePanelSelectedIndex())
         .value(this.favoritePanelSlotSummary())
         .width(FAVORITE_BAR_SELECT_WIDTH)
         .height(36)
         .font({ size: FAVORITE_BAR_FONT_SIZE })
-        .fontColor('#2B2027')
-        .selectedOptionBgColor('#C86B8C')
+        .fontColor($r('sys.color.font_primary'))
         .selectedOptionFont({ size: FAVORITE_BAR_FONT_SIZE, weight: FontWeight.Medium })
-        .selectedOptionFontColor('#FFFFFF')
+        .selectedOptionFontColor($r('sys.color.font_primary'))
         .optionFont({ size: FAVORITE_BAR_FONT_SIZE })
-        .optionBgColor('#FFFFFF')
-        .optionFontColor('#2B2027')
-        .backgroundColor('#FFFFFF')
+        .optionFontColor($r('sys.color.font_primary'))
         .borderRadius(8)
         .onSelect((index: number, _value: string) => {
           const slots = this.favoriteSlots();
@@ -18702,7 +19793,8 @@ struct Index {
       .width('100%')
       .padding(12)
       .backgroundColor('#FFFFFF')
-      .borderRadius(8);
+      .borderRadius(8)
+      .transition(feedbackTransition());
     }
   }
 
@@ -18722,19 +19814,18 @@ struct Index {
         .width('100%');
 
         Select(this.favoritePanelSelectOptions())
+          .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+          .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
           .selected(this.favoritePanelSelectedIndex())
           .value(this.favoritePanelSlotSummary())
           .height(36)
           .width('100%')
           .font({ size: 13 })
-          .fontColor('#2B2027')
-          .selectedOptionBgColor('#C86B8C')
+          .fontColor($r('sys.color.font_primary'))
           .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-          .selectedOptionFontColor('#FFFFFF')
+          .selectedOptionFontColor($r('sys.color.font_primary'))
           .optionFont({ size: 13 })
-          .optionBgColor('#FFFFFF')
-          .optionFontColor('#2B2027')
-          .backgroundColor('#FFFFFF')
+          .optionFontColor($r('sys.color.font_primary'))
           .borderRadius(8)
           .onSelect((index: number, _value: string) => {
             const slots = this.favoriteSlots();
@@ -18792,7 +19883,8 @@ struct Index {
       .padding(10)
       .backgroundColor('#FFFFFF')
       .borderRadius(8)
-      .alignItems(HorizontalAlign.Start);
+      .alignItems(HorizontalAlign.Start)
+      .transition(feedbackTransition());
     }
   }
 
@@ -18845,7 +19937,8 @@ struct Index {
       .padding(10)
       .backgroundColor('#FFFFFF')
       .borderRadius(8)
-      .alignItems(HorizontalAlign.Start);
+      .alignItems(HorizontalAlign.Start)
+      .transition(feedbackTransition());
     }
   }
 
@@ -18909,7 +20002,8 @@ struct Index {
       .padding(10)
       .backgroundColor('#FFFFFF')
       .borderRadius(8)
-      .alignItems(HorizontalAlign.Start);
+      .alignItems(HorizontalAlign.Start)
+      .transition(feedbackTransition());
     }
   }
 
@@ -18981,7 +20075,8 @@ struct Index {
       .padding(10)
       .backgroundColor('#FFFFFF')
       .borderRadius(8)
-      .alignItems(HorizontalAlign.Start);
+      .alignItems(HorizontalAlign.Start)
+      .transition(feedbackTransition());
     }
   }
 
@@ -19275,10 +20370,10 @@ struct Index {
       Text(title)
         .layoutWeight(1)
         .fontSize(13)
-        .fontColor('#E8EAED');
+        .fontColor($r('sys.color.font_primary'));
       Text(value)
         .fontSize(12)
-        .fontColor(enabled ? '#9A7D8A' : '#6F5964');
+        .fontColor(enabled ? $r('sys.color.font_secondary') : $r('sys.color.font_tertiary'));
     }
     .width('100%');
   }
@@ -19294,19 +20389,19 @@ struct Index {
     Column({ space: 8 }) {
       this.ReaderSettingHeader(title, value);
       Select(options)
+        .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+        .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
         .selected(selected)
         .value(value)
         .height(36)
         .width('100%')
         .font({ size: 13 })
-        .fontColor('#E8EAED')
-        .selectedOptionBgColor('#C86B8C')
+        .fontColor($r('sys.color.font_primary'))
         .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-        .selectedOptionFontColor('#FFFFFF')
+        .selectedOptionFontColor('#C86B8C')
+        .selectedOptionBgColor('rgba(200,107,140,0.18)')
         .optionFont({ size: 13 })
-        .optionBgColor('#4E3A45')
-        .optionFontColor('#E8EAED')
-        .backgroundColor('#4E3A45')
+        .optionFontColor($r('sys.color.font_primary'))
         .borderRadius(8)
         .onSelect((index: number, _value: string) => {
           onSelect(index);
@@ -19314,7 +20409,7 @@ struct Index {
     }
     .width('100%')
     .padding(12)
-    .backgroundColor('#3A2A33')
+    .backgroundColor('rgba(127,127,127,0.10)')
     .borderRadius(6);
   }
 
@@ -19329,10 +20424,10 @@ struct Index {
       Text(title)
         .layoutWeight(1)
         .fontSize(13)
-        .fontColor(enabled ? '#E8EAED' : '#6F5964');
+        .fontColor(enabled ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'));
       Toggle({ type: ToggleType.Switch, isOn: value })
+        .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
         .selectedColor('#C86B8C')
-        .switchPointColor('#FFFFFF')
         .enabled(enabled)
         .onChange((isOn: boolean) => {
           onChange(isOn);
@@ -19356,11 +20451,10 @@ struct Index {
     Column({ space: 8 }) {
       this.ReaderSettingHeader(title, valueText, enabled);
       Slider({ value, min, max, step, style: SliderStyle.OutSet })
+        .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+        .selectedColor('#C86B8C')
         .width('100%')
         .enabled(enabled)
-        .selectedColor(enabled ? '#C86B8C' : '#4B5563')
-        .trackColor('#3A3D42')
-        .blockColor(enabled ? '#E8EAED' : '#6F5964')
         .showTips(true, valueText)
         .onChange((nextValue: number, mode: SliderChangeMode) => {
           if (mode !== SliderChangeMode.Begin) {
@@ -19370,7 +20464,7 @@ struct Index {
     }
     .width('100%')
     .padding(12)
-    .backgroundColor('#3A2A33')
+    .backgroundColor('rgba(127,127,127,0.10)')
     .borderRadius(6);
   }
 
@@ -19385,12 +20479,16 @@ struct Index {
     Button() {
       SymbolGlyph(symbol)
         .fontSize(19)
-        .fontColor([enabled ? (primary ? '#FFFFFF' : '#E8EAED') : '#7C6470']);
+        .fontWeight(primary ? FontWeight.Bold : FontWeight.Regular)
+        .fontColor([enabled ?
+          (primary ? $r('sys.color.ohos_id_color_text_primary_contrary') : $r('sys.color.font_primary')) :
+          $r('sys.color.font_tertiary')]);
     }
     .width(40)
     .height(40)
     .borderRadius(20)
-    .backgroundColor(enabled ? (primary ? '#C86B8C' : '#4E3A45') : '#3A2A33')
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(primary ? IMMERSIVE_SELECTED_MATERIAL : IMMERSIVE_SEARCH_MATERIAL)
     .enabled(enabled)
     .accessibilityText(label)
     .onClick(() => {
@@ -19410,11 +20508,16 @@ struct Index {
       Row({ space: 6 }) {
         SymbolGlyph(symbol)
           .fontSize(17)
-          .fontColor([enabled ? (primary ? '#FFFFFF' : '#E8EAED') : '#7C6470']);
+          .fontWeight(primary ? FontWeight.Bold : FontWeight.Regular)
+          .fontColor([enabled ?
+            (primary ? $r('sys.color.ohos_id_color_text_primary_contrary') : $r('sys.color.font_primary')) :
+            $r('sys.color.font_tertiary')]);
         Text(label)
           .fontSize(12)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(enabled ? (primary ? '#FFFFFF' : '#E8EAED') : '#7C6470')
+          .fontWeight(primary ? FontWeight.Bold : FontWeight.Medium)
+          .fontColor(enabled ?
+            (primary ? $r('sys.color.ohos_id_color_text_primary_contrary') : $r('sys.color.font_primary')) :
+            $r('sys.color.font_tertiary'))
           .maxLines(1);
       }
       .justifyContent(FlexAlign.Center);
@@ -19422,7 +20525,8 @@ struct Index {
     .height(40)
     .layoutWeight(1)
     .borderRadius(20)
-    .backgroundColor(enabled ? (primary ? '#C86B8C' : '#4E3A45') : '#3A2A33')
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(primary ? IMMERSIVE_SELECTED_MATERIAL : IMMERSIVE_SEARCH_MATERIAL)
     .enabled(enabled)
     .accessibilityText(label)
     .onClick(() => {
@@ -19495,7 +20599,7 @@ struct Index {
         }
         .width('100%')
         .padding(12)
-        .backgroundColor('#3A2A33')
+        .backgroundColor('rgba(127,127,127,0.10)')
         .borderRadius(6);
 
         Column({ space: 12 }) {
@@ -19503,9 +20607,9 @@ struct Index {
           Text(this.readerCacheSummaryText())
             .width('100%')
             .fontSize(11)
-            .fontColor('#9A7D8A')
+            .fontColor($r('sys.color.font_secondary'))
             .maxLines(2);
-          this.ReaderSwitchSetting('下载原图', this.readerUseOriginImage, true, (isOn: boolean): void => {
+          this.ReaderSwitchSetting('阅读原图', this.readerUseOriginImage, true, (isOn: boolean): void => {
             if (isOn !== this.readerUseOriginImage) {
               this.toggleReaderOriginImage();
             }
@@ -19514,7 +20618,7 @@ struct Index {
             .width('100%')
             .height(32)
             .fontSize(12)
-            .fontColor('#E8EAED')
+            .fontColor($r('sys.color.font_primary'))
             .backgroundColor('#4E3A45')
             .borderRadius(8)
             .onClick(() => {
@@ -19523,7 +20627,7 @@ struct Index {
         }
         .width('100%')
         .padding(12)
-        .backgroundColor('#3A2A33')
+        .backgroundColor('rgba(127,127,127,0.10)')
         .borderRadius(6);
 
         Column({ space: 12 }) {
@@ -19575,7 +20679,7 @@ struct Index {
         }
         .width('100%')
         .padding(12)
-        .backgroundColor('#3A2A33')
+        .backgroundColor('rgba(127,127,127,0.10)')
         .borderRadius(6);
 
         this.ReaderSliderSetting(
@@ -19595,7 +20699,7 @@ struct Index {
       .alignItems(HorizontalAlign.Start);
     }
     .width('100%')
-    .height(320)
+    .height(Math.min(320, Math.max(100, this.readerViewportHeight * 0.38)))
     .edgeEffect(EdgeEffect.Spring);
   }
 
@@ -19789,6 +20893,7 @@ struct Index {
           Column({ space: 10 }) {
             if (loading) {
               LoadingProgress()
+                .color('#C86B8C')
                 .width(40)
                 .height(40);
             }
@@ -19826,6 +20931,7 @@ struct Index {
       Math.abs(this.readerDragOffset) < 1) {
       Column({ space: 10 }) {
         LoadingProgress()
+          .color('#C86B8C')
           .width(42)
           .height(42);
         Text(this.readerLoadingText())
@@ -19879,7 +20985,7 @@ struct Index {
   }
 
   @Builder
-  private ReaderFullscreenControlsContent(): void {
+  private ReaderFullscreenTitleBarContent(): void {
     Column({ space: 0 }) {
       if (this.readerShowBattery || this.readerShowProgress || this.readerShowClock) {
         Row({ space: 10 }) {
@@ -19888,16 +20994,16 @@ struct Index {
               if (this.readerShowBattery) {
                 Text(this.readerBatteryText)
                   .fontSize(12)
-                  .fontColor('#E8EAED');
+                  .fontColor($r('sys.color.font_primary'));
               }
               if (this.readerShowClock) {
                 Text(this.readerNowText)
                   .fontSize(12)
-                  .fontColor('#E8EAED');
+                  .fontColor($r('sys.color.font_primary'));
               }
             }
             .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-            .backgroundColor('#7A2D3135')
+            .systemMaterial(IMMERSIVE_TOOLBAR_MATERIAL)
             .borderRadius(14);
           }
 
@@ -19909,39 +21015,45 @@ struct Index {
             Text(this.readerProgressText())
               .fontSize(12)
               .fontWeight(FontWeight.Medium)
-              .fontColor('#E8EAED')
+              .fontColor($r('sys.color.font_primary'))
               .textAlign(TextAlign.End)
               .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-              .backgroundColor('#7A2D3135')
+              .systemMaterial(IMMERSIVE_TOOLBAR_MATERIAL)
               .borderRadius(14);
           } else {
             Text(this.readerPageInfoText())
               .fontSize(12)
               .fontWeight(FontWeight.Medium)
-              .fontColor('#E8EAED')
+              .fontColor($r('sys.color.font_primary'))
               .textAlign(TextAlign.End)
               .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-              .backgroundColor('#7A2D3135')
+              .systemMaterial(IMMERSIVE_TOOLBAR_MATERIAL)
               .borderRadius(14);
           }
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 12, bottom: 10 })
         .opacity(this.readerTopInfoVisible ? 1 : 0)
+        .translate({ y: this.readerTopInfoVisible ? 0 : -8 })
         .animation({ duration: 240, curve: Curve.EaseOut });
       }
 
-      Blank()
-        .layoutWeight(1)
-        .hitTestBehavior(HitTestMode.None);
+    }
+    .width('100%')
+    .height(52)
+    .hitTestBehavior(HitTestMode.BLOCK_DESCENDANTS);
+  }
 
+  @Builder
+  private ReaderFullscreenStatusBarContent(): void {
+    Column({ space: 0 }) {
       if (this.shouldShowReaderGlobalLoading()) {
         Text(this.readerLoadingText())
           .width('100%')
           .fontSize(12)
-          .fontColor('#DADCE0')
+          .fontColor($r('sys.color.font_primary'))
           .padding({ left: 16, right: 16, top: 8, bottom: 8 })
-          .backgroundColor('#9416181A');
+          .backgroundColor(Color.Transparent);
       }
 
       if (this.readerCurrentError.length > 0) {
@@ -19949,12 +21061,12 @@ struct Index {
           Text(this.readerCurrentError)
             .layoutWeight(1)
             .fontSize(12)
-            .fontColor('#FEE4E2')
+            .fontColor($r('sys.color.font_primary'))
             .maxLines(2);
           Button('重试')
             .height(28)
             .fontSize(12)
-            .fontColor('#E8EAED')
+            .fontColor($r('sys.color.font_primary'))
             .backgroundColor('#B54708')
             .borderRadius(6)
             .onClick(() => {
@@ -19963,93 +21075,101 @@ struct Index {
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: 8 })
-        .backgroundColor('#A5331818');
-      }
-
-      if (this.readerMenuVisible || !this.readerReadingFullscreen) {
-        Column({ space: 10 }) {
-          Row({ space: 12 }) {
-            Column({ space: 4 }) {
-              Text('阅读器')
-                .fontSize(14)
-                .fontWeight(FontWeight.Medium)
-                .fontColor('#E8EAED')
-                .maxLines(1);
-              Text(this.readerBottomHintText())
-                .fontSize(11)
-                .fontColor('#9A7D8A')
-                .maxLines(1);
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start);
-
-            this.ReaderIconButton($r('sys.symbol.eye'), '详情', true, false, (): void => {
-                this.handleNativeTitleBarBack();
-              });
-            this.ReaderIconButton($r('sys.symbol.gearshape_fill'), this.readerSettingsVisible ? '关闭设置' : '设置', true, this.readerSettingsVisible, (): void => {
-                this.toggleReaderSettingsPanel();
-              });
-          }
-          .width('100%');
-
-          Text(this.readerCacheSummaryText())
-            .width('100%')
-            .fontSize(11)
-            .fontColor('#9A7D8A')
-            .maxLines(1);
-
-          Row({ space: 8 }) {
-            TextInput({ text: this.readerJumpInput, placeholder: '页码' })
-              .layoutWeight(1)
-              .height(34)
-              .backgroundColor('#4E3A45')
-              .fontColor('#E8EAED')
-              .borderRadius(6)
-              .fontSize(13)
-              .onChange((value: string) => {
-                this.readerJumpInput = value;
-              });
-            this.ReaderIconButton($r('sys.symbol.arrow_clockwise'), '跳转', true, true, (): void => {
-                void this.jumpNativeReader();
-              });
-            this.ReaderFilledButton(
-              this.readerAutoTransferring ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
-              this.readerAutoTransferLabel(),
-              true,
-              this.readerAutoTransferring,
-              (): void => {
-                this.toggleReaderAutoTransfer();
-              }
-            );
-          }
-          .width('100%');
-
-          Row({ space: 8 }) {
-            this.ReaderFilledButton($r('sys.symbol.chevron_left'), '上一页', this.canShiftNativeReaderBackward(), false, (): void => {
-                this.goReaderPrevious();
-              });
-            this.ReaderIconButton($r('sys.symbol.arrow_up_left_and_arrow_down_right'), this.readerFitContain ? '填充' : '适应', true, false, (): void => {
-                this.toggleReaderFit();
-              });
-            this.ReaderFilledButton($r('sys.symbol.chevron_right'), '下一页', this.canShiftNativeReaderForward(), true, (): void => {
-                this.goReaderNext();
-              });
-          }
-          .width('100%');
-
-          if (this.readerSettingsVisible) {
-            this.ReaderSettingsPanel();
-          }
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 14 })
-        .backgroundColor('#D9111315')
-        .alignItems(HorizontalAlign.Start);
+        .backgroundColor(Color.Transparent);
       }
     }
+    .width('100%');
+  }
+
+  @Builder
+  private ReaderFullscreenMenuBarContent(): void {
+    Column({ space: 10 }) {
+      Row({ space: 12 }) {
+        Column({ space: 4 }) {
+          Text('阅读器')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+            .maxLines(1);
+          Text(this.readerBottomHintText())
+            .fontSize(11)
+            .fontColor($r('sys.color.font_secondary'))
+            .maxLines(1);
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start);
+
+        this.ReaderIconButton($r('sys.symbol.eye'), '详情', true, false, (): void => {
+            this.handleNativeTitleBarBack();
+          });
+        this.ReaderIconButton($r('sys.symbol.gearshape_fill'), this.readerSettingsVisible ? '关闭设置' : '设置', true, this.readerSettingsVisible, (): void => {
+            this.toggleReaderSettingsPanel();
+          });
+      }
+      .width('100%');
+
+      Text(this.readerCacheSummaryText())
+        .width('100%')
+        .fontSize(11)
+        .fontColor($r('sys.color.font_secondary'))
+        .maxLines(1);
+
+      Row({ space: 8 }) {
+        TextInput({ text: this.readerJumpInput, placeholder: '页码' })
+          .caretColor('#C86B8C')
+          .selectedBackgroundColor('rgba(200,107,140,0.24)')
+          .layoutWeight(1)
+          .height(34)
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .fontColor($r('sys.color.font_primary'))
+          .borderRadius(6)
+          .fontSize(13)
+          .onChange((value: string) => {
+            this.readerJumpInput = value;
+          });
+        this.ReaderIconButton($r('sys.symbol.arrow_clockwise'), '跳转', true, true, (): void => {
+            void this.jumpNativeReader();
+          });
+        this.ReaderFilledButton(
+          this.readerAutoTransferring ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'),
+          this.readerAutoTransferLabel(),
+          true,
+          this.readerAutoTransferring,
+          (): void => {
+            this.toggleReaderAutoTransfer();
+          }
+        );
+      }
+      .width('100%');
+
+      Row({ space: 8 }) {
+        this.ReaderFilledButton($r('sys.symbol.chevron_left'), '上一页', this.canShiftNativeReaderBackward(), false, (): void => {
+            this.goReaderPrevious();
+          });
+        this.ReaderIconButton($r('sys.symbol.arrow_up_left_and_arrow_down_right'), this.readerFitContain ? '填充' : '适应', true, false, (): void => {
+            this.toggleReaderFit();
+          });
+        this.ReaderFilledButton($r('sys.symbol.chevron_right'), '下一页', this.canShiftNativeReaderForward(), true, (): void => {
+            this.goReaderNext();
+          });
+      }
+      .width('100%');
+
+      Column() {
+        this.ReaderSettingsPanel();
+      }
+      .width('100%')
+      .height(this.readerSettingsVisible ? Math.min(320, Math.max(100, this.readerViewportHeight * 0.38)) : 0)
+      .opacity(this.readerSettingsVisible ? 1 : 0)
+      .translate({ y: this.readerSettingsVisible ? 0 : 8 })
+      .clip(true)
+      .hitTestBehavior(this.readerSettingsVisible ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+      .animation({ duration: 240, curve: Curve.EaseOut });
+    }
     .width('100%')
-    .height('100%')
-    .hitTestBehavior(HitTestMode.None);
+    .padding({ left: 16, right: 16, top: 12, bottom: 14 })
+    .backgroundColor(Color.Transparent)
+    .alignItems(HorizontalAlign.Start);
   }
 
   @Builder
@@ -20057,6 +21177,10 @@ struct Index {
     ReaderFullscreenPage({
       customLightness: this.readerCustomScreenLightness,
       overlayMaskColor: this.readerOverlayMaskColor(),
+      titleBarVisible: this.readerShowBattery || this.readerShowProgress || this.readerShowClock,
+      bottomBarVisible: this.readerMenuVisible || !this.readerReadingFullscreen ||
+        this.shouldShowReaderGlobalLoading() || this.readerCurrentError.length > 0,
+      menuBarVisible: this.readerMenuVisible || !this.readerReadingFullscreen,
       onReaderAreaChange: (_: Area, value: Area): void => {
         const nextWidth = Math.max(1, Number(value.width));
         const nextHeight = Math.max(1, Number(value.height));
@@ -20073,8 +21197,14 @@ struct Index {
       loadingOverlayContent: (): void => {
         this.ReaderLoadingOverlay();
       },
-      controlsContent: (): void => {
-        this.ReaderFullscreenControlsContent();
+      titleBarContent: (): void => {
+        this.ReaderFullscreenTitleBarContent();
+      },
+      statusBarContent: (): void => {
+        this.ReaderFullscreenStatusBarContent();
+      },
+      menuBarContent: (): void => {
+        this.ReaderFullscreenMenuBarContent();
       }
     });
   }
@@ -20111,6 +21241,8 @@ struct Index {
 
       Row({ space: 8 }) {
         TextInput({ text: this.readerJumpInput, placeholder: '页码' })
+          .caretColor('#C86B8C')
+          .selectedBackgroundColor('rgba(200,107,140,0.24)')
           .layoutWeight(1)
           .height(34)
           .backgroundColor('#F8F8F8')
@@ -20374,7 +21506,7 @@ struct Index {
         activeContentEndOffset: this.pageContentEndOffset() + 12,
         activeLoading: this.shouldShowDownloadStateLoading(),
         managerStatus: this.effectiveDownloadManagerStatus(),
-        downloadRootText: this.downloadRoot(),
+        downloadRootText: this.downloadDirectoryStatus,
         revision: this.downloadQueueRevision + this.downloadRuntimeRevision,
         imageUrlForCover: (value: string): string => this.galleryImageDisplayUrl(value),
         siteDisplayNameForItem: (item: DownloadQueueItem): string => this.siteDisplayName(item.site),
@@ -20385,6 +21517,7 @@ struct Index {
         speedTextForItem: (item: DownloadQueueItem): string => formatBytesPerSecond(item.speedBytesPerSecond),
         remainingTextForItem: (item: DownloadQueueItem): string => formatRemainingSeconds(item.remainingSeconds),
         isItemRunning: (item: DownloadQueueItem): boolean => this.isDownloadItemRunning(item),
+        isItemQueued: (item: DownloadQueueItem): boolean => this.isDownloadItemQueued(item),
         onViewModeChange: (value: string): void => {
           this.setDownloadViewMode(value);
         },
@@ -20402,6 +21535,9 @@ struct Index {
         },
         onOpenItemDetail: (item: DownloadQueueItem): void => {
           void this.openStoredGalleryInNative(item);
+        },
+        onOpenDownloadDirectory: (): void => {
+          void this.openDownloadDirectoryInFileManager();
         },
         onRemoveItem: (item: DownloadQueueItem): void => {
           this.removeDownloadItem(item);
@@ -20620,7 +21756,8 @@ struct Index {
             .width('100%')
             .padding(16);
         }
-        .height(undefined);
+        .height(undefined)
+        .transition(feedbackTransition());
       } else {
         ForEach(this.bookmarks, (item: BookmarkItem) => {
           ListItem({ style: ListItemStyle.CARD }) {
@@ -20649,9 +21786,11 @@ struct Index {
             }
             .width('100%')
             .constraintSize({ minHeight: 76 })
-            .padding(16);
+            .padding(16)
+            .geometryTransition(`bookmark-row:${item.url}`);
           }
           .height(undefined)
+          .transition(listItemTransition())
           .accessibilityText(`打开书签 ${item.title}`)
           .onClick(() => {
             this.openBookmarkDestination(item.url, item.title);
@@ -20668,7 +21807,9 @@ struct Index {
             },
             edgeEffect: SwipeEdgeEffect.Spring
           })
-          .bindContextMenu(this.BookmarkContextMenu(item), ResponseType.LongPress);
+          .bindContextMenu(this.BookmarkContextMenu(item), ResponseType.LongPress, {
+            systemMaterial: IMMERSIVE_MENU_MATERIAL
+          });
         }, (item: BookmarkItem) => item.url);
       }
     }
@@ -20761,19 +21902,18 @@ struct Index {
       .width('100%');
 
       Select(this.favoriteFilterSelectOptions())
+        .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+        .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
         .selected(this.favoriteFilterSelectedIndex())
         .value(this.favoriteFilterSummary())
         .height(36)
         .width('100%')
         .font({ size: 13 })
-        .fontColor('#2B2027')
-        .selectedOptionBgColor('#C86B8C')
+        .fontColor($r('sys.color.font_primary'))
         .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-        .selectedOptionFontColor('#FFFFFF')
+        .selectedOptionFontColor($r('sys.color.font_primary'))
         .optionFont({ size: 13 })
-        .optionBgColor('#FFFFFF')
-        .optionFontColor('#2B2027')
-        .backgroundColor('#FFFFFF')
+        .optionFontColor($r('sys.color.font_primary'))
         .borderRadius(8)
         .onSelect((index: number, _value: string) => {
           const options = this.favoriteFilterOptions();
@@ -20839,7 +21979,9 @@ struct Index {
       .height('100%');
     } else if (this.libraryPanel === LIBRARY_HISTORY) {
       this.HistorySection();
-    } else if (this.effectiveDownloadViewMode() === DOWNLOAD_VIEW_ACTIVE) {
+    } else if (this.effectiveDownloadViewMode() === DOWNLOAD_VIEW_ACTIVE ||
+      (!this.shouldShowDownloadStateLoading() &&
+        !this.downloadItemsSource().some((item: DownloadQueueItem): boolean => item.status === DOWNLOAD_STATUS_DONE))) {
       Column() {
         this.DownloadQueueSection();
       }
@@ -20952,7 +22094,8 @@ struct Index {
     .padding(12)
     .backgroundColor('#FFFFFF')
     .borderRadius(8)
-    .alignItems(VerticalAlign.Center);
+    .alignItems(VerticalAlign.Center)
+    .transition(feedbackTransition());
   }
 
   @Builder
@@ -20964,7 +22107,8 @@ struct Index {
       .width('100%')
       .padding(12)
       .backgroundColor(isError ? '#FFF3F2' : '#FFFFFF')
-      .borderRadius(8);
+      .borderRadius(8)
+      .transition(feedbackTransition());
   }
 
   @Builder
@@ -21037,32 +22181,101 @@ struct Index {
       }
     }
     .width('100%')
-    .alignItems(HorizontalAlign.Start);
+    .alignItems(HorizontalAlign.Start)
+    .transition(contentAppearTransition());
+  }
+
+  @Builder
+  private TopListControls(): void {
+    ImmersiveTitleSurface({
+      surfaceHeight: TOP_LIST_CONTROL_HEIGHT,
+      content: (): void => {
+        this.TopListControlsContent();
+      }
+    });
+  }
+
+  @Builder
+  private TopListControlsContent(): void {
+    Row({ space: 8 }) {
+      if (this.topListError.length > 0) {
+        Text('排行榜')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('sys.color.font_primary'))
+          .layoutWeight(1);
+      } else {
+        Select(this.topListGroupSelectOptions())
+          .systemMaterial(IMMERSIVE_RANKING_CONTROL_MATERIAL)
+          .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
+          .selected(this.topListGroupSelectedIndex())
+          .value(this.topListGroupSummary())
+          .height(TOP_LIST_CONTROL_HEIGHT)
+          .layoutWeight(1)
+          .font({ size: 13 })
+          .fontColor($r('sys.color.font_primary'))
+          .controlSize(ControlSize.SMALL)
+          .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
+          .selectedOptionFontColor($r('sys.color.font_primary'))
+          .optionFont({ size: 13 })
+          .optionFontColor($r('sys.color.font_primary'))
+          .menuAlign(MenuAlignType.START, { dx: 0, dy: 8 })
+          .optionWidth(OptionWidthMode.FIT_TRIGGER)
+          .showInSubWindow(true)
+          .showDefaultSelectedIcon(true)
+          .borderRadius(TOP_LIST_CONTROL_HEIGHT / 2)
+          .shadow({ radius: 0 })
+          .accessibilityText('切换排行榜')
+          .enabled(!this.topListLoading)
+          .onSelect((index: number, _value: string) => {
+            this.selectTopListGroupByIndex(index);
+          });
+      }
+      Button({ type: ButtonType.Normal }) {
+        SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+          .fontSize(18)
+          .fontColor([$r('sys.color.icon_primary')]);
+      }
+        .width(TOP_LIST_CONTROL_HEIGHT)
+        .height(TOP_LIST_CONTROL_HEIGHT)
+        .buttonStyle(ButtonStyleMode.NORMAL)
+        .systemMaterial(IMMERSIVE_RANKING_CONTROL_MATERIAL)
+        .accessibilityText('刷新排行榜')
+        .enabled(!this.topListLoading)
+        .borderRadius(TOP_LIST_CONTROL_HEIGHT / 2)
+        .shadow({ radius: 0 })
+        .onClick(() => {
+          void this.loadTopList();
+        });
+    }
+    .width('100%')
+    .height(TOP_LIST_CONTROL_HEIGHT);
   }
 
   @Builder
   private TopListSection(): void {
     Column({ space: 12 }) {
+      if (this.topListDetail.groups.length > 0 || this.topListError.length > 0) {
+        this.TopListControls();
+      }
+      ContentTransition({
+        changeKey: `${this.topListGroupIndex}:${this.topListPeriodSelectedIndex()}`,
+        animateOnAppear: false,
+        content: (): void => {
+          this.TopListContent();
+        }
+      });
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start);
+  }
+
+  @Builder
+  private TopListContent(): void {
+    Column({ space: 12 }) {
       if (this.topListLoading) {
         this.TopListLoadingCard('正在加载排行榜...');
       } else if (this.topListError.length > 0) {
-        Row({ space: 8 }) {
-          Text('排行榜')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#2B2027')
-            .layoutWeight(1);
-          Button('刷新')
-            .height(28)
-            .fontSize(12)
-            .fontColor('#2B2027')
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
-            .borderRadius(8)
-            .onClick(() => {
-              void this.loadTopList();
-            });
-        }
-        .width('100%');
         Text(this.topListError)
           .fontSize(13)
           .lineHeight(20)
@@ -21070,63 +22283,11 @@ struct Index {
           .width('100%')
           .padding(12)
           .backgroundColor('#FFF3F2')
-          .borderRadius(8);
+          .borderRadius(8)
+          .transition(feedbackTransition());
       } else if (this.topListDetail.groups.length === 0) {
         this.TopListStatusCard('还没有排行榜数据。');
       } else {
-        Row({ space: 8 }) {
-          Select(this.topListGroupSelectOptions())
-            .selected(this.topListGroupSelectedIndex())
-            .value(this.topListGroupSummary())
-            .height(36)
-            .layoutWeight(1)
-            .font({ size: 13 })
-            .fontColor($r('sys.color.font_primary'))
-            .controlSize(ControlSize.SMALL)
-            .selectedOptionFont({ size: 13, weight: FontWeight.Medium })
-            .selectedOptionFontColor($r('sys.color.font_primary'))
-            .optionFont({ size: 13 })
-            .optionFontColor($r('sys.color.font_primary'))
-            .menuBackgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THICK)
-            .menuAlign(MenuAlignType.START, { dx: 0, dy: 8 })
-            .optionWidth(OptionWidthMode.FIT_TRIGGER)
-            .showInSubWindow(true)
-            .showDefaultSelectedIcon(true)
-            .borderRadius(8)
-            .onSelect((index: number, _value: string) => {
-              this.selectTopListGroupByIndex(index);
-            });
-          Button() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(18)
-              .fontColor([$r('sys.color.icon_primary')]);
-          }
-            .width(36)
-            .height(36)
-            .accessibilityText('刷新排行榜')
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
-            .borderRadius(8)
-            .onClick(() => {
-              void this.loadTopList();
-            });
-        }
-        .width('100%');
-
-        Column() {
-          SegmentButton({
-            options: this.topListPeriodSegmentOptions,
-            selectedIndexes: $topListPeriodSelectedIndexes,
-            onItemClicked: (index: number): void => {
-              this.topListPeriodSelectedIndexes = [index];
-              this.syncTopListPeriodSelectedIndex();
-              this.loadCurrentTopListGalleryPeriod();
-            }
-          })
-            .width('100%');
-        }
-        .width('100%')
-        .clip(true);
-
         if (this.shouldShowCurrentTopListGalleryWaterfall()) {
           this.LocalFilterStatusCard(this.topListGalleryFilteredCount);
           HomeGalleryPage({
@@ -21183,7 +22344,8 @@ struct Index {
             }, (entry: NativeTopListEntry) => `${entry.rank}-${entry.url}`);
           }
           .width('100%')
-          .alignItems(HorizontalAlign.Start);
+          .alignItems(HorizontalAlign.Start)
+          .transition(contentAppearTransition());
         }
       }
     }
@@ -21220,8 +22382,8 @@ struct Index {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start);
       Toggle({ type: ToggleType.Switch, isOn: value })
+        .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
         .height(48)
-        .selectedColor('#C86B8C')
         .accessibilityText(title)
         .onChange((isOn: boolean) => {
           onChange(isOn);
@@ -21617,8 +22779,7 @@ struct Index {
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start);
         Toggle({ type: ToggleType.Switch, isOn: value })
-          .selectedColor('#C86B8C')
-          .switchPointColor('#FFFFFF')
+          .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
           .responseRegion({ x: 0, y: -8, width: '100%', height: 48 })
           .accessibilityText(title)
           .onChange((isOn: boolean) => {
@@ -21648,13 +22809,14 @@ struct Index {
             .fontSize(16)
             .fontColor($r('sys.color.font_primary'));
           Select([{ value: '外站 E-Hentai' }, { value: '里站 ExHentai' }])
+            .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+            .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
             .selected(this.siteMode === GallerySite.EX ? 1 : 0)
             .value(this.siteMode === GallerySite.EX ? '里站 ExHentai' : '外站 E-Hentai')
             .height(48)
             .font({ size: 14 })
             .fontColor($r('sys.color.font_primary'))
-            .selectedOptionFontColor('#A85474')
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .selectedOptionFontColor($r('sys.color.font_primary'))
             .accessibilityText('当前站点')
             .onSelect((index: number, _value: string) => {
               const site = index === 1 ? GallerySite.EX : GallerySite.E;
@@ -21722,28 +22884,33 @@ struct Index {
     .divider({ strokeWidth: 0.5, color: $r('sys.color.comp_divider'), startMargin: 20, endMargin: 20 });
   }
 
+  private currentFilterRule(rule: FilterRule): FilterRule {
+    // Stable row identity must still read the latest replacement snapshot.
+    return this.filterRules.find((item: FilterRule) => item.id === rule.id) ?? rule;
+  }
+
   @Builder
   private FilterRuleRow(rule: FilterRule): void {
     Column({ space: 8 }) {
       Row({ space: 16 }) {
         Column({ space: 6 }) {
-          Text(rule.text)
+          Text(this.currentFilterRule(rule).text)
             .fontSize(16)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_primary'));
-          Text(rule.enabled ? '已启用' : '已停用')
+          Text(this.currentFilterRule(rule).enabled ? '已启用' : '已停用')
             .fontSize(13)
             .fontColor($r('sys.color.font_secondary'));
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start);
-        Toggle({ type: ToggleType.Switch, isOn: rule.enabled })
+        Toggle({ type: ToggleType.Switch, isOn: this.currentFilterRule(rule).enabled })
+          .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
           .height(48)
-          .selectedColor('#C86B8C')
-          .accessibilityText(`启用过滤规则 ${rule.text}`)
+          .accessibilityText(`启用过滤规则 ${this.currentFilterRule(rule).text}`)
           .enabled(!this.filterRulesSaving)
           .onChange((isOn: boolean) => {
-            void this.setFilterRuleEnabled(rule, isOn);
+            void this.setFilterRuleEnabled(this.currentFilterRule(rule), isOn);
           });
       }
       .width('100%')
@@ -21754,15 +22921,17 @@ struct Index {
         .fontSize(14)
         .backgroundColor($r('sys.color.comp_background_tertiary'))
         .fontColor('#B42318')
-        .accessibilityText(`删除过滤规则 ${rule.text}`)
+        .accessibilityText(`删除过滤规则 ${this.currentFilterRule(rule).text}`)
         .enabled(!this.filterRulesSaving)
         .onClick(() => {
-          void this.deleteFilterRule(rule);
+          void this.deleteFilterRule(this.currentFilterRule(rule));
         });
     }
     .width('100%')
     .padding({ top: 12, bottom: 12 })
-    .alignItems(HorizontalAlign.Start);
+    .alignItems(HorizontalAlign.Start)
+    .geometryTransition(`filter-rule:${rule.id}`)
+    .transition(listItemTransition());
   }
 
   @Builder
@@ -21788,17 +22957,17 @@ struct Index {
         Column({ space: 8 }) {
           this.ManagementFieldLabel('匹配方式');
           Select(this.filterModeSelectOptions())
+            .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+            .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
             .selected(this.filterModeSelectedIndex())
             .value(this.filterModeLabel(this.filterModeDraft))
             .height(48)
             .width('100%')
             .font({ size: 16 })
             .fontColor($r('sys.color.font_primary'))
-            .selectedOptionBgColor('#C86B8C')
-            .selectedOptionFontColor('#FFFFFF')
+            .selectedOptionFontColor($r('sys.color.font_primary'))
             .optionFont({ size: 16 })
             .optionFontColor($r('sys.color.font_primary'))
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
             .borderRadius(12)
             .accessibilityText('过滤规则匹配方式')
             .onSelect((index: number, _value: string) => {
@@ -21835,7 +23004,8 @@ struct Index {
           .width('100%')
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 1, color: $r('sys.color.comp_divider') })
-          .borderRadius(12);
+          .borderRadius(12)
+          .transition(feedbackTransition());
         }
 
         Button('添加规则')
@@ -21916,7 +23086,8 @@ struct Index {
           .fontColor($r('sys.color.font_secondary'))
           .padding(24)
           .backgroundColor($r('sys.color.comp_background_primary'))
-          .borderRadius(12);
+          .borderRadius(12)
+          .transition(feedbackTransition());
       } else {
         ForEach(FILTER_MODE_OPTIONS, (option: FilterModeOption) => {
           if (this.filterRulesForMode(option.mode).length > 0) {
@@ -21925,18 +23096,19 @@ struct Index {
                 .fontSize(17)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_primary'));
-              ForEach(this.filterRulesForMode(option.mode), (rule: FilterRule, index: number) => {
-                if (index > 0) {
+              ForEach(this.filterRulesForMode(option.mode), (rule: FilterRule) => {
+                if (this.filterRulesForMode(option.mode)[0]?.id !== rule.id) {
                   Divider().color($r('sys.color.comp_divider'));
                 }
                 this.FilterRuleRow(rule);
-              }, (rule: FilterRule) => `${rule.id}:${rule.enabled ? '1' : '0'}`);
+              }, (rule: FilterRule) => `${rule.id}`);
             }
             .width('100%')
             .padding(16)
             .backgroundColor($r('sys.color.comp_background_primary'))
             .borderRadius(12)
-            .alignItems(HorizontalAlign.Start);
+            .alignItems(HorizontalAlign.Start)
+            .transition(feedbackTransition());
           }
         }, (option: FilterModeOption) => `${option.mode}`);
       }
@@ -21976,7 +23148,9 @@ struct Index {
     }
     .width('100%')
     .constraintSize({ minHeight: 72 })
-    .padding({ top: 12, bottom: 12 });
+    .padding({ top: 12, bottom: 12 })
+    .geometryTransition(`blacklist:${item.id}`)
+    .transition(listItemTransition());
   }
 
   @Builder
@@ -22055,15 +23229,16 @@ struct Index {
           .fontColor($r('sys.color.font_secondary'))
           .padding(24)
           .backgroundColor($r('sys.color.comp_background_primary'))
-          .borderRadius(12);
+          .borderRadius(12)
+          .transition(feedbackTransition());
       } else {
         Column({ space: 4 }) {
           Text(`已屏蔽 ${this.blacklistItems.length} 位用户`)
             .fontSize(17)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_primary'));
-          ForEach(this.blacklistItems, (item: BlacklistItem, index: number) => {
-            if (index > 0) {
+          ForEach(this.blacklistItems, (item: BlacklistItem) => {
+            if (this.blacklistItems[0]?.id !== item.id) {
               Divider().color($r('sys.color.comp_divider'));
             }
             this.BlacklistRow(item);
@@ -22073,7 +23248,8 @@ struct Index {
         .padding(16)
         .backgroundColor($r('sys.color.comp_background_primary'))
         .borderRadius(12)
-        .alignItems(HorizontalAlign.Start);
+        .alignItems(HorizontalAlign.Start)
+        .transition(feedbackTransition());
       }
     }
     .width('100%')
@@ -22175,22 +23351,32 @@ struct Index {
           Text('下载目录')
             .fontSize(16)
             .fontColor($r('sys.color.font_primary'));
-          TextInput({ text: this.downloadDirectoryPath, placeholder: '留空使用应用默认目录' })
+          Text(this.downloadDirectoryStatus)
             .width('100%')
-            .height(48)
             .fontSize(14)
-            .fontColor($r('sys.color.font_primary'))
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
-            .accessibilityText('下载目录')
-            .onChange((value: string) => {
-              this.downloadDirectoryPath = value;
-              this.writeValue('download_directory_path', value);
-            });
-          Text(`默认：${this.abilityFilesDir()}/${READER_DOWNLOAD_DIR_NAME}`)
+            .lineHeight(20)
+            .fontColor($r('sys.color.font_primary'));
+          if (this.downloadDirectoryPath.length > 0) {
+            Text(this.downloadDirectoryPath)
+              .width('100%')
+              .fontSize(12)
+              .lineHeight(18)
+              .copyOption(CopyOptions.LocalDevice)
+              .fontColor($r('sys.color.font_secondary'));
+          }
+          Text('新下载的图片和 Torrent 保存在系统下载目录，可在文件 App 中浏览。已有下载继续使用原目录。')
             .width('100%')
             .fontSize(12)
             .lineHeight(18)
             .fontColor($r('sys.color.font_secondary'));
+          if (this.downloadDirectoryPath.length === 0) {
+            Button(this.downloadDirectoryPreparing ? '正在准备下载目录' : '重试准备下载目录')
+              .enabled(!this.downloadDirectoryPreparing)
+              .height(40)
+              .onClick((): void => {
+                void this.preparePublicDownloadDirectory();
+              });
+          }
         }
         .width('100%')
         .padding({ left: 12, right: 12, top: 12, bottom: 12 })
@@ -22204,13 +23390,14 @@ struct Index {
             .fontSize(16)
             .fontColor($r('sys.color.font_primary'));
           Select(this.downloadConcurrencySelectOptions())
+            .systemMaterial(IMMERSIVE_CONTROL_MATERIAL)
+            .menuSystemMaterial(IMMERSIVE_MENU_MATERIAL)
             .selected(this.downloadConcurrency - 1)
             .value(`${this.downloadConcurrency} 个线程`)
             .height(48)
             .font({ size: 14 })
             .fontColor($r('sys.color.font_primary'))
-            .selectedOptionFontColor('#A85474')
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .selectedOptionFontColor($r('sys.color.font_primary'))
             .accessibilityText('并发下载线程数')
             .onSelect((index: number, _value: string) => {
               const next = clampNumber(index + 1, 1, DOWNLOAD_MAX_CONCURRENCY);
@@ -22224,13 +23411,20 @@ struct Index {
         .padding({ left: 12, right: 12, top: 8, bottom: 8 });
       }
       .height(undefined);
-      this.SettingsSwitchItem('下载原图', '优先获取画廊的原始图片', this.downloadUseOriginImage,
-        (isOn: boolean): void => {
-          if (isOn !== this.downloadUseOriginImage) {
-            this.downloadUseOriginImage = isOn;
-            this.writeValue('download_origin_image', isOn);
-          }
-        });
+      ListItem({ style: ListItemStyle.CARD }) {
+        Column({ space: 6 }) {
+          Text('下载画质')
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'));
+          Text('每次添加下载时选择原图或压缩图，继续和重试会保留该任务的选择。')
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'));
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .padding(12);
+      }
+      .height(undefined);
       ListItem({ style: ListItemStyle.CARD }) {
         Column({ space: 10 }) {
           Text('下载队列 CSV')
@@ -22505,7 +23699,7 @@ struct Index {
                   barBottomMargin: this.systemSafeBottom,
                   systemMaterialEffect: {
                     materialType: hdsMaterial.MaterialType.ADAPTIVE,
-                    materialLevel: this.customMaterialLevel
+                    materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
                   }
                 })
                 .onTabBarClick((index: number) => {
@@ -22526,7 +23720,9 @@ struct Index {
             .titleMode(this.currentTitleMode())
             .bindSheet($$this.watchedTagSheetVisible, this.WatchedTagSheetContent(), {
               mode: SheetMode.OVERLAY,
-              height: '78%',
+              height: SheetSize.MEDIUM,
+              detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+              systemMaterial: IMMERSIVE_SHEET_MATERIAL,
               dragBar: true,
               showClose: true,
               preferType: SheetType.BOTTOM,

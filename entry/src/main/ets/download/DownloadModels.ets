@@ -1,6 +1,7 @@
 import { LocalGalleryRecord } from '../models/LocalModels';
 
 export interface DownloadQueueItem extends LocalGalleryRecord {
+  imageQuality: string;
   status: string;
   label: string;
   queuedAt: string;

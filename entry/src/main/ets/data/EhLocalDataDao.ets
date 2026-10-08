@@ -73,8 +73,9 @@ export class EhLocalDataDao {
         'status TEXT NOT NULL, label TEXT NOT NULL, queued_at TEXT, last_action TEXT, ' +
         'downloaded INTEGER, total INTEGER, failed_count INTEGER, archive_uri TEXT, created_at TEXT, updated_at TEXT, ' +
         'current_page INTEGER, current_page_label TEXT, speed_bps REAL, remaining_seconds INTEGER, ' +
-        'download_dir TEXT, error TEXT, page_errors TEXT)'
+        "download_dir TEXT, error TEXT, page_errors TEXT, image_quality TEXT DEFAULT '')"
     );
+    await this.ensureDownloadImageQualityColumn();
     await this.store.executeSql(
       `CREATE TABLE IF NOT EXISTS ${QUICK_SEARCH_TABLE} (` +
         'quick_key TEXT PRIMARY KEY, ' +
@@ -147,6 +148,29 @@ export class EhLocalDataDao {
       this.downloadLabelToBucket({ label: DOWNLOAD_DEFAULT_LABEL, createdAt: this.nowLabel() }),
       relationalStore.ConflictResolution.ON_CONFLICT_IGNORE
     );
+  }
+
+  private async ensureDownloadImageQualityColumn(): Promise<void> {
+    let resultSet: relationalStore.ResultSet | undefined = undefined;
+    let hasImageQuality = false;
+    try {
+      resultSet = await this.store.querySql(`PRAGMA table_info(${DOWNLOAD_TABLE})`);
+      if (resultSet.goToFirstRow()) {
+        do {
+          if (this.resultString(resultSet, 'name') === 'image_quality') {
+            hasImageQuality = true;
+            break;
+          }
+        } while (resultSet.goToNextRow());
+      }
+    } finally {
+      if (resultSet) {
+        resultSet.close();
+      }
+    }
+    if (!hasImageQuality) {
+      await this.store.executeSql(`ALTER TABLE ${DOWNLOAD_TABLE} ADD COLUMN image_quality TEXT DEFAULT ''`);
+    }
   }
 
   private nowLabel(): string {
@@ -328,6 +352,7 @@ export class EhLocalDataDao {
       speed_bps: item.speedBytesPerSecond,
       remaining_seconds: item.remainingSeconds,
       download_dir: item.downloadDir,
+      image_quality: item.imageQuality || '',
       error: item.error,
       page_errors: JSON.stringify(item.pageErrors)
     };
@@ -847,11 +872,12 @@ export class EhLocalDataDao {
     }
   }
 
-  async loadDownloadItems(limit: number = LOCAL_LIST_LOAD_LIMIT): Promise<DownloadQueueItem[]> {
+  async loadDownloadItems(limit: number = 0): Promise<DownloadQueueItem[]> {
     let resultSet: relationalStore.ResultSet | undefined = undefined;
     try {
+      const limitClause = Number.isFinite(limit) && limit > 0 ? ` LIMIT ${Math.floor(limit)}` : '';
       resultSet = await this.store.querySql(
-        `SELECT * FROM ${DOWNLOAD_TABLE} ORDER BY updated_at DESC LIMIT ${limit}`
+        `SELECT * FROM ${DOWNLOAD_TABLE} ORDER BY updated_at DESC${limitClause}`
       );
       const items: DownloadQueueItem[] = [];
       if (resultSet.goToFirstRow()) {
@@ -889,6 +915,7 @@ export class EhLocalDataDao {
             speedBytesPerSecond: this.resultNumber(resultSet, 'speed_bps', 0),
             remainingSeconds: this.resultNumber(resultSet, 'remaining_seconds', -1),
             downloadDir: this.resultString(resultSet, 'download_dir'),
+            imageQuality: this.resultString(resultSet, 'image_quality'),
             error: this.resultString(resultSet, 'error'),
             pageErrors: this.parseDownloadPageErrors(this.resultString(resultSet, 'page_errors', '[]'))
           });

@@ -1,3 +1,6 @@
+import { FrameCallback } from '@kit.ArkUI';
+import { IMMERSIVE_TOOLBAR_MATERIAL } from '../../styles/ImmersiveMaterials';
+
 export type ReaderAreaChangeHandler = (oldValue: Area, newValue: Area) => void;
 export type ReaderSwiperIndexChangeHandler = (index: number) => void;
 export type ReaderVirtualPageHandler = (page: ReaderVirtualPage) => void;
@@ -112,6 +115,21 @@ const EMPTY_READER_RESOLVED_PAGE: ReaderResolvedPage = {
 };
 const READER_IMAGE_RENDER_RETRY_LIMIT: number = 2;
 const READER_IMAGE_RENDER_RETRY_DELAY_MS: number = 360;
+const READER_CHROME_ANIMATION_DURATION_MS: number = 240;
+const READER_CHROME_SLIDE_DISTANCE: number = 24;
+
+class ReaderChromeFrameCallback extends FrameCallback {
+  private action: () => void;
+
+  constructor(action: () => void) {
+    super();
+    this.action = action;
+  }
+
+  onFrame(_frameTimeInNano: number): void {
+    this.action();
+  }
+}
 
 function readerErrorMessage(error: Object | string | undefined, fallback: string): string {
   const raw = `${error}`.replace('Error: ', '').trim();
@@ -131,11 +149,11 @@ function readerErrorMessage(error: Object | string | undefined, fallback: string
 export struct ReaderSwiperView {
   controller: SwiperController = new SwiperController();
   dataSource: ReaderPageDataSource = new ReaderPageDataSource();
-  currentIndex: number = 0;
-  cachedCount: number = 2;
-  vertical: boolean = false;
-  itemSpace: number = 0;
-  fitContain: boolean = true;
+  @Prop currentIndex: number = 0;
+  @Prop cachedCount: number = 2;
+  @Prop vertical: boolean = false;
+  @Prop itemSpace: number = 0;
+  @Prop fitContain: boolean = true;
 
   onIndexChange: ReaderSwiperIndexChangeHandler = (_index: number): void => {};
   onPageAppear: ReaderVirtualPageHandler = (_page: ReaderVirtualPage): void => {};
@@ -183,7 +201,7 @@ export struct ReaderSwiperView {
 @Component
 struct ReaderImagePage {
   page: ReaderVirtualPage = EMPTY_READER_VIRTUAL_PAGE;
-  fitContain: boolean = true;
+  @Prop fitContain: boolean = true;
   onPageAppear: ReaderVirtualPageHandler = (_page: ReaderVirtualPage): void => {};
   onPageTap: ReaderPageTapHandler = (_event: ClickEvent): void => {};
   onResolvePage: ReaderPageResolveHandler = async (_page: ReaderVirtualPage): Promise<ReaderResolvedPage> => {
@@ -377,7 +395,8 @@ struct ReaderImagePage {
         if (this.error.length === 0) {
           LoadingProgress()
             .width(40)
-            .height(40);
+            .height(40)
+            .color('#C86B8C');
           Text(`${this.progress}%`)
             .fontSize(12)
             .fontColor('#6F5964');
@@ -449,21 +468,173 @@ struct ReaderImagePage {
 
 @Component
 export struct ReaderFullscreenPage {
-  customLightness: boolean = false;
-  overlayMaskColor: string = '#00000000';
+  @Prop customLightness: boolean = false;
+  @Prop overlayMaskColor: string = '#00000000';
+  @Prop titleBarVisible: boolean = false;
+  @Prop @Watch('syncBottomBarVisibility') bottomBarVisible: boolean = false;
+  @Prop @Watch('syncBottomBarVisibility') menuBarVisible: boolean = false;
   onReaderAreaChange: ReaderAreaChangeHandler = (_oldValue: Area, _newValue: Area): void => {};
 
   @BuilderParam negativeLayerContent: () => void = this.EmptySlot;
   @BuilderParam currentLayerContent: () => void = this.EmptySlot;
   @BuilderParam positiveLayerContent: () => void = this.EmptySlot;
   @BuilderParam loadingOverlayContent: () => void = this.EmptySlot;
-  @BuilderParam controlsContent: () => void = this.EmptySlot;
+  @BuilderParam titleBarContent: () => void = this.EmptySlot;
+  @BuilderParam statusBarContent: () => void = this.EmptySlot;
+  @BuilderParam menuBarContent: () => void = this.EmptySlot;
+
+  @State private viewportHeight: number = 720;
+  @State private bottomBarMounted: boolean = false;
+  @State private bottomBarOpacity: number = 0;
+  @State private bottomBarOffsetY: number = READER_CHROME_SLIDE_DISTANCE;
+  @State private bottomBarMeasuredHeight: number = 0;
+  @State private menuBarMounted: boolean = false;
+  @State private menuBarOpacity: number = 0;
+  @State private menuBarOffsetY: number = READER_CHROME_SLIDE_DISTANCE;
+  @State private menuBarMeasuredHeight: number = 0;
+  @State private menuBarHeightAutomatic: boolean = true;
+  @State private menuBarAnimatedHeight: number = 0;
+
+  private chromeActive: boolean = false;
+  private chromeAnimationGeneration: number = 0;
+
+  aboutToAppear(): void {
+    this.chromeActive = true;
+    this.syncBottomBarVisibility();
+  }
+
+  aboutToDisappear(): void {
+    this.chromeActive = false;
+    this.chromeAnimationGeneration++;
+    this.bottomBarMounted = false;
+    this.menuBarMounted = false;
+    this.bottomBarOpacity = 0;
+    this.menuBarOpacity = 0;
+    this.bottomBarOffsetY = READER_CHROME_SLIDE_DISTANCE;
+    this.menuBarOffsetY = READER_CHROME_SLIDE_DISTANCE;
+    this.bottomBarMeasuredHeight = 0;
+    this.menuBarMeasuredHeight = 0;
+    this.menuBarHeightAutomatic = true;
+    this.menuBarAnimatedHeight = 0;
+  }
+
+  private shouldDisplayBottomBar(): boolean {
+    return this.bottomBarVisible || this.menuBarVisible;
+  }
+
+  private bottomBarHeight(): Length {
+    if (!this.bottomBarMounted) {
+      return 0;
+    }
+    if (!this.shouldDisplayBottomBar() && this.bottomBarMeasuredHeight > 0) {
+      return Math.min(this.bottomBarMeasuredHeight, Math.max(1, this.viewportHeight * 0.8));
+    }
+    return 'auto';
+  }
+
+  private menuBarHeight(): Length {
+    return this.menuBarHeightAutomatic ? 'auto' : Math.max(0, this.menuBarAnimatedHeight);
+  }
+
+  private syncBottomBarVisibility(): void {
+    if (!this.chromeActive) {
+      return;
+    }
+    const generation = ++this.chromeAnimationGeneration;
+    const showBar = this.shouldDisplayBottomBar();
+    const showMenu = this.menuBarVisible;
+    if (showBar && !this.bottomBarMounted) {
+      this.bottomBarOpacity = 0;
+      this.bottomBarOffsetY = READER_CHROME_SLIDE_DISTANCE;
+      this.bottomBarMounted = true;
+    }
+    if (showMenu && !this.menuBarMounted) {
+      this.menuBarOpacity = 0;
+      this.menuBarOffsetY = READER_CHROME_SLIDE_DISTANCE;
+      this.menuBarHeightAutomatic = true;
+      this.menuBarMounted = true;
+    }
+    if (!showMenu && showBar && this.menuBarMounted &&
+      this.menuBarHeightAutomatic && this.menuBarMeasuredHeight > 0) {
+      // A status banner keeps the material shell visible. Collapse the menu's
+      // measured space along with its exit instead of jumping after removal.
+      this.menuBarAnimatedHeight = this.menuBarMeasuredHeight;
+      this.menuBarHeightAutomatic = false;
+    }
+    // Mount first, then animate in the next frame. A generation check also
+    // invalidates queued frames and finishes when visibility changes rapidly.
+    this.getUIContext().postFrameCallback(new ReaderChromeFrameCallback((): void => {
+      if (!this.chromeActive || generation !== this.chromeAnimationGeneration) {
+        return;
+      }
+      if (this.bottomBarMounted) {
+        this.animateBottomBar(showBar, generation);
+      }
+      if (this.menuBarMounted) {
+        this.animateMenuBar(showMenu, generation);
+      }
+    }));
+  }
+
+  private animateBottomBar(visible: boolean, generation: number): void {
+    this.getUIContext().animateTo({
+      duration: READER_CHROME_ANIMATION_DURATION_MS,
+      curve: Curve.EaseOut,
+      onFinish: (): void => {
+        if (!this.chromeActive || generation !== this.chromeAnimationGeneration) {
+          return;
+        }
+        if (!visible && !this.shouldDisplayBottomBar()) {
+          this.bottomBarMounted = false;
+          this.menuBarMounted = false;
+          this.bottomBarMeasuredHeight = 0;
+          this.menuBarMeasuredHeight = 0;
+          this.menuBarHeightAutomatic = true;
+          this.menuBarAnimatedHeight = 0;
+        }
+      }
+    }, (): void => {
+      this.bottomBarOpacity = visible ? 1 : 0;
+      this.bottomBarOffsetY = visible ? 0 : READER_CHROME_SLIDE_DISTANCE;
+    });
+  }
+
+  private animateMenuBar(visible: boolean, generation: number): void {
+    this.getUIContext().animateTo({
+      duration: READER_CHROME_ANIMATION_DURATION_MS,
+      curve: Curve.EaseOut,
+      onFinish: (): void => {
+        if (!this.chromeActive || generation !== this.chromeAnimationGeneration) {
+          return;
+        }
+        if (!visible && !this.menuBarVisible) {
+          this.menuBarMounted = false;
+          this.menuBarMeasuredHeight = 0;
+          this.menuBarHeightAutomatic = true;
+          this.menuBarAnimatedHeight = 0;
+        } else if (visible && this.menuBarVisible) {
+          this.menuBarHeightAutomatic = true;
+        }
+      }
+    }, (): void => {
+      this.menuBarOpacity = visible ? 1 : 0;
+      this.menuBarOffsetY = visible ? 0 : READER_CHROME_SLIDE_DISTANCE;
+      if (visible) {
+        // Return to intrinsic height when reopening so the independent settings
+        // panel animation continues to resize the menu normally.
+        this.menuBarHeightAutomatic = true;
+      } else if (this.shouldDisplayBottomBar() && !this.menuBarHeightAutomatic) {
+        this.menuBarAnimatedHeight = 0;
+      }
+    });
+  }
 
   @Builder
   private EmptySlot(): void {
   }
 
-  build() {
+  @Builder
+  private ReaderCanvas(): void {
     Stack({ alignContent: Alignment.Center }) {
       this.negativeLayerContent();
       this.currentLayerContent();
@@ -474,15 +645,112 @@ export struct ReaderFullscreenPage {
         }
         .width('100%')
         .height('100%')
-        .backgroundColor(this.overlayMaskColor);
+        .backgroundColor(this.overlayMaskColor)
+        .hitTestBehavior(HitTestMode.None);
       }
 
       this.loadingOverlayContent();
-      this.controlsContent();
     }
     .width('100%')
     .height('100%')
+    .backgroundColor('#000000')
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]);
+  }
+
+  @Builder
+  private ReaderTitleBar(): void {
+    this.titleBarContent();
+  }
+
+  @Builder
+  private ReaderBottomBar(): void {
+    if (this.bottomBarMounted) {
+      Column() {
+        Scroll() {
+          Column({ space: 0 }) {
+            this.statusBarContent();
+            if (this.menuBarMounted) {
+              Column() {
+                this.menuBarContent();
+              }
+              .width('100%')
+              .height(this.menuBarHeight())
+              .clip(true)
+              .opacity(this.menuBarOpacity)
+              .translate({ y: this.menuBarOffsetY })
+              .hitTestBehavior(this.menuBarVisible ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+              .onAreaChange((_oldValue: Area, newValue: Area): void => {
+                const nextHeight = Math.max(0, Number(newValue.height));
+                if (this.menuBarVisible && this.menuBarHeightAutomatic && nextHeight > 0 &&
+                  Math.abs(nextHeight - this.menuBarMeasuredHeight) >= 1) {
+                  this.menuBarMeasuredHeight = nextHeight;
+                }
+              });
+            }
+          }
+          .width('100%');
+        }
+        .width('100%')
+        .height(this.bottomBarHeight())
+        .constraintSize({ maxHeight: Math.max(1, this.viewportHeight * 0.8) })
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring);
+      }
+      .width('100%')
+      .borderRadius({ topLeft: 20, topRight: 20 })
+      .clip(true)
+      .systemMaterial(IMMERSIVE_TOOLBAR_MATERIAL)
+      .opacity(this.bottomBarOpacity)
+      .translate({ y: this.bottomBarOffsetY })
+      .hitTestBehavior(this.shouldDisplayBottomBar() ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+      .onAreaChange((_oldValue: Area, newValue: Area): void => {
+        const nextHeight = Math.max(0, Number(newValue.height));
+        if (this.shouldDisplayBottomBar() && nextHeight > 0 &&
+          Math.abs(nextHeight - this.bottomBarMeasuredHeight) >= 1) {
+          this.bottomBarMeasuredHeight = nextHeight;
+        }
+      });
+    }
+  }
+
+  build() {
+    // Generic immersive materials are supported in a native Navigation title bar
+    // and a horizontal Tabs bottom TabBar. Keep both bars above the full image canvas.
+    Navigation() {
+      Tabs({ barPosition: BarPosition.End, index: 0 }) {
+        TabContent() {
+          this.ReaderCanvas();
+        }
+        .tabBar(this.ReaderBottomBar);
+      }
+      .width('100%')
+      .height('100%')
+      .vertical(false)
+      .scrollable(false)
+      .barMode(BarMode.Fixed)
+      .barHeight(this.bottomBarHeight(), true)
+      .barOverlap(true)
+      .barBackgroundColor(Color.Transparent)
+      .barBackgroundBlurStyle(BlurStyle.NONE)
+      .divider(null)
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]);
+    }
+    .width('100%')
+    .height('100%')
+    .mode(NavigationMode.Stack)
+    .hideBackButton(true)
+    .hideToolBar(true)
+    .title({ builder: this.ReaderTitleBar, height: 52 }, {
+      backgroundColor: Color.Transparent,
+      barStyle: BarStyle.STACK
+    })
+    .hideTitleBar(!this.titleBarVisible, false)
+    .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     .onAreaChange((oldValue: Area, newValue: Area) => {
+      const nextHeight = Math.max(1, Number(newValue.height));
+      if (Math.abs(nextHeight - this.viewportHeight) >= 1) {
+        this.viewportHeight = nextHeight;
+      }
       this.onReaderAreaChange(oldValue, newValue);
     })
     .backgroundColor('#000000')
